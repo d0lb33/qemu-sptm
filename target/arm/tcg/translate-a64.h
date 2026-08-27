@@ -201,6 +201,7 @@ static inline ARMFPStatusFlavour select_ah_fpst(DisasContext *s, MemOp esz)
 
 bool disas_sve(DisasContext *, uint32_t);
 bool disas_sme(DisasContext *, uint32_t);
+bool disas_gxf(DisasContext *, uint32_t);
 
 void gen_gvec_rax1(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
                    uint32_t rm_ofs, uint32_t opr_sz, uint32_t max_sz);

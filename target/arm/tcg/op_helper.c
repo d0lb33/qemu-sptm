@@ -26,6 +26,9 @@
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/probe.h"
 #include "cpregs.h"
+#include "qemu/log.h"
+
+// #define LOG_MSRS
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -1255,6 +1258,9 @@ void HELPER(set_cp_reg64)(CPUARMState *env, const void *rip, uint64_t value)
 {
     const ARMCPRegInfo *ri = rip;
 
+#ifdef LOG_MSRS
+    qemu_log("msr_w(%s, 0x%" PRIx64 ", 0x%" PRIx64 ")\n", ri->name, value, env->pc);
+#endif // LOG_MSRS
     if (ri->type & ARM_CP_IO) {
         bql_lock();
         ri->writefn(env, ri, value);
@@ -1277,6 +1283,9 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
         res = ri->readfn(env, ri);
     }
 
+#ifdef LOG_MSRS
+    qemu_log("msr_r(%s, 0x%" PRIx64 ", 0x%" PRIx64 ")\n", ri->name, res, env->pc);
+#endif // LOG_MSRS
     return res;
 }
 

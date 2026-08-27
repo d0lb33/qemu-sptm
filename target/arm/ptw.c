@@ -1623,6 +1623,69 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
     return prot_rw | PAGE_EXEC;
 }
 
+static int get_S1prot_sprr(CPUARMState *env, int pxn_uxn, int ap) {
+    uint64_t sprr_reg;
+    uint8_t sprr_idx;
+
+    static const uint8_t gl_perm_table[16] = {
+        0,
+        0,
+        0,
+        0,
+
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ | PAGE_EXEC,
+
+        PAGE_READ,
+        PAGE_READ,
+        PAGE_READ,
+        PAGE_READ,
+
+        PAGE_READ | PAGE_WRITE,
+        PAGE_READ | PAGE_WRITE,
+        PAGE_READ | PAGE_WRITE,
+        PAGE_READ | PAGE_WRITE,
+    };
+
+    static const uint8_t el_perm_table[16] = {
+        0,
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ,
+        PAGE_READ | PAGE_WRITE,
+
+        0,
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ,
+        0,
+
+        0,
+        PAGE_EXEC,
+        PAGE_READ,
+        PAGE_READ | PAGE_WRITE,
+
+        0,
+        PAGE_READ | PAGE_EXEC,
+        PAGE_READ,
+        PAGE_READ | PAGE_WRITE,
+    };
+
+    if (0 == arm_current_el(env)) {
+        sprr_reg = env->sprr_uperm_el0;
+    } else {
+        sprr_reg = env->sprr_pperm_el[arm_current_el(env)];
+    }
+
+    sprr_idx = (sprr_reg >> (4 * (pxn_uxn | (ap << 2)))) & 0x0F;
+
+    if (arm_apple_is_gl(env)) {
+        return gl_perm_table[sprr_idx];
+    } else {
+        return el_perm_table[sprr_idx];
+    }
+}
+
 /* Extra page permission bits, during get_S1prot_indirect only. */
 #define PAGE_GCS      (1 << 3)
 #define PAGE_WXN      (1 << 4)
@@ -2376,7 +2439,11 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
             g_assert_not_reached();
         }
 
-        if (param.pie) {
+        if (param.sprr) {
+            int pxn_uxn = extract64(attrs, 53, 2);
+            prot = get_S1prot_sprr(env, pxn_uxn, ap);
+        }
+        else if (param.pie) {
             int pi = extract64(attrs, 6, 1)
                    | (extract64(attrs, 51, 1) << 1)
                    | (extract64(attrs, 53, 2) << 2);

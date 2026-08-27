@@ -629,6 +629,11 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     int new_el;
     bool return_to_aa64 = (spsr & PSTATE_nRW) == 0;
 
+    if (arm_apple_is_gl(env)) {
+        spsr = env->spsr_gl[cur_el];
+        new_pc = env->elr_gl[cur_el];
+    }
+
     aarch64_save_sp(env, cur_el);
 
     arm_clear_exclusive(env);
@@ -696,6 +701,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     bql_unlock();
 
     if (!return_to_aa64) {
+        assert(!arm_apple_is_gl(env));
         env->aarch64 = false;
         /* We do a raw CPSR write because aarch64_sync_64_to_32()
          * will sort the register banks out for us, and we've already

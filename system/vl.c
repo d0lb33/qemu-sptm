@@ -3025,6 +3025,27 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_initrd:
                 qdict_put_str(machine_opts_dict, "initrd", optarg);
                 break;
+            case QEMU_OPTION_bootkc:
+                qdict_put_str(machine_opts_dict, "bootkc", optarg);
+                break;
+            case QEMU_OPTION_args:
+                qdict_put_str(machine_opts_dict, "args", optarg);
+                break;
+            case QEMU_OPTION_dtree:
+                qdict_put_str(machine_opts_dict, "dtree", optarg);
+                break;
+            case QEMU_OPTION_sptm:
+                qdict_put_str(machine_opts_dict, "sptm", optarg);
+                break;
+            case QEMU_OPTION_txm:
+                qdict_put_str(machine_opts_dict, "txm", optarg);
+                break;
+            case QEMU_OPTION_tc:
+                qdict_put_str(machine_opts_dict, "tc", optarg);
+                break;
+            case QEMU_OPTION_ramdisk:
+                qdict_put_str(machine_opts_dict, "ramdisk", optarg);
+                break;
             case QEMU_OPTION_append:
                 qdict_put_str(machine_opts_dict, "append", optarg);
                 break;

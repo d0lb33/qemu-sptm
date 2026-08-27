@@ -6667,6 +6667,26 @@ SRST
             (qemu) qom-set /objects/iothread1 poll-max-ns 100000
 ERST
 
+DEF("bootkc", HAS_ARG, QEMU_OPTION_bootkc, \
+           "-bootkc file    use 'file' as XNU kernelcache\n", QEMU_ARCH_ALL)
+
+DEF("args", HAS_ARG, QEMU_OPTION_args, \
+           "-args    use 'args' as the XNU boot argument\n", QEMU_ARCH_ALL)
+
+DEF("dtree", HAS_ARG, QEMU_OPTION_dtree, \
+           "-dtree file    use 'file' as XNU device tree\n", QEMU_ARCH_ALL)
+
+DEF("sptm", HAS_ARG, QEMU_OPTION_sptm, \
+           "-sptm file    use 'file' as the SPTM firmware\n", QEMU_ARCH_ALL)
+
+DEF("txm", HAS_ARG, QEMU_OPTION_txm, \
+           "-txm file    use 'file' as the TXM firmware\n", QEMU_ARCH_ALL)
+
+DEF("tc", HAS_ARG, QEMU_OPTION_tc, \
+           "-tc file    use 'file' as the trustcache \n", QEMU_ARCH_ALL)
+
+DEF("ramdisk", HAS_ARG, QEMU_OPTION_ramdisk, \
+           "-ramdisk file    use 'file' as the ramdisk \n", QEMU_ARCH_ALL)
 
 HXCOMM This is the last statement. Insert new options before this line!
 

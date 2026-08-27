@@ -1,0 +1,7 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+bool kc_uses_mte(uint8_t *macho);
+void patch_kc(uint8_t *macho);

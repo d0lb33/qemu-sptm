@@ -65,6 +65,7 @@
 #define EXCP_VINMI          27
 #define EXCP_VFNMI          28
 #define EXCP_MON_TRAP       29   /* AArch32 trap to Monitor mode */
+#define EXCP_GENTER         30
 /* NB: add new EXCP_ defines to the array in arm_log_exception() too */
 
 #define ARMV7M_EXCP_RESET   1
@@ -808,6 +809,31 @@ typedef struct CPUArchState {
         uint32_t rnr;
         uint32_t ctrl;
     } sau;
+
+    /* Apple Si specific state */
+    // Opaque pointer to automatically generated scratchpad for registers we essentially ignore at runtime:
+    void *apple_state;
+
+    // SPRR stuff
+    uint64_t sprr_config_el[4];
+    uint64_t sprr_pperm_el[4];
+    uint64_t sprr_uperm_el0;
+
+    // GXF stuff (extracted from struct arm_guest_extregs_t in KDK development kernel)
+    uint64_t gxf_config_el[4];
+    uint64_t gxf_entry_el[4];
+    uint64_t gxf_pabentry_el[4];
+    uint64_t sp_gl[4];
+    uint64_t tpidr_gl[4];
+    uint64_t aspsr_gl[4];
+    uint64_t vbar_gl[4];
+    uint64_t far_gl[4];
+    uint64_t esr_gl[4];
+    uint64_t elr_gl[4];
+    uint64_t spsr_gl[4];
+    uint64_t pmcr1_gl[4];
+    uint64_t afsr1_gl[4];
+    uint64_t currentg;
 
 #if !defined(CONFIG_USER_ONLY)
     NVICState *nvic;

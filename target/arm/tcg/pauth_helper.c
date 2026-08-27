@@ -27,6 +27,9 @@
 #include "tcg/tcg-gvec-desc.h"
 #include "qemu/xxhash.h"
 
+// Apple's PAC implementation does weird things after launchd starts and there
+// are multiple processes; use this to straight up disable PAC for now
+#define QEMU_SPTM_DISABLE_PAC
 
 static uint64_t pac_cell_shuffle(uint64_t i)
 {
@@ -334,6 +337,10 @@ static uint64_t pauth_addpac(CPUARMState *env, uint64_t ptr, uint64_t modifier,
     uint64_t pac, ext_ptr, ext, test;
     int bot_bit, top_bit;
 
+#ifdef QEMU_SPTM_DISABLE_PAC
+    return ptr;
+#endif // QEMU_SPTM_DISABLE_PAC
+
     /* If tagged pointers are in use, use ptr<55>, otherwise ptr<63>.  */
     if (param.tbi) {
         ext = sextract64(ptr, 55, 1);
@@ -435,6 +442,10 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
 
     cmp_mask = MAKE_64BIT_MASK(bot_bit, top_bit - bot_bit);
     cmp_mask &= ~MAKE_64BIT_MASK(55, 1);
+
+#ifdef QEMU_SPTM_DISABLE_PAC
+    return orig_ptr;
+#endif // QEMU_SPTM_DISABLE_PAC
 
     if (param.mtx) {
         cmp_mask &= ~MAKE_64BIT_MASK(56, 4);

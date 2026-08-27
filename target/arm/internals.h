@@ -541,6 +541,16 @@ static inline int arm_current_el(CPUARMState *env)
     }
 }
 
+static inline bool arm_apple_is_sprr_enabled(CPUARMState *env) {
+    // There is no sprr_config_el0; todo is figure out how that works.
+    // For now, we just say sprr is on if either EL1 or 2 has it on.
+    return env->sprr_config_el[1] || env->sprr_config_el[2];
+}
+
+static inline bool arm_apple_is_gl(CPUARMState *env) {
+    return 0 != (env->currentg & 0x01);
+}
+
 static inline bool arm_cpu_data_is_big_endian_a32(CPUARMState *env,
                                                   bool sctlr_b)
 {
@@ -592,7 +602,11 @@ static inline bool arm_cpu_bswap_data(CPUARMState *env)
 static inline void aarch64_save_sp(CPUARMState *env, int el)
 {
     if (env->pstate & PSTATE_SP) {
-        env->sp_el[el] = env->xregs[31];
+        if (arm_apple_is_gl(env)) {
+            env->sp_gl[el] = env->xregs[31];
+        } else {
+            env->sp_el[el] = env->xregs[31];
+        }
     } else {
         env->sp_el[0] = env->xregs[31];
     }
@@ -601,7 +615,11 @@ static inline void aarch64_save_sp(CPUARMState *env, int el)
 static inline void aarch64_restore_sp(CPUARMState *env, int el)
 {
     if (env->pstate & PSTATE_SP) {
-        env->xregs[31] = env->sp_el[el];
+        if (arm_apple_is_gl(env)) {
+            env->xregs[31] = env->sp_gl[el];
+        } else {
+            env->xregs[31] = env->sp_el[el];
+        }
     } else {
         env->xregs[31] = env->sp_el[0];
     }
@@ -1445,6 +1463,7 @@ typedef struct ARMVAParameters {
     bool pie        : 1;
     bool aie        : 1;
     bool mtx        : 1;
+    bool sprr       : 1;
 } ARMVAParameters;
 
 /**

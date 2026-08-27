@@ -35,6 +35,7 @@
 #include "cpregs.h"
 #include "target/arm/gtimer.h"
 #include "qemu/plugin.h"
+#include "xnu/apple_regs.h"
 
 static void switch_mode(CPUARMState *env, int mode);
 #ifndef CONFIG_USER_ONLY
@@ -2116,6 +2117,17 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
       .readfn = gt_phys_redir_ctl_read, .raw_readfn = raw_read,
       .writefn = gt_phys_redir_ctl_write, .raw_writefn = raw_write,
     },
+    // Apple generic timer (see xnu-11215.1.10/osfmk/arm64/machine_routines.c)
+    { .name = "AGTCNTP_CTL_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 1, .crn = 15, .crm = 13, .opc2 = 4,
+      .type = ARM_CP_IO, .access = PL0_RW,
+      .accessfn = gt_ptimer_access,
+      .nv2_redirect_offset = 0x180 | NV2_REDIR_NV1,
+      .fieldoffset = offsetof(CPUARMState, cp15.c14_timer[GTIMER_PHYS].ctl),
+      .resetvalue = 0,
+      .readfn = gt_phys_redir_ctl_read, .raw_readfn = raw_read,
+      .writefn = gt_phys_redir_ctl_write, .raw_writefn = raw_write,
+    },
     { .name = "CNTV_CTL", .cp = 15, .crn = 14, .crm = 3, .opc1 = 0, .opc2 = 1,
       .type = ARM_CP_IO | ARM_CP_ALIAS, .access = PL0_RW,
       .accessfn = gt_vtimer_access,
@@ -2126,6 +2138,16 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     },
     { .name = "CNTV_CTL_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 3, .opc2 = 1,
+      .type = ARM_CP_IO, .access = PL0_RW,
+      .accessfn = gt_vtimer_access,
+      .nv2_redirect_offset = 0x170 | NV2_REDIR_NV1,
+      .fieldoffset = offsetof(CPUARMState, cp15.c14_timer[GTIMER_VIRT].ctl),
+      .resetvalue = 0,
+      .readfn = gt_virt_redir_ctl_read, .raw_readfn = raw_read,
+      .writefn = gt_virt_redir_ctl_write, .raw_writefn = raw_write,
+    },
+    { .name = "AGTCNTV_CTL_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 1, .crn = 15, .crm = 0, .opc2 = 5,
       .type = ARM_CP_IO, .access = PL0_RW,
       .accessfn = gt_vtimer_access,
       .nv2_redirect_offset = 0x170 | NV2_REDIR_NV1,
@@ -2154,6 +2176,12 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
       .accessfn = gt_ptimer_access, .resetfn = gt_phys_timer_reset,
       .readfn = gt_phys_redir_tval_read, .writefn = gt_phys_redir_tval_write,
     },
+    { .name = "AGTCNTP_TVAL_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 1, .crn = 15, .crm = 11, .opc2 = 4,
+      .type = ARM_CP_NO_RAW | ARM_CP_IO, .access = PL0_RW,
+      .accessfn = gt_ptimer_access, .resetfn = gt_phys_timer_reset,
+      .readfn = gt_phys_redir_tval_read, .writefn = gt_phys_redir_tval_write,
+    },
     { .name = "CNTV_TVAL", .cp = 15, .crn = 14, .crm = 3, .opc1 = 0, .opc2 = 0,
       .type = ARM_CP_NO_RAW | ARM_CP_IO, .access = PL0_RW,
       .accessfn = gt_vtimer_access,
@@ -2161,6 +2189,12 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     },
     { .name = "CNTV_TVAL_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 3, .opc2 = 0,
+      .type = ARM_CP_NO_RAW | ARM_CP_IO, .access = PL0_RW,
+      .accessfn = gt_vtimer_access, .resetfn = gt_virt_timer_reset,
+      .readfn = gt_virt_redir_tval_read, .writefn = gt_virt_redir_tval_write,
+    },
+    { .name = "AGTCNTV_TVAL_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 1, .crn = 15, .crm = 15, .opc2 = 4,
       .type = ARM_CP_NO_RAW | ARM_CP_IO, .access = PL0_RW,
       .accessfn = gt_vtimer_access, .resetfn = gt_virt_timer_reset,
       .readfn = gt_virt_redir_tval_read, .writefn = gt_virt_redir_tval_write,
@@ -2176,6 +2210,16 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
       .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
       .accessfn = gt_pct_access, .readfn = gt_cnt_read,
     },
+    { .name = "ACNTPCT_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 10, .opc2 = 5,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .accessfn = gt_pct_access, .readfn = gt_cnt_read,
+    },
+    { .name = "AGTCNTPCT_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 11, .opc2 = 6,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .accessfn = gt_pct_access, .readfn = gt_cnt_read,
+    },
     { .name = "CNTVCT", .cp = 15, .crm = 14, .opc1 = 1,
       .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO,
       .accessfn = gt_vct_access,
@@ -2183,6 +2227,16 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     },
     { .name = "CNTVCT_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 0, .opc2 = 2,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .accessfn = gt_vct_access, .readfn = gt_virt_cnt_read,
+    },
+    { .name = "ACNTVCT_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 10, .opc2 = 6,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .accessfn = gt_vct_access, .readfn = gt_virt_cnt_read,
+    },
+    { .name = "AGTCNTVCT_EL0", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 11, .opc2 = 7,
       .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
       .accessfn = gt_vct_access, .readfn = gt_virt_cnt_read,
     },
@@ -7987,22 +8041,14 @@ void define_one_arm_cp_reg(ARMCPU *cpu, const ARMCPRegInfo *r)
             /* min_EL EL1, but some accessible to EL0 via kernel ABI */
             mask = PL0U_R | PL1_RW;
             break;
-        case 1: case 2:
-            /* min_EL EL1 */
-            mask = PL1_RW;
-            break;
+        case 1:
+        case 2:
         case 3:
-            /* min_EL EL0 */
-            mask = PL0_RW;
-            break;
         case 4:
         case 5:
-            /* min_EL EL2 */
-            mask = PL2_RW;
-            break;
         case 6:
-            /* min_EL EL3 */
-            mask = PL3_RW;
+            /* Lower Qemu default privs to allow Apple Si specific MSRs at EL1 */
+            mask = PL0_RW;
             break;
         case 7:
             /* min_EL EL1, secure mode only (we don't check the latter) */
@@ -8607,6 +8653,7 @@ void arm_log_exception(CPUState *cs)
             [EXCP_VINMI] = "Virtual IRQ NMI",
             [EXCP_VFNMI] = "Virtual FIQ NMI",
             [EXCP_MON_TRAP] = "Monitor Trap",
+            [EXCP_GENTER] = "genter",
         };
 
         if (idx >= 0 && idx < ARRAY_SIZE(excnames)) {
@@ -9358,6 +9405,12 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     unsigned int cur_el = arm_current_el(env);
     int rt;
 
+    if (arm_apple_is_gl(env)) {
+        addr = env->vbar_gl[new_el];
+    }
+
+    env->aspsr_gl[new_el] = env->currentg;
+
     if (tcg_enabled()) {
         /*
          * Note that new_el can never be 0.  If cur_el is 0, then
@@ -9421,9 +9474,13 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
             syndrome_is_sync_extabt(env->exception.syndrome)) {
             addr += 0x180;
         }
-        env->cp15.far_el[new_el] = env->exception.vaddress;
+        if (arm_apple_is_gl(env)) {
+            env->far_gl[new_el] = env->exception.vaddress;
+        } else {
+            env->cp15.far_el[new_el] = env->exception.vaddress;
+        }
         qemu_log_mask(CPU_LOG_INT, "...with FAR 0x%" PRIx64 "\n",
-                      env->cp15.far_el[new_el]);
+                      arm_apple_is_gl(env) ? env->far_gl[new_el] : env->cp15.far_el[new_el]);
         /* fall through */
     case EXCP_BKPT:
     case EXCP_UDEF:
@@ -9469,7 +9526,11 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
                                                 10, 5, rt);
             break;
         }
-        env->cp15.esr_el[new_el] = env->exception.syndrome;
+        if (arm_apple_is_gl(env)) {
+            env->esr_gl[new_el] = env->exception.syndrome;
+        } else {
+            env->cp15.esr_el[new_el] = env->exception.syndrome;
+        }
         break;
     case EXCP_IRQ:
     case EXCP_VIRQ:
@@ -9486,7 +9547,19 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
         addr += 0x180;
         /* Construct the SError syndrome from IDS and ISS fields. */
         env->exception.syndrome = syn_serror(env->cp15.vsesr_el2 & 0x1ffffff);
-        env->cp15.esr_el[new_el] = env->exception.syndrome;
+        if (arm_apple_is_gl(env)) {
+            env->esr_gl[new_el] = env->exception.syndrome;
+        } else {
+            env->cp15.esr_el[new_el] = env->exception.syndrome;
+        }
+        break;
+    case EXCP_GENTER:
+        assert(0 == env->currentg);
+        assert(env->aarch64);
+        env->aspsr_gl[new_el] = env->currentg;
+        env->currentg = 1;
+        env->esr_gl[new_el] = env->exception.syndrome;
+        addr = env->gxf_entry_el[new_el];
         break;
     default:
         cpu_abort(cs, "Unhandled exception 0x%x\n", cs->exception_index);
@@ -9495,7 +9568,12 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     if (is_a64(env)) {
         old_mode = pstate_read(env);
         aarch64_save_sp(env, arm_current_el(env));
-        env->elr_el[new_el] = env->pc;
+
+        if (arm_apple_is_gl(env)) {
+            env->elr_gl[new_el] = env->pc;
+        } else {
+            env->elr_el[new_el] = env->pc;
+        }
 
         if (cur_el == 1 && new_el == 1) {
             uint64_t hcr = arm_hcr_el2_eff(env);
@@ -9511,6 +9589,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
             }
         }
     } else {
+        assert(!arm_apple_is_gl(env));
         old_mode = cpsr_read_for_spsr_elx(env);
         env->elr_el[new_el] = env->regs[15];
 
@@ -9518,11 +9597,16 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 
         env->condexec_bits = 0;
     }
-    env->banked_spsr[aarch64_banked_spsr_index(new_el)] = old_mode;
+    if (arm_apple_is_gl(env)) {
+        env->spsr_gl[new_el] = old_mode;
+    } else {
+        env->banked_spsr[aarch64_banked_spsr_index(new_el)] = old_mode;
+    }
 
     qemu_log_mask(CPU_LOG_INT, "...with SPSR 0x%" PRIx64 "\n", old_mode);
     qemu_log_mask(CPU_LOG_INT, "...with ELR 0x%" PRIx64 "\n",
-                  env->elr_el[new_el]);
+                  arm_apple_is_gl(env) ? env->elr_gl[new_el] : env->elr_el[new_el]);
+    qemu_log_mask(CPU_LOG_INT, "...with ASPSR 0x%" PRIx64 "\n", env->aspsr_gl[new_el]);
 
     if (cpu_isar_feature(aa64_pan, cpu)) {
         /* The value of PSTATE.PAN is normally preserved, except when ... */
@@ -9837,12 +9921,15 @@ ARMVAParameters aa64_va_parameters(CPUARMState *env, uint64_t va,
 {
     uint64_t tcr = regime_tcr(env, mmu_idx);
     bool epd, hpd, tsz_oob, ds, ha, hd, pie = false;
+    bool sprr = false;
     bool mtx, aie = false;
     int select, tsz, tbi, max_tsz, min_tsz, ps, sh;
     ARMGranuleSize gran;
     ARMCPU *cpu = env_archcpu(env);
     bool stage2 = regime_is_stage2(mmu_idx);
     int r_el = regime_el(mmu_idx);
+
+    sprr = arm_apple_is_sprr_enabled(env);
 
     if (!regime_has_2_ranges(mmu_idx)) {
         select = 0;
@@ -9999,6 +10086,7 @@ ARMVAParameters aa64_va_parameters(CPUARMState *env, uint64_t va,
         .pie = pie,
         .aie = aie,
         .mtx = mtx,
+        .sprr = sprr,
     };
 }
 
