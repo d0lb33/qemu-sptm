@@ -2440,8 +2440,9 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         }
 
         if (param.sprr) {
-            int pxn_uxn = extract64(attrs, 53, 2);
-            prot = get_S1prot_sprr(env, pxn_uxn, ap);
+            int sprr_lo = extract64(descriptor, 53, 2); // UXN|PXN
+            int sprr_hi = extract64(descriptor, 6, 2);  // AP1|AP0
+            prot = get_S1prot_sprr(env, sprr_lo, sprr_hi);
         }
         else if (param.pie) {
             int pi = extract64(attrs, 6, 1)
