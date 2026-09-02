@@ -60,9 +60,10 @@
  *   16   'xars'  xART slave    18   'sks '  AppleSEPKeyStore (the keybag)
  *   19   'xarm'  xART master   253  discovery   254  L4Info   255  bootstrap
  *
- * 'sks' is known but NOT advertised by default -- announcing an endpoint we
- * cannot answer panics the kernel after 20 unanswered requests. See the long
- * comment above sep_default_eps.
+ * 'sks' implements the iOS 27 IPC v1 negotiation and the media-key create /
+ * unwrap path used by encrypted APFS.  The default list only gained it after
+ * a guest-created encrypted volume survived a reboot and mounted successfully
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:476..500).
  *
  * ---------------------------------------------------------------------------
  * Bootstrap endpoint (255), what AppleSEPBooter sends and what it accepts
@@ -206,6 +207,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/guest-random.h"
+#include "crypto/hash.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -252,6 +254,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 /* ---------------- SEP protocol ---------------- */
 
 #define SEP_EP_CONTROL     0
+#define SEP_EP_KEYSTORE    18
 #define SEP_EP_DISCOVERY   253
 #define SEP_EP_L4INFO      254
 #define SEP_EP_BOOTSTRAP   255
@@ -317,6 +320,80 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define XART_EPOCH_SIZE       2      // lsl x10, x10, 1 at 0x5a1d14
 #define XART_GET_EPOCH_LEN    8      // stp x8(8), xzr at 0x5a1c14
 
+/*
+ * AppleSEPKeyStore IPC version 1.  The first live request is 0x5c bytes and
+ * begins with header_body_size 0x48 (docs/re/sep-protocol.md).  In the kext's
+ * decoded representation the 16-byte payload hash is omitted from the field
+ * offsets, so the digest routine at 0xfffffff00956eab0 sees:
+ *
+ *   +0x10  ipc_version, 4 bytes     (wire +0x14)
+ *   +0x14  time_msecs, 8 bytes      (wire +0x18)
+ *   +0x1c  flags, 4 bytes           (wire +0x20)
+ *   +0x20  id, 8 bytes              (wire +0x24)
+ *   +0x28  v1 tail, 0x20 bytes      (wire +0x2c)
+ *
+ * The five updates are at 0xfffffff00956eb48..0x956ebc4, followed by the
+ * payload update at 0xfffffff00956ebc8..0x956ebd8.  The first 16 digest bytes
+ * are compared with wire +4 at 0xfffffff00956ec64..0x956ec70.  Version 1
+ * therefore has a 0x4c-byte wire header and hashes [0x14, 0x4c) plus payload.
+ */
+#define SKS_IPC_V1_HEADER_BODY_SIZE  0x48
+#define SKS_IPC_V1_HEADER_SIZE       0x4c
+#define SKS_IPC_HASH_OFF             0x04
+#define SKS_IPC_VERSION_OFF          0x14
+#define SKS_IPC_TIME_OFF             0x18
+#define SKS_IPC_FLAGS_OFF            0x20
+#define SKS_IPC_ID_OFF               0x24
+#define SKS_IPC_V1_TAIL_OFF          0x2c
+#define SKS_IPC_V1_HASHED_SIZE       0x38
+#define SKS_IPC_HASH_SIZE            0x10
+#define SKS_IPC_VERSION_1            1
+#define SKS_MSG_REPLY                0x80
+
+/* iOS 27 operations established by the live trace and the call sites that
+ * pass them to the IPC serializer: 0xfffffff00957ed30 passes 0x4d for
+ * negotiation, and 0xfffffff00955eb84 passes 0x2a for set_env.  Byte 1 holds
+ * this code plus the reply bit; byte 2 is a request ID. */
+#define SKS_NEGOTIATE  0x4d
+#define SKS_SET_ENV    0x2a
+#define SKS_NEW_MEDIA_KEY 0x31
+#define SKS_UNWRAP_MEDIA_KEY 0x32
+
+/* fs_new_media_key's first output is the live CPX key: the bridge stores it at
+ * descriptor +0/+8 (0xfffffff00957789c..0x95778b8), and APFS passes that
+ * pointer/length to cpx_set_key_len and memcpy at
+ * 0xfffffff00a8720e8..0xa872190.  AppleNVMeRequest requires exactly 0x40
+ * bytes when the wrapped/composite bit is set
+ * (0xfffffff00a139230..0xa13925c); 0x20 reaches its explicit
+ * "Invalid key length for unwrapped key" branch at 0xfffffff00a1392ac. */
+#define SKS_MEDIA_KEY_SIZE       64
+
+/* The third output is the opaque record which fs_new_media_key gives back to
+ * APFS (0xfffffff009572d90..0x9572da8).  A 0x28-byte value is stored verbatim
+ * in the guest's 80-byte keybag record: the write is logged at
+ * /tmp/dvm/probe/SKS_KEYOP_V7A.serial.log:67 and the next boot sends the same
+ * 0x28-byte record back in /tmp/dvm/probe/SKS_LIVEKEY_V9.stderr.log:6463..6473. */
+#define SKS_WRAPPED_KEY_SIZE     40
+
+static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
+    0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+    0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
+    0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+};
+
+static const uint8_t sks_wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
+    0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+    0x57, 0x52, 0x41, 0x50, 0x50, 0x45, 0x44, 0x2d,
+    0x4b, 0x45, 0x59, 0x2d, 0x30, 0x31, 0x00, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+};
+
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
 // (string 0xfffffff007710dbe) but the boot path we exercise never calls it.
@@ -353,11 +430,9 @@ static const SEPEndpointDef sep_all_eps[] = {
     { "xarm", 19,  1, 4, 1, 4 },
 };
 /*
- * sks is deliberately not in the default list, even though AppleSEPKeyStore
- * waits for it by name. An endpoint that is advertised and then never answers
- * is worse than one that was never advertised: AppleSEPKeyStore sends its
- * first IPC request the moment `sep-endpoint,sks` appears, re-sends it every
- * ~5 s logging
+ * An advertised but unanswered sks endpoint is fatal: AppleSEPKeyStore sends
+ * its first IPC request the moment `sep-endpoint,sks` appears, re-sends it
+ * every ~5 s logging
  *
  *   "AppleSEPKeyStore":pid:0,:3466: sks timeout strike N
  *
@@ -376,14 +451,16 @@ static const SEPEndpointDef sep_all_eps[] = {
  * launchd's `keybag` boot task. The restore-ramdisk boot is only two strikes
  * short of the same panic inside a 120 s probe.
  *
- * The request we would have to answer is captured in docs/re/sep-protocol.md
- * and the reply has to carry an AppleKeyStore ipc.c header of its own: the
+ * This model answers the request captured in docs/re/sep-protocol.md with an
+ * AppleKeyStore ipc.c header of its own.  The
  * kext logs "negotiated to ipc header theirs:v%llu, ours:v%u -> negotiated:
  * v%llu" (0xfffffff00954cd10) after computing
- * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc). Put sks back
- * with DARWIN_SEP_EPS=cntl,scrd,xars,sks,xarm once that reply exists.
+ * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc).  It was
+ * promoted to the default only after op31 and op32 let the guest mount its
+ * encrypted volume after a reboot
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:476..500).
  */
-static const char *const sep_default_eps = "cntl,scrd,xars,xarm";
+static const char *const sep_default_eps = "cntl,scrd,sks,xars,xarm";
 
 typedef struct {
     bool advertised;
@@ -443,6 +520,7 @@ static inline uint8_t frame_tag(uint64_t m)    { return (m >> 8) & 0xff; }
 static inline uint8_t frame_op(uint64_t m)     { return (m >> 16) & 0xff; }
 static inline uint8_t frame_param(uint64_t m)  { return (m >> 24) & 0xff; }
 static inline uint32_t frame_data(uint64_t m)  { return m >> 32; }
+static inline uint8_t sks_code(uint64_t m)     { return frame_tag(m) & 0x7f; }
 
 static inline uint64_t frame(uint8_t ep, uint8_t tag, uint8_t op, uint8_t param, uint32_t data) {
     return (uint64_t)ep | ((uint64_t)tag << 8) | ((uint64_t)op << 16) |
@@ -741,6 +819,249 @@ static void sep_handle_l4info(DarwinSEPState *s, uint64_t m) {
             s->role, s->shm_dva, s->shm_size);
 }
 
+static bool sep_sks_hash_response(DarwinSEPState *s, uint8_t *buf,
+                                  uint32_t size)
+{
+    struct iovec iov[2];
+    g_autofree uint8_t *digest = NULL;
+    size_t digest_len = 0;
+    Error *local_err = NULL;
+
+    if (size < SKS_IPC_V1_HEADER_SIZE) {
+        return false;
+    }
+
+    iov[0].iov_base = buf + SKS_IPC_VERSION_OFF;
+    iov[0].iov_len = SKS_IPC_V1_HASHED_SIZE;
+    iov[1].iov_base = buf + SKS_IPC_V1_HEADER_SIZE;
+    iov[1].iov_len = size - SKS_IPC_V1_HEADER_SIZE;
+    if (qcrypto_hash_bytesv(QCRYPTO_HASH_ALGO_SHA256, iov, ARRAY_SIZE(iov),
+                            &digest, &digest_len, &local_err) < 0 ||
+        digest_len < SKS_IPC_HASH_SIZE) {
+        fprintf(stderr, "sep(%s): sks SHA-256 failed: %s\n", s->role,
+                local_err ? error_get_pretty(local_err) : "short digest");
+        error_free(local_err);
+        return false;
+    }
+    memcpy(buf + SKS_IPC_HASH_OFF, digest, SKS_IPC_HASH_SIZE);
+    return true;
+}
+
+static bool sep_sks_init_response(DarwinSEPState *s, const uint8_t *request,
+                                  uint32_t request_size, uint8_t *response,
+                                  uint32_t response_size)
+{
+    uint32_t header_body_size;
+    uint32_t ipc_version;
+
+    if (request_size < SKS_IPC_V1_HEADER_SIZE ||
+        response_size < SKS_IPC_V1_HEADER_SIZE) {
+        fprintf(stderr, "sep(%s): sks IPC message is shorter than the v1 "
+                "header (request 0x%x, response 0x%x)\n", s->role,
+                request_size, response_size);
+        return false;
+    }
+    header_body_size = ldl_le_p(request);
+    ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
+    if (header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
+        ipc_version != SKS_IPC_VERSION_1) {
+        fprintf(stderr, "sep(%s): sks unsupported IPC header body 0x%x "
+                "version %u; no reply\n", s->role, header_body_size,
+                ipc_version);
+        return false;
+    }
+
+    memset(response, 0, response_size);
+    stl_le_p(response, SKS_IPC_V1_HEADER_BODY_SIZE);
+    stl_le_p(response + SKS_IPC_VERSION_OFF, SKS_IPC_VERSION_1);
+
+    /* Preserve the request identity fields used to match an IPC response.
+     * Their v1 offsets are the fields hashed at 0xfffffff00956eb5c..
+     * 0xfffffff00956ebc4.  Flags stay zero, as in the captured request. */
+    memcpy(response + SKS_IPC_TIME_OFF, request + SKS_IPC_TIME_OFF, 8);
+    memcpy(response + SKS_IPC_ID_OFF, request + SKS_IPC_ID_OFF, 8);
+    memcpy(response + SKS_IPC_V1_TAIL_OFF,
+           request + SKS_IPC_V1_TAIL_OFF,
+           SKS_IPC_V1_HEADER_SIZE - SKS_IPC_V1_TAIL_OFF);
+    return true;
+}
+
+static bool sep_sks_send_response(DarwinSEPState *s, uint64_t m,
+                                  uint8_t *response, uint32_t response_size)
+{
+    SEPEndpointState *e = &s->ep[SEP_EP_KEYSTORE];
+
+    if (response_size > e->ool_out_size || !e->ool_out_addr) {
+        fprintf(stderr, "sep(%s): sks response 0x%x does not fit OOL out "
+                "buffer at dva 0x%" PRIx64 " size 0x%x; no reply\n",
+                s->role, response_size, e->ool_out_addr, e->ool_out_size);
+        return false;
+    }
+    if (!sep_sks_hash_response(s, response, response_size) ||
+        !sep_dma(s, e->ool_out_addr, response, response_size, true)) {
+        return false;
+    }
+
+    fprintf(stderr, "sep(%s): sks code 0x%02x id %u replied with %u-byte "
+            "SHA-256-authenticated IPC v1 message\n", s->role, sks_code(m),
+            frame_op(m), response_size);
+    sep_send(s, SEP_EP_KEYSTORE, frame_tag(m) | SKS_MSG_REPLY, frame_op(m),
+             0, response_size << 16);
+    return true;
+}
+
+static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
+{
+    SEPEndpointState *e = &s->ep[SEP_EP_KEYSTORE];
+    uint32_t request_size = frame_data(m) >> 16;
+    g_autofree uint8_t *request = NULL;
+    g_autofree uint8_t *response = NULL;
+    uint8_t *payload;
+    uint32_t payload_size;
+    const char *name;
+
+    if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
+        fprintf(stderr, "sep(%s): sks code 0x%02x id %u has invalid OOL in "
+                "size 0x%x (buffer 0x%x); no reply\n", s->role, sks_code(m),
+                frame_op(m), request_size, e->ool_in_size);
+        return;
+    }
+    request = g_malloc(request_size);
+    if (!sep_dma(s, e->ool_in_addr, request, request_size, false)) {
+        return;
+    }
+
+    if (s->debug) {
+        uint32_t n = MIN(request_size, SKS_IPC_V1_HEADER_SIZE + 96);
+        fprintf(stderr, "sep(%s): sks code 0x%02x id %u request bytes:",
+                s->role, sks_code(m), frame_op(m));
+        for (uint32_t i = 0; i < n; i++) {
+            if ((i & 15) == 0) {
+                fprintf(stderr, "\n  %04x:", i);
+            }
+            fprintf(stderr, " %02x", request[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    switch (sks_code(m)) {
+    case SKS_NEGOTIATE:
+        name = "negotiate IPC version";
+        payload_size = 16;
+        break;
+    case SKS_SET_ENV:
+        /* The first probe named the caller by panicking with "set_env failed"
+         * at AppleKeyStore.cpp:6790 after receiving a wrong-sized reply
+         * (/tmp/dvm/probe/SKS_V1.serial.log:227). */
+        name = "set environment";
+        payload_size = 4;
+        break;
+    case SKS_NEW_MEDIA_KEY:
+        /* The generated IPC decoder at 0xfffffff00957d6f8..0x957d7a8
+         * consumes three length-prefixed blobs with a scalar between the
+         * second and third.  fs_new_media_key reaches that decoder through
+         * 0xfffffff009572d64 -> 0xfffffff009577870 -> 0xfffffff00957d6e4.
+         * The values are deliberately stable constants: this model has no
+         * SEP secret, and AppleSEPKeyStore treats these fields as opaque. */
+        name = "new media key (fake-key mode)";
+        payload_size = 4 + 4 + SKS_MEDIA_KEY_SIZE + 4 + 4 + 4 +
+                       SKS_WRAPPED_KEY_SIZE;
+        break;
+    case SKS_UNWRAP_MEDIA_KEY:
+        /* fs_unwrap_media_key_from_uid reaches the 0x32 serializer through
+         * 0xfffffff009572e24 -> 0xfffffff009577900 ->
+         * 0xfffffff00957d974.  Its decoder publishes two blobs and a scalar
+         * at 0xfffffff00957da90..0x957db00. */
+        name = "unwrap media key (fake-key mode)";
+        payload_size = 4 + 4 + SKS_MEDIA_KEY_SIZE + 4 + 4;
+        break;
+    default:
+        /* A status-only success is a logged no-op, not a claim that the
+         * operation's side effects are implemented.  It lets the guest name
+         * the next missing operation without fabricating a payload shape. */
+        name = "unknown status-only no-op";
+        payload_size = 4;
+        break;
+    }
+
+    response = g_malloc(SKS_IPC_V1_HEADER_SIZE + payload_size);
+    if (!sep_sks_init_response(s, request, request_size, response,
+                               SKS_IPC_V1_HEADER_SIZE + payload_size)) {
+        return;
+    }
+    payload = response + SKS_IPC_V1_HEADER_SIZE;
+
+    /* Negotiation payload is established by the live request at
+     * /tmp/dvm/probe/SKS_CTL.stderr.log:374-381: status zero followed by
+     * offered version one.  Every unknown operation returns only status zero. */
+    switch (sks_code(m)) {
+    case SKS_NEGOTIATE:
+        stl_le_p(payload, 0);
+        stl_le_p(payload + 4, SKS_IPC_VERSION_1);
+        break;
+    case SKS_NEW_MEDIA_KEY: {
+        uint32_t off = 0;
+
+        /* This is the union selector, not a separate status word.  The
+         * request selects variant 1 at payload+0x04; the matching v1 reply
+         * layout is decoded at 0xfffffff009567394..0x9567408. */
+        stl_le_p(payload + off, 1);
+        off += 4;
+        stl_le_p(payload + off, SKS_MEDIA_KEY_SIZE);
+        off += 4;
+        memcpy(payload + off, sks_media_key, SKS_MEDIA_KEY_SIZE);
+        off += SKS_MEDIA_KEY_SIZE;
+        /* The auxiliary AES-IV key is optional: APFS only calls
+         * cpx_set_aes_iv_key when this length is nonzero at
+         * 0xfffffff00a8721a0..0xa8721ac. */
+        stl_le_p(payload + off, 0);
+        off += 4;
+        /* Bit 1 tells the bridge this is a raw wrapped-key reply; it becomes
+         * bit 0 in the AP-side key descriptor at 0xfffffff0095778d4..0x95778e4.
+         * Without it APFS panics "CP_RAW_KEY_WRAPPEDKEY is NOT set" at
+         * keybag_common.c:1086 (/tmp/dvm/probe/SKS_KEYOP_V5.serial.log:199). */
+        stl_le_p(payload + off, BIT(1));
+        off += 4;
+        stl_le_p(payload + off, SKS_WRAPPED_KEY_SIZE);
+        off += 4;
+        memcpy(payload + off, sks_wrapped_key, SKS_WRAPPED_KEY_SIZE);
+        fprintf(stderr, "sep(%s): sks op31 supplies CPX key length %u, "
+                "no auxiliary key, wrapped record length %u\n", s->role,
+                SKS_MEDIA_KEY_SIZE, SKS_WRAPPED_KEY_SIZE);
+        break;
+    }
+    case SKS_UNWRAP_MEDIA_KEY: {
+        uint32_t off = 0;
+
+        /* The request's wrapped record is intentionally opaque.  In the
+         * first-party no-effaceable-storage mode observed at
+         * /tmp/dvm/probe/SKS_LIVEKEY_V9.serial.log:481, a stable fake key is
+         * the modeled side effect; there is no unknown storage operation to
+         * pretend succeeded. */
+        stl_le_p(payload + off, 1);
+        off += 4;
+        stl_le_p(payload + off, SKS_MEDIA_KEY_SIZE);
+        off += 4;
+        memcpy(payload + off, sks_media_key, SKS_MEDIA_KEY_SIZE);
+        off += SKS_MEDIA_KEY_SIZE;
+        stl_le_p(payload + off, 0);
+        off += 4;
+        stl_le_p(payload + off, BIT(1));
+        fprintf(stderr, "sep(%s): sks op32 restores CPX key length %u, "
+                "no auxiliary key\n", s->role, SKS_MEDIA_KEY_SIZE);
+        break;
+    }
+    default:
+        stl_le_p(payload, 0);
+        break;
+    }
+
+    fprintf(stderr, "sep(%s): sks code 0x%02x id %u (%s), request %u bytes\n",
+            s->role, sks_code(m), frame_op(m), name, request_size);
+    sep_sks_send_response(s, m, response,
+                          SKS_IPC_V1_HEADER_SIZE + payload_size);
+}
+
 /*
  * Show `n` bytes of an endpoint's OOL in-buffer, so the next protocol can be
  * worked out from a live boot rather than guessed. Capped at 256 bytes and at
@@ -854,6 +1175,7 @@ static void sep_receive(DarwinSEPState *s, uint64_t m) {
     case SEP_EP_BOOTSTRAP: sep_handle_bootstrap(s, m); break;
     case SEP_EP_CONTROL:   sep_handle_control(s, m); break;
     case SEP_EP_L4INFO:    sep_handle_l4info(s, m); break;
+    case SEP_EP_KEYSTORE:  sep_handle_sks(s, m); break;
     case 16: case 19:      sep_handle_xart(s, m); break;
     case 10:
         fprintf(stderr, "sep(%s): scrd request tag %u, %u byte body: %s\n", s->role,
@@ -867,7 +1189,7 @@ static void sep_receive(DarwinSEPState *s, uint64_t m) {
         }
         break;
     default:
-        // scrd, sks and friends: logged and left unanswered until their
+        // scrd and friends: logged and left unanswered until their
         // protocols are modelled. This is the honest hole, not a guess.
         fprintf(stderr, "sep(%s): ep %u '%s' op %u tag %u param %u data 0x%08x: no handler\n",
                 s->role, ep, ep_name(s, ep), frame_op(m), frame_tag(m), frame_param(m), frame_data(m));
