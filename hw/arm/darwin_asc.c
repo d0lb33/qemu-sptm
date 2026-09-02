@@ -62,9 +62,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinASCState, DARWIN_ASC)
 #define MBOX_I2A_RECV0  0x830
 #define MBOX_I2A_RECV1  0x838
 
+// Control register layout, from m1n1's R_MBOX_CTRL (hw/asc.py):
+//   [23:20] FIFOCNT   number of messages queued
+//   [18]    OVERFLOW
+//   [17]    EMPTY
+//   [16]    FULL
+//   [15:12] RPTR      read pointer
+//   [11:8]  WPTR      write pointer
+//   [0]     ENABLE    (written by the guest)
 #define MBOX_CTRL_FULL      BIT(16)
 #define MBOX_CTRL_EMPTY     BIT(17)
 #define MBOX_CTRL_CNT_SHIFT 20
+#define MBOX_CTRL_RPTR_SHIFT 12
+#define MBOX_CTRL_WPTR_SHIFT 8
+#define MBOX_CTRL_PTR_MASK   0xf
 
 #define MBOX_FIFO_DEPTH 16
 
@@ -326,12 +337,20 @@ static uint64_t asc_read(void *opaque, hwaddr offset, unsigned size) {
         case MBOX_A2I_CTRL:
             val = s->a2i_ctrl_raw | MBOX_CTRL_EMPTY;
             break;
-        case MBOX_I2A_CTRL:
-            val = s->i2a_ctrl_raw & ~(MBOX_CTRL_FULL | MBOX_CTRL_EMPTY | (0xf << MBOX_CTRL_CNT_SHIFT));
+        case MBOX_I2A_CTRL: {
+            uint32_t rptr = s->i2a_head & MBOX_CTRL_PTR_MASK;
+            uint32_t wptr = (s->i2a_head + s->i2a_count) & MBOX_CTRL_PTR_MASK;
+            val = s->i2a_ctrl_raw & ~(MBOX_CTRL_FULL | MBOX_CTRL_EMPTY |
+                                      (0xf << MBOX_CTRL_CNT_SHIFT) |
+                                      (MBOX_CTRL_PTR_MASK << MBOX_CTRL_RPTR_SHIFT) |
+                                      (MBOX_CTRL_PTR_MASK << MBOX_CTRL_WPTR_SHIFT));
             if (s->i2a_count == 0) val |= MBOX_CTRL_EMPTY;
             if (s->i2a_count >= MBOX_FIFO_DEPTH) val |= MBOX_CTRL_FULL;
             val |= (uint64_t)(s->i2a_count & 0xf) << MBOX_CTRL_CNT_SHIFT;
+            val |= (uint64_t)rptr << MBOX_CTRL_RPTR_SHIFT;
+            val |= (uint64_t)wptr << MBOX_CTRL_WPTR_SHIFT;
             break;
+        }
         case MBOX_I2A_RECV0:
             if (s->i2a_count) val = s->i2a_fifo[s->i2a_head].msg0;
             break;
