@@ -6,6 +6,7 @@
 #include "qapi/error.h"
 #include "target/arm/cpu-qom.h"
 #include "qemu/notify.h"
+#include "system/memory.h"
 
 #define ONE_KB        BIT(10)
 #define ONE_MB        BIT(20)
@@ -48,6 +49,16 @@ struct xnu_boot_info {
 
     // Feedback from the kernel loader back to the darwin machine to boot during reset
     hwaddr  init_pc, init_x0;
+
+    // Boot framebuffer (-fb WxH[@scale], -fbmode text|graphics)
+    // The framebuffer is carved out of the top of DRAM (like iBoot does) and
+    // described to XNU via boot_args.Video and the /vram device tree node.
+    char *fb, *fbmode;
+    uint32_t fb_width, fb_height, fb_scale;
+    bool fb_graphics;
+    hwaddr fb_base;
+    size_t fb_size;
+    MemoryRegion *dram_mr;
 };
 
 #define MACHINE_CLASS_ARG(a) \

@@ -21,6 +21,11 @@
 #include "hw/arm/apple_amcc.h"
 #include "xnu/patch.h"
 #include "xnu/macho.h"
+#include "xnu/darwin_fb.h"
+#include "xnu/darwin_aic.h"
+#include "xnu/darwin_dcp.h"
+#include "xnu/darwin_dart.h"
+#include "xnu/darwin_unimp.h"
 
 // See device tree specification section 2.3.8: ranges
 #define IO_RANGE_BASE_OFFSET     1
@@ -51,6 +56,8 @@ MACHINE_CLASS_ARG(sptm);
 MACHINE_CLASS_ARG(txm);
 MACHINE_CLASS_ARG(tc);
 MACHINE_CLASS_ARG(ramdisk);
+MACHINE_CLASS_ARG(fb);
+MACHINE_CLASS_ARG(fbmode);
 
 static void alloc_zeroed(const char *name, hwaddr pa, size_t len) {
     if (0 == len) {
@@ -119,10 +126,44 @@ static void init_cpu_impl(struct dtree_node *dt_root) {
     alloc_zeroed("cpm_reg_impl", cpm_impl[0].base, cpm_impl[0].len);
 }
 
-static void init_uart(struct dtree_node *dt_root, uint64_t iobase) {
+static DeviceState *init_uart(struct dtree_node *dt_root, uint64_t iobase, DeviceState *aic) {
     struct dtree_node *uart = adt_find_node(dt_root, "arm-io/uart0");
     struct adt_io_reg *uart_reg = adt_get_prop_val(uart, "reg");
-    exynos4210_uart_create(uart_reg[0].base + iobase, 16, 0, serial_hd(0), 0);
+    qemu_irq irq = 0;
+    uint32_t *vec = adt_get_prop_val(uart, "interrupts");
+    if (aic && vec) irq = darwin_aic_get_irq(aic, vec[0]);
+    return exynos4210_uart_create(uart_reg[0].base + iobase, 16, 0, serial_hd(0), irq);
+}
+
+// -fb WxH[@scale] / -fbmode text|graphics
+static void parse_fb_args(struct xnu_boot_info *info) {
+    info->fb_width = info->fb_height = 0;
+    info->fb_scale = 1;
+    info->fb_graphics = false;
+
+    if (!info->fb || !*info->fb || 0 == strcmp(info->fb, "off") || 0 == strcmp(info->fb, "none")) {
+        return;
+    }
+
+    unsigned w = 0, h = 0, s = 1;
+    int n = sscanf(info->fb, "%ux%u@%u", &w, &h, &s);
+    if (n < 2 || !w || !h || w > 8192 || h > 8192 || s < 1 || s > 3) {
+        fprintf(stderr, "error: bad -fb '%s', expected WxH[@scale] (eg. 828x1792@2)\n", info->fb);
+        exit(1);
+    }
+
+    info->fb_width = w;
+    info->fb_height = h;
+    info->fb_scale = s;
+
+    if (info->fbmode) {
+        if (0 == strcmp(info->fbmode, "graphics")) {
+            info->fb_graphics = true;
+        } else if (0 != strcmp(info->fbmode, "text")) {
+            fprintf(stderr, "error: bad -fbmode '%s', expected text or graphics\n", info->fbmode);
+            exit(1);
+        }
+    }
 }
 
 static void init_sep(struct dtree_node *dt_root) {
@@ -136,38 +177,19 @@ static void init_sep(struct dtree_node *dt_root) {
     alloc_zeroed("sep", sep_reg[0].base, sep_reg[0].len);
 }
 
-static void init_aic(struct dtree_node *dt_root, uint64_t iobase) {
-    // This is a bare-bones aic implementation that ignores all register reads/
-    // writes, and simply reports the correct number of IRQs
-    struct dtree_node *aic = adt_find_node(dt_root, "arm-io/aic");
-    struct adt_io_reg *aic_reg = adt_get_prop_val(aic, "reg");
-
-    uint64_t base = aic_reg[0].base + iobase;
-    alloc_zeroed("aic", base, aic_reg[0].len);
-
-    int aic_vers = -1;
-    sscanf(adt_get_prop_val(aic, "compatible"), "aic,%d", &aic_vers);
-
-    uint32_t num_irqs = 0;
-    switch (aic_vers) {
-        case 1:
-            // aic,1 needs register +0x04 from first iobase to report the number of interrupts
-            // This is always 8x the size of the ipid-mask for this device
-            num_irqs = 8 * adt_get_prop_len(aic, "ipid-mask");
-            address_space_write(&address_space_memory, base + 0x4, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
-            break;
-
-        case 2:
-        case 3:
-            // aic,2 and aic,3 have num irqs at +0xC
-            num_irqs = A_GOOD_NUMBER_OF_IRQS;
-            address_space_write(&address_space_memory, base + 0xC, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
-            break;
-
-        default:
-            fprintf(stderr, "warning: unsupported AIC, this will probably not work\n");
-            break;
+// Real AIC model (see darwin_aic.c). Falls back to the old "zeroed RAM" stub
+// with DARWIN_AIC_STUB=1 for debugging.
+static DeviceState *init_aic(struct dtree_node *dt_root, uint64_t iobase, DeviceState *cpudev) {
+    if (getenv("DARWIN_AIC_STUB")) {
+        struct dtree_node *aic = adt_find_node(dt_root, "arm-io/aic");
+        struct adt_io_reg *aic_reg = adt_get_prop_val(aic, "reg");
+        uint64_t base = aic_reg[0].base + iobase;
+        alloc_zeroed("aic", base, aic_reg[0].len);
+        uint32_t num_irqs = A_GOOD_NUMBER_OF_IRQS;
+        address_space_write(&address_space_memory, base + 0xC, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
+        return NULL;
     }
+    return darwin_aic_create(dt_root, iobase, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
 }
 
 static void setup_mte(Object *cpuobj, MachineState *machine, struct xnu_boot_info *info) {
@@ -217,6 +239,7 @@ static void darwin_init(MachineState *ms) {
     struct dtree_node *dt_root;
 
     if (!info->args) info->args = g_default_args;
+    parse_fb_args(info);
     info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel");
     info->dtree_f = check_and_open(info->dtree, "error opening device tree");
     info->tc_f = check_and_open(info->tc, "error opening trust cache");
@@ -271,8 +294,11 @@ static void darwin_init(MachineState *ms) {
     uint64_t iobase = arm_io_ranges[IO_RANGE_BASE_OFFSET];
     assert(0 == arm_io_ranges[0]); // child bus phys addr must be zero
 
-    init_uart(dt_root, iobase);
-    init_aic(dt_root, iobase);
+    if (!getenv("DARWIN_NO_UNIMP")) darwin_unimp_init(dt_root, iobase);
+    DeviceState *aic = init_aic(dt_root, iobase, cpudev);
+    DeviceState *uart = init_uart(dt_root, iobase, aic);
+    darwin_darts_create(dt_root, iobase, aic);
+    darwin_dcp_create(dt_root, iobase, aic);
     init_sep(dt_root);
     init_cpu_impl(dt_root);
 
@@ -284,6 +310,9 @@ static void darwin_init(MachineState *ms) {
 
     // On Apple Si, FIQ is hardwired to platform timer
     qdev_connect_gpio_out(cpudev, GTIMER_HYPVIRT, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+
+    // Boot framebuffer display + keyboard bridge into the serial console
+    darwin_fb_init(info, uart);
 
     qemu_register_reset(do_darwin_reset, s);
     munmap(info->bootkc_f.buf, info->bootkc_f.len);
@@ -313,6 +342,8 @@ static void darwin_machine_class_init(ObjectClass *oc, const void *data) {
     object_class_property_add_str(oc, "txm", txm_darwin_class_get, txm_darwin_class_set);
     object_class_property_add_str(oc, "tc", tc_darwin_class_get, tc_darwin_class_set);
     object_class_property_add_str(oc, "ramdisk", ramdisk_darwin_class_get, ramdisk_darwin_class_set);
+    object_class_property_add_str(oc, "fb", fb_darwin_class_get, fb_darwin_class_set);
+    object_class_property_add_str(oc, "fbmode", fbmode_darwin_class_get, fbmode_darwin_class_set);
 
     darwin_machine_init(mc);
 }

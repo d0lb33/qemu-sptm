@@ -650,6 +650,26 @@ static const VMStateDescription vmstate_exynos4210_uart = {
     }
 };
 
+/*
+ * Inject received bytes into the UART as if they arrived from the chardev
+ * backend. Used by darwin-fb to forward keyboard input from the QEMU display
+ * window into the guest's serial console.
+ */
+int exynos4210_uart_inject(DeviceState *dev, const uint8_t *buf, int len)
+{
+    Exynos4210UartState *s = EXYNOS4210_UART(dev);
+    int can = exynos4210_uart_can_receive(s);
+
+    if (can <= 0) {
+        return 0;
+    }
+    if (len > can) {
+        len = can;
+    }
+    exynos4210_uart_receive(s, buf, len);
+    return len;
+}
+
 DeviceState *exynos4210_uart_create(hwaddr addr,
                                     int fifo_size,
                                     int channel,

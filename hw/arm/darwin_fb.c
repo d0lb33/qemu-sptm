@@ -1,0 +1,304 @@
+/*
+ * darwin-fb: boot framebuffer display for the -M darwin machine
+ *
+ * XNU draws its verbose-boot text console (and, in graphics mode, the boot
+ * progress spinner) into the framebuffer described by boot_args.Video. That
+ * framebuffer lives at the top of guest DRAM (see setup_framebuffer in
+ * xnuboot_sptm.c). This device exposes that guest memory zero-copy as a
+ * DisplaySurface so any QEMU UI (cocoa, sdl, gtk, vnc, ...) can show it.
+ *
+ * Since the emulated machine has no HID hardware, keyboard input from the QEMU
+ * display window is translated to ASCII / VT100 escape sequences and injected
+ * into the guest's UART, so the window works as a terminal for the serial
+ * console (boot with serial=2: serial input, video console output).
+ */
+
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu/module.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "ui/console.h"
+#include "ui/surface.h"
+#include "ui/input.h"
+#include "system/memory.h"
+#include "hw/arm/exynos4210.h"
+#include "standard-headers/linux/input-event-codes.h"
+#include "xnu/boot/xnuboot.h"
+#include "xnu/darwin_fb.h"
+
+#define TYPE_DARWIN_FB "darwin-fb"
+OBJECT_DECLARE_SIMPLE_TYPE(DarwinFBState, DARWIN_FB)
+
+struct DarwinFBState {
+    SysBusDevice parent_obj;
+
+    QemuConsole *con;
+    DisplaySurface *surface;
+    bool surface_attached;
+
+    uint8_t *host;
+    uint32_t width, height, scale;
+    hwaddr guest_base;
+    bool graphics;
+
+    DeviceState *uart;
+    QemuInputHandlerState *kbd;
+    bool shift, ctrl, alt, caps;
+};
+
+/* ---------------- display ---------------- */
+
+static bool darwin_fb_gfx_update(void *opaque)
+{
+    DarwinFBState *s = opaque;
+
+    if (!s->surface_attached) {
+        // Ownership of the surface passes to the console
+        qemu_console_set_surface(s->con, s->surface);
+        s->surface_attached = true;
+    }
+
+    // The surface is backed directly by guest RAM, so just flag a full refresh.
+    // The UI backends (vnc in particular) do their own dirty-tile detection.
+    qemu_console_update_full(s->con);
+    return true;
+}
+
+static void darwin_fb_invalidate(void *opaque)
+{
+}
+
+static const GraphicHwOps darwin_fb_ops = {
+    .invalidate = darwin_fb_invalidate,
+    .gfx_update = darwin_fb_gfx_update,
+};
+
+/* ---------------- keyboard -> UART ---------------- */
+
+// US keyboard layout, indexed by linux keycode
+static const char keymap_lower[] = {
+    [KEY_ESC] = 0x1b,
+    [KEY_1] = '1', [KEY_2] = '2', [KEY_3] = '3', [KEY_4] = '4', [KEY_5] = '5',
+    [KEY_6] = '6', [KEY_7] = '7', [KEY_8] = '8', [KEY_9] = '9', [KEY_0] = '0',
+    [KEY_MINUS] = '-', [KEY_EQUAL] = '=', [KEY_BACKSPACE] = 0x7f, [KEY_TAB] = '\t',
+    [KEY_Q] = 'q', [KEY_W] = 'w', [KEY_E] = 'e', [KEY_R] = 'r', [KEY_T] = 't',
+    [KEY_Y] = 'y', [KEY_U] = 'u', [KEY_I] = 'i', [KEY_O] = 'o', [KEY_P] = 'p',
+    [KEY_LEFTBRACE] = '[', [KEY_RIGHTBRACE] = ']', [KEY_ENTER] = '\r',
+    [KEY_A] = 'a', [KEY_S] = 's', [KEY_D] = 'd', [KEY_F] = 'f', [KEY_G] = 'g',
+    [KEY_H] = 'h', [KEY_J] = 'j', [KEY_K] = 'k', [KEY_L] = 'l',
+    [KEY_SEMICOLON] = ';', [KEY_APOSTROPHE] = '\'', [KEY_GRAVE] = '`',
+    [KEY_BACKSLASH] = '\\',
+    [KEY_Z] = 'z', [KEY_X] = 'x', [KEY_C] = 'c', [KEY_V] = 'v', [KEY_B] = 'b',
+    [KEY_N] = 'n', [KEY_M] = 'm', [KEY_COMMA] = ',', [KEY_DOT] = '.', [KEY_SLASH] = '/',
+    [KEY_KPASTERISK] = '*', [KEY_SPACE] = ' ',
+    [KEY_KP7] = '7', [KEY_KP8] = '8', [KEY_KP9] = '9', [KEY_KPMINUS] = '-',
+    [KEY_KP4] = '4', [KEY_KP5] = '5', [KEY_KP6] = '6', [KEY_KPPLUS] = '+',
+    [KEY_KP1] = '1', [KEY_KP2] = '2', [KEY_KP3] = '3', [KEY_KP0] = '0', [KEY_KPDOT] = '.',
+    [KEY_102ND] = '\\', [KEY_KPENTER] = '\r', [KEY_KPSLASH] = '/',
+};
+
+static const char keymap_upper[] = {
+    [KEY_ESC] = 0x1b,
+    [KEY_1] = '!', [KEY_2] = '@', [KEY_3] = '#', [KEY_4] = '$', [KEY_5] = '%',
+    [KEY_6] = '^', [KEY_7] = '&', [KEY_8] = '*', [KEY_9] = '(', [KEY_0] = ')',
+    [KEY_MINUS] = '_', [KEY_EQUAL] = '+', [KEY_BACKSPACE] = 0x7f, [KEY_TAB] = '\t',
+    [KEY_Q] = 'Q', [KEY_W] = 'W', [KEY_E] = 'E', [KEY_R] = 'R', [KEY_T] = 'T',
+    [KEY_Y] = 'Y', [KEY_U] = 'U', [KEY_I] = 'I', [KEY_O] = 'O', [KEY_P] = 'P',
+    [KEY_LEFTBRACE] = '{', [KEY_RIGHTBRACE] = '}', [KEY_ENTER] = '\r',
+    [KEY_A] = 'A', [KEY_S] = 'S', [KEY_D] = 'D', [KEY_F] = 'F', [KEY_G] = 'G',
+    [KEY_H] = 'H', [KEY_J] = 'J', [KEY_K] = 'K', [KEY_L] = 'L',
+    [KEY_SEMICOLON] = ':', [KEY_APOSTROPHE] = '"', [KEY_GRAVE] = '~',
+    [KEY_BACKSLASH] = '|',
+    [KEY_Z] = 'Z', [KEY_X] = 'X', [KEY_C] = 'C', [KEY_V] = 'V', [KEY_B] = 'B',
+    [KEY_N] = 'N', [KEY_M] = 'M', [KEY_COMMA] = '<', [KEY_DOT] = '>', [KEY_SLASH] = '?',
+    [KEY_KPASTERISK] = '*', [KEY_SPACE] = ' ',
+    [KEY_KP7] = '7', [KEY_KP8] = '8', [KEY_KP9] = '9', [KEY_KPMINUS] = '-',
+    [KEY_KP4] = '4', [KEY_KP5] = '5', [KEY_KP6] = '6', [KEY_KPPLUS] = '+',
+    [KEY_KP1] = '1', [KEY_KP2] = '2', [KEY_KP3] = '3', [KEY_KP0] = '0', [KEY_KPDOT] = '.',
+    [KEY_102ND] = '|', [KEY_KPENTER] = '\r', [KEY_KPSLASH] = '/',
+};
+
+static const char *darwin_kbd_special(unsigned key)
+{
+    switch (key) {
+    case KEY_UP:       return "\x1b[A";
+    case KEY_DOWN:     return "\x1b[B";
+    case KEY_RIGHT:    return "\x1b[C";
+    case KEY_LEFT:     return "\x1b[D";
+    case KEY_HOME:     return "\x1b[H";
+    case KEY_END:      return "\x1b[F";
+    case KEY_INSERT:   return "\x1b[2~";
+    case KEY_DELETE:   return "\x1b[3~";
+    case KEY_PAGEUP:   return "\x1b[5~";
+    case KEY_PAGEDOWN: return "\x1b[6~";
+    case KEY_F1:       return "\x1bOP";
+    case KEY_F2:       return "\x1bOQ";
+    case KEY_F3:       return "\x1bOR";
+    case KEY_F4:       return "\x1bOS";
+    default:           return NULL;
+    }
+}
+
+static void darwin_kbd_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *evt)
+{
+    DarwinFBState *s = DARWIN_FB(dev);
+    unsigned key;
+    bool down;
+    uint8_t buf[8];
+    int len = 0;
+
+    if (!s->uart || evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+
+    key = evt->key.key;
+    down = evt->key.down;
+
+    switch (key) {
+    case KEY_LEFTSHIFT:
+    case KEY_RIGHTSHIFT:
+        s->shift = down;
+        return;
+    case KEY_LEFTCTRL:
+    case KEY_RIGHTCTRL:
+        s->ctrl = down;
+        return;
+    case KEY_LEFTALT:
+    case KEY_RIGHTALT:
+    case KEY_LEFTMETA:
+    case KEY_RIGHTMETA:
+        s->alt = down;
+        return;
+    case KEY_CAPSLOCK:
+        if (down) {
+            s->caps = !s->caps;
+        }
+        return;
+    default:
+        break;
+    }
+
+    if (!down) {
+        return;
+    }
+
+    const char *seq = darwin_kbd_special(key);
+    if (seq) {
+        len = strlen(seq);
+        memcpy(buf, seq, len);
+    } else {
+        char c = 0;
+        if (key < ARRAY_SIZE(keymap_lower)) {
+            c = (s->shift ? keymap_upper : keymap_lower)[key];
+        }
+        if (!c) {
+            return;
+        }
+        if (s->caps) {
+            if (c >= 'a' && c <= 'z') {
+                c = c - 'a' + 'A';
+            } else if (c >= 'A' && c <= 'Z') {
+                c = c - 'A' + 'a';
+            }
+        }
+        if (s->ctrl) {
+            if (c >= 'a' && c <= 'z') {
+                c = c - 'a' + 1;
+            } else if (c >= 'A' && c <= 'Z') {
+                c = c - 'A' + 1;
+            } else if (c >= '@' && c <= '_') {
+                c = c - '@';
+            } else if (c == '?') {
+                c = 0x7f;
+            }
+        }
+        buf[0] = c;
+        len = 1;
+    }
+
+    exynos4210_uart_inject(s->uart, buf, len);
+}
+
+static const QemuInputHandler darwin_kbd_handler = {
+    .name  = "darwin-fb keyboard (to serial console)",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = darwin_kbd_event,
+};
+
+/* ---------------- device ---------------- */
+
+static void darwin_fb_realize(DeviceState *dev, Error **errp)
+{
+    DarwinFBState *s = DARWIN_FB(dev);
+
+    if (!s->host || !s->width || !s->height) {
+        error_setg(errp, "darwin-fb: no framebuffer memory configured");
+        return;
+    }
+
+    // XNU's boot video pixel format is "BBBBBBBBGGGGGGGGRRRRRRRR" (32bpp,
+    // little endian B,G,R,X in memory), which is pixman x8r8g8b8.
+    s->surface = qemu_create_displaysurface_from(s->width, s->height,
+                                                 PIXMAN_x8r8g8b8,
+                                                 s->width * 4, s->host);
+    s->con = qemu_graphic_console_create(dev, 0, &darwin_fb_ops, s);
+
+    if (s->uart) {
+        s->kbd = qemu_input_handler_register(dev, &darwin_kbd_handler);
+        qemu_input_handler_activate(s->kbd);
+    }
+
+    fprintf(stderr, "darwin-fb: %ux%u@%u framebuffer at 0x%" HWADDR_PRIx
+            " (%s mode%s)\n", s->width, s->height, s->scale, s->guest_base,
+            s->graphics ? "graphics" : "text",
+            s->uart ? ", keyboard -> serial console" : "");
+}
+
+static void darwin_fb_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    dc->realize = darwin_fb_realize;
+    dc->desc = "XNU boot framebuffer";
+    dc->user_creatable = false;
+}
+
+static const TypeInfo darwin_fb_info = {
+    .name          = TYPE_DARWIN_FB,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(DarwinFBState),
+    .class_init    = darwin_fb_class_init,
+};
+
+static void darwin_fb_register_types(void)
+{
+    type_register_static(&darwin_fb_info);
+}
+
+type_init(darwin_fb_register_types)
+
+void darwin_fb_init(struct xnu_boot_info *info, DeviceState *uart)
+{
+    if (!info->fb_width || !info->fb_height || !info->fb_size) {
+        return;
+    }
+
+    assert(info->dram_mr);
+    assert(info->fb_base >= info->dram_base);
+    assert(info->fb_base + info->fb_size <= info->dram_base + info->dram_size);
+
+    DeviceState *dev = qdev_new(TYPE_DARWIN_FB);
+    DarwinFBState *s = DARWIN_FB(dev);
+
+    s->host = (uint8_t *)memory_region_get_ram_ptr(info->dram_mr) + (info->fb_base - info->dram_base);
+    s->width = info->fb_width;
+    s->height = info->fb_height;
+    s->scale = info->fb_scale;
+    s->guest_base = info->fb_base;
+    s->graphics = info->fb_graphics;
+    s->uart = uart;
+
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+}

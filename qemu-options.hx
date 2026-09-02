@@ -6688,6 +6688,12 @@ DEF("tc", HAS_ARG, QEMU_OPTION_tc, \
 DEF("ramdisk", HAS_ARG, QEMU_OPTION_ramdisk, \
            "-ramdisk file    use 'file' as the ramdisk \n", QEMU_ARCH_ALL)
 
+DEF("fb", HAS_ARG, QEMU_OPTION_fb, \
+           "-fb WxH[@scale]    give XNU a WxH boot framebuffer (eg. 828x1792@2), 'off' to disable\n", QEMU_ARCH_ALL)
+
+DEF("fbmode", HAS_ARG, QEMU_OPTION_fbmode, \
+           "-fbmode text|graphics    XNU framebuffer mode: text console (default) or boot graphics\n", QEMU_ARCH_ALL)
+
 HXCOMM This is the last statement. Insert new options before this line!
 
 #undef DEF

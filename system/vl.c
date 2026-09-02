@@ -3046,6 +3046,12 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_ramdisk:
                 qdict_put_str(machine_opts_dict, "ramdisk", optarg);
                 break;
+            case QEMU_OPTION_fb:
+                qdict_put_str(machine_opts_dict, "fb", optarg);
+                break;
+            case QEMU_OPTION_fbmode:
+                qdict_put_str(machine_opts_dict, "fbmode", optarg);
+                break;
             case QEMU_OPTION_append:
                 qdict_put_str(machine_opts_dict, "append", optarg);
                 break;

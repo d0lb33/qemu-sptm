@@ -33,11 +33,61 @@
 #define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT(36)-1)) ))
 #define STRIP_L2_PT_INDEX(a)    (( ((a)) & (~(BIT(36)-1)) ))
 
-static void alloc_ram(Object *cpuobj, hwaddr base, size_t len) {
+static void alloc_ram(Object *cpuobj, struct xnu_boot_info *info, hwaddr base, size_t len) {
     MemoryRegion *ram_main = get_system_memory();
     MemoryRegion *ram_subreg = g_new(MemoryRegion, 1);
     memory_region_init_ram(ram_subreg, NULL, "dram", len, &error_fatal);
     memory_region_add_subregion(ram_main, base, ram_subreg);
+    info->dram_mr = ram_subreg;
+}
+
+// Framebuffer carveout granularity. Keeping memSize 2MB aligned keeps XNU's
+// physmap block mappings happy.
+#define FB_ALIGN (2 * ONE_MB)
+
+// Carve the boot framebuffer out of the top of DRAM, exactly like iBoot does:
+// XNU only manages [physBase, physBase + memSize), so shrinking memSize keeps
+// the framebuffer out of the free page pool. XNU then maps it via
+// boot_args.Video with ml_io_map (device / write-combined attributes), which
+// the SPTM pmap explicitly supports for DRAM addresses.
+//
+// Must be called after args->memSize is final, and before the device tree is
+// copied into guest memory (it fills in /vram/reg, just like iBoot).
+static void setup_framebuffer(struct xnu_boot_info *info, boot_args *args, struct dtree_node *dt_root) {
+    if (!info->fb_width || !info->fb_height) return;
+
+    size_t fb_size = ROUND_UP_POW2((size_t)info->fb_width * 4 * info->fb_height, FB_ALIGN);
+    if (fb_size >= args->memSize / 2) {
+        fprintf(stderr, "error: framebuffer (%zu bytes) is too large for DRAM\n", fb_size);
+        exit(1);
+    }
+
+    hwaddr fb_base = args->physBase + args->memSize - fb_size;
+    args->memSize -= fb_size;
+
+    args->Video.v_baseAddr = fb_base;
+    args->Video.v_display  = info->fb_graphics ? 1 : 0;   // 0 = text console, 1 = boot graphics (progress spinner)
+    args->Video.v_rowBytes = info->fb_width * 4;
+    args->Video.v_width    = info->fb_width;
+    args->Video.v_height   = info->fb_height;
+    args->Video.v_depth    = 32 | ((info->fb_scale - 1) << kBootVideoDepthScaleShift);
+
+    info->fb_base = fb_base;
+    info->fb_size = fb_size;
+
+    // iBoot publishes the framebuffer in /vram/reg = <base size>
+    struct dtree_node *vram = adt_find_node(dt_root, "vram");
+    if (vram) {
+        u64 *reg = adt_get_prop_val(vram, "reg");
+        if (reg && adt_get_prop_len(vram, "reg") >= 2 * sizeof(u64)) {
+            reg[0] = fb_base;
+            reg[1] = fb_size;
+        }
+    }
+
+#ifdef DEBUG_MEMORY_LAYOUT
+    printf("framebuffer: 0x%016llX (0x%zX) %ux%u@%u\n", fb_base, fb_size, info->fb_width, info->fb_height, info->fb_scale);
+#endif // DEBUG_MEMORY_LAYOUT
 }
 
 static hwaddr vtop(macho_info_t *mi, hwaddr v) {
@@ -92,7 +142,7 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
     u8 *macho_bkc = (u8*)info->bootkc_f.buf;
     u8 *macho_txm = (u8*)info->txm_f.buf;
 
-    alloc_ram(OBJECT(cpu), info->dram_base, info->dram_size);
+    alloc_ram(OBJECT(cpu), info, info->dram_base, info->dram_size);
 
     macho_info_t bkc_mi  = macho_get_info(macho_bkc);
     macho_info_t txm_mi  = macho_get_info(macho_txm);
@@ -384,6 +434,7 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
     args.deviceTreeP = dtree_base_phys - args.physBase + args.virtBase;
     args.deviceTreeLength = info->dtree_f.len;
     g_strlcpy(args.CommandLine, info->args, BOOT_LINE_LENGTH);
+    setup_framebuffer(info, &args, (struct dtree_node*)dtree);
 
 #ifdef DEBUG_MEMORY_LAYOUT
     uint64_t sptm_load = args.virtBase - args.physBase + sptm_mi.physlo;
@@ -446,7 +497,7 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
 static void arm_load_xnu_nosptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_info *info) {
     u8 *macho_bkc = (u8*)info->bootkc_f.buf;
 
-    alloc_ram(OBJECT(cpu), info->dram_base, info->dram_size);
+    alloc_ram(OBJECT(cpu), info, info->dram_base, info->dram_size);
 
     macho_info_t bkc_mi  = macho_get_info(macho_bkc);
 
@@ -486,6 +537,7 @@ static void arm_load_xnu_nosptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_i
     args.deviceTreeP = dtree_base_phys - args.physBase + args.virtBase;
     args.deviceTreeLength = info->dtree_f.len;
     g_strlcpy(args.CommandLine, info->args, BOOT_LINE_LENGTH);
+    setup_framebuffer(info, &args, (struct dtree_node*)info->dtree_f.buf);
 
     assert(args.topOfKernelData > bkc_mi.physlo + (bkc_mi.virthi - bkc_mi.virtlo));
 
