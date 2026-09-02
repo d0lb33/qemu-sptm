@@ -929,9 +929,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * The values are deliberately stable constants: this model has no
          * SEP secret, and AppleSEPKeyStore treats these fields as opaque. */
         name = "new media key (deterministic constants)";
-        payload_size = 4 + 4 + SKS_MEDIA_KEY_BLOB_SIZE +
-                       4 + SKS_MEDIA_KEY_BLOB_SIZE + 4 +
-                       4 + SKS_MEDIA_KEY_BLOB_SIZE;
+        payload_size = 4 + 4 + 4 + 4 + 4 + SKS_MEDIA_KEY_BLOB_SIZE;
         break;
     default:
         /* A status-only success is a logged no-op, not a claim that the
@@ -968,19 +966,18 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
 
         stl_le_p(payload + off, 0);
         off += 4;
-        for (unsigned int blob = 0; blob < 2; blob++) {
-            stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
-            off += 4;
-            memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
-            payload[off] ^= blob;
-            off += SKS_MEDIA_KEY_BLOB_SIZE;
-        }
+        /* These are optional in/out buffers.  fs_new_media_key supplies a
+         * -1 sentinel for the first one; a nonzero length makes the decoder
+         * copy through 0xffffffff at 0xfffffff00957f97c. */
+        stl_le_p(payload + off, 0);
+        off += 4;
+        stl_le_p(payload + off, 0);
+        off += 4;
         stl_le_p(payload + off, 0);
         off += 4;
         stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
         off += 4;
         memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
-        payload[off] ^= 2;
         break;
     }
     default:
