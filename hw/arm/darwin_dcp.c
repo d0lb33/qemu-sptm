@@ -164,6 +164,25 @@ static bool dcp_announce(DarwinDCP *d, uint8_t ep, const DCPService *svc) {
         { .key = "EPICName",          .str = svc->epic_name },
         { .key = "EPICProviderClass", .str = svc->provider },
         { .key = "EPICUnit",          .num = 0, .bits = 64 },
+        /*
+         * Required, and its absence is what kept every DCPAV*Proxy from
+         * starting. They all share DCPAVProxy::start (0xfffffff009b03e40),
+         * which checks, in order: OSDynamicCast(AFKEndpointInterface,
+         * provider), getWorkLoop(), IOService::start, then
+         *
+         *   provider->getProperty("EPICLocation") must be an OSString
+         *   (0xfffffff009b04088-0xfffffff009b040ac)
+         *
+         * before EPICUnit. Without it the proxy fails out with
+         * "DCPAVRemoteSACControllerProxy failed to start".
+         *
+         * The value is compared against "External"; IOAVFamily
+         * (0xfffffff009db7868) maps it to an "External"/"Embedded" Location
+         * property, and the DCP firmware's own string table carries exactly
+         * those two next to the EPIC* keys (dcpfw+0x3f65d5, +0x3f65de).
+         * "Embedded" is the built-in panel, which is what we are.
+         */
+        { .key = "EPICLocation",      .str = "Embedded" },
         { .key = "name",              .str = svc->epic_name },
         { .key = "interface-name",    .str = svc->epic_name },
     };

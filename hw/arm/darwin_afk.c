@@ -630,6 +630,34 @@ bool darwin_afk_handle(DarwinAFK *a, uint8_t ep, uint64_t msg) {
         afk_ep_reset(a, e);
         return true;
 
+    case RBEP_RECV: {
+        /*
+         * RECV is *our* opcode -- we send AFK_MSG(RBEP_RECV) | wptr to tell the
+         * AP to drain the RX ring -- but iOS 27's AP sends it back at us to
+         * mean the opposite: "I have written to my TX ring, come and drain it".
+         * It is SEND (0xa2) by another name, with the new wptr in bits [31:16].
+         *
+         * Established by instrumenting both rings when it arrives. Twice, the
+         * value in bits [31:16] equalled the TX ring's own wptr exactly, while
+         * our TX read cursor sat at 0 and the RX ring was fully drained:
+         *
+         *   msg 0x0085000000800000 [hi16 0x0080] tx{rptr 0x0 wptr 0x80}
+         *   msg 0x0085000001800080 [hi16 0x0180] tx{rptr 0x0 wptr 0x180}
+         *   rx{rptr 0x1800 wptr 0x1800} after 16 announces
+         *
+         * Ignoring it left the AP's first two real messages unread, which is
+         * where the conversation stalled after the service announces.
+         */
+        uint32_t wptr = (uint32_t)((msg >> 16) & 0xffff);
+        if (e->state != AFK_EP_STARTED) {
+            fprintf(stderr, "afk(%s): ep 0x%02x RECV before START_ACK (state %u), ignoring\n",
+                    a->role, ep, e->state);
+            return true;
+        }
+        afk_drain_tx(a, ep, e, wptr);
+        return true;
+    }
+
     default:
         // Never fault, never guess: log what the AP asked for so the next
         // person can see exactly which opcode is missing.
