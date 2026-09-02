@@ -131,10 +131,12 @@ static void init_cpu_impl(struct dtree_node *dt_root) {
 static DeviceState *init_uart(struct dtree_node *dt_root, uint64_t iobase, DeviceState *aic) {
     struct dtree_node *uart = adt_find_node(dt_root, "arm-io/uart0");
     struct adt_io_reg *uart_reg = adt_get_prop_val(uart, "reg");
-    qemu_irq irq = 0;
-    uint32_t *vec = adt_get_prop_val(uart, "interrupts");
-    if (aic && vec) irq = darwin_aic_get_irq(aic, vec[0]);
-    return exynos4210_uart_create(uart_reg[0].base + iobase, 16, 0, serial_hd(0), irq);
+    // Deliberately left unconnected. XNU's Apple serial driver never clears
+    // UINTP, and exynos4210_uart only deasserts its line when that is cleared,
+    // so a connected line would latch high forever and storm the AIC. The
+    // console works because XNU polls the UART; nothing depends on this
+    // interrupt today.
+    return exynos4210_uart_create(uart_reg[0].base + iobase, 16, 0, serial_hd(0), 0);
 }
 
 // -fb WxH[@scale] / -fbmode text|graphics
@@ -191,7 +193,10 @@ static DeviceState *init_aic(struct dtree_node *dt_root, uint64_t iobase, Device
         address_space_write(&address_space_memory, base + 0xC, MEMTXATTRS_UNSPECIFIED, &num_irqs, sizeof(num_irqs));
         return NULL;
     }
-    return darwin_aic_create(dt_root, iobase, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+    // The CPU is not realized yet, so it has no canonical QOM path and a link
+    // to its gpio would be silently stored as "". darwin_init connects the
+    // output after qdev_realize instead.
+    return darwin_aic_create(dt_root, iobase, NULL);
 }
 
 static void setup_mte(Object *cpuobj, MachineState *machine, struct xnu_boot_info *info) {
@@ -317,6 +322,14 @@ static void darwin_init(MachineState *ms) {
 
     // On Apple Si, FIQ is hardwired to platform timer
     qdev_connect_gpio_out(cpudev, GTIMER_HYPVIRT, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+
+    // Must come after realize, for the same reason as the FIQ above: before it,
+    // the CPU has no canonical QOM path, object_property_set_link stores "" and
+    // qemu_set_irq on the result is a silent no-op. That is why no AIC
+    // interrupt was ever delivered to the guest.
+    if (aic) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(aic), 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+    }
 
     // Boot framebuffer display + keyboard bridge into the serial console
     darwin_fb_init(info, uart);

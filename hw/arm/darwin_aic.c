@@ -379,7 +379,10 @@ DeviceState *darwin_aic_create(struct dtree_node *dt_root, uint64_t iobase, qemu
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, reg[0].base + iobase);
-    sysbus_connect_irq(sbd, 0, cpu_irq);
+    // May be NULL: connecting to a gpio of a device that is not yet realized
+    // silently stores an empty QOM link, so the machine connects this after
+    // the CPU is realized instead. See darwin.c.
+    if (cpu_irq) sysbus_connect_irq(sbd, 0, cpu_irq);
 
     fprintf(stderr, "darwin-aic: aic,%d at 0x%" PRIx64 " (%u vectors, ext 0x%x, stride 0x%x, iack 0x%x)\n",
             version, reg[0].base + iobase, max_irq,
