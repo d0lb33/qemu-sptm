@@ -29,6 +29,9 @@
 // TXM actual virt addr = sptm.virtlo + 1 * SPTM_EXPECTED_STRIDE
 // BKC actual virt addr = sptm.virtlo + 2 * SPTM_EXPECTED_STRIDE
 #define SPTM_EXPECTED_STRIDE    0x10000000
+// A real sep-firmware image is a few MiB; 2 MiB of zeros is plenty for an
+// emulated SEP that never reads it (see the SEPFW block below).
+#define SEPFW_RESERVED_SIZE     0x200000
 
 #define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT(36)-1)) ))
 #define STRIP_L2_PT_INDEX(a)    (( ((a)) & (~(BIT(36)-1)) ))
@@ -388,6 +391,19 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
         blob_head += info->ramdisk_f.len;
         blob_head = ROUND_NEXT_PAGE(blob_head);
         END_ENTRY("RAMDisk");
+    }
+
+    // SEPFW: where iBoot would have left the SEP firmware image. Only when the
+    // device tree carries the entry (dt_fixup -enable sep adds it), and
+    // deliberately zero-filled: AppleSEPFirmware::fromPreload wraps the range
+    // in a memory descriptor and maps it for the SEP without reading it
+    // (AppleSEPManager kext 0xfffffff009591df4..0x591eb4), and the emulated
+    // SEP in darwin_sep.c never looks at the image either. Placed below
+    // topOfKernelData so XNU treats it as reserved rather than free memory.
+    if (adt_get_prop_val(map, "SEPFW")) {
+        blob_head += SEPFW_RESERVED_SIZE;
+        blob_head = ROUND_NEXT_PAGE(blob_head);
+        END_ENTRY("SEPFW");
     }
 
 #undef PUSH_SEG

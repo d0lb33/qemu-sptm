@@ -27,6 +27,7 @@
 #include "xnu/darwin_asc.h"
 #include "xnu/darwin_sart.h"
 #include "xnu/darwin_dart.h"
+#include "xnu/darwin_sep.h"
 #include "xnu/darwin_unimp.h"
 
 // See device tree specification section 2.3.8: ranges
@@ -307,9 +308,12 @@ static void darwin_init(MachineState *ms) {
     darwin_darts_create(dt_root, iobase, aic);
     darwin_sarts_create(dt_root, iobase, aic);
     darwin_dcp_create(dt_root, iobase, aic);
+    // The SEP is an ASC wrapper too, but speaks its own protocol above the
+    // mailbox rather than RTKit, so it gets its own model (darwin_sep.c).
+    darwin_sep_create(dt_root, iobase, aic);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
-    static const char *const claimed_ascs[] = { "dcp" };
+    static const char *const claimed_ascs[] = { "dcp", "sep" };
     darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, ARRAY_SIZE(claimed_ascs));
     init_sep(dt_root);
     init_cpu_impl(dt_root);
