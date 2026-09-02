@@ -356,6 +356,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * this code plus the reply bit; byte 2 is a request ID. */
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
+#define SKS_CHECK_CLASS 0x10
 #define SKS_NEW_MEDIA_KEY 0x31
 #define SKS_UNWRAP_MEDIA_KEY 0x32
 
@@ -956,6 +957,17 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         name = "set environment";
         payload_size = 4;
         break;
+    case SKS_CHECK_CLASS:
+        /* fs_check_class emits union selector 2 at wire payload +0x00
+         * (/tmp/dvm/probe/SKS_REMOUNT_V10.stderr.log:1912..1919).  Its
+         * variant-2 reply decoder at 0xfffffff009562ee8..0x956302c consumes
+         * five length-prefixed blobs and two u32 scalars after the selector.
+         * Empty blobs and zero scalars are the fake-key result; omitting those
+         * fields is rejected as e00002bc at
+         * /tmp/dvm/idle/probe/OP10_TEST.serial.log:486. */
+        name = "check class available (fake-key mode)";
+        payload_size = 4 + 5 * 4 + 2 * 4;
+        break;
     case SKS_NEW_MEDIA_KEY:
         /* The generated IPC decoder at 0xfffffff00957d6f8..0x957d7a8
          * consumes three length-prefixed blobs with a scalar between the
@@ -998,6 +1010,14 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
+        break;
+    case SKS_CHECK_CLASS:
+        stl_le_p(payload, 2);
+        /* sep_sks_init_response() zeroes the five blob lengths and two
+         * trailing scalars required by the decoder. */
+        fprintf(stderr, "sep(%s): sks op10 reports the requested class "
+                "available through 32-byte fake-key union variant 2\n",
+                s->role);
         break;
     case SKS_NEW_MEDIA_KEY: {
         uint32_t off = 0;
