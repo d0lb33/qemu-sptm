@@ -974,7 +974,11 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         off += 4;
         stl_le_p(payload + off, 0);
         off += 4;
-        stl_le_p(payload + off, 0);
+        /* Bit 1 tells the bridge this is a raw wrapped-key reply; it becomes
+         * bit 0 in the AP-side key descriptor at 0xfffffff0095778d4..0x95778e4.
+         * Without it APFS panics "CP_RAW_KEY_WRAPPEDKEY is NOT set" at
+         * keybag_common.c:1086 (/tmp/dvm/probe/SKS_KEYOP_V5.serial.log:199). */
+        stl_le_p(payload + off, BIT(1));
         off += 4;
         stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
         off += 4;
