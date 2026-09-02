@@ -349,25 +349,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_IPC_VERSION_1            1
 #define SKS_MSG_REPLY                0x80
 
-/* Operation byte values observed in the iOS 27 frame or cross-checked by the
- * AppleSEPKeyStore strings listed in docs/re/sks-feasibility.md. */
-#define SKS_CREATE_KEYBAG       0x01
-#define SKS_COPY_KEYBAG         0x02
-#define SKS_LOAD_KEYBAG         0x03
-#define SKS_CHANGE_LOCK_STATE   0x04
-#define SKS_UNLOAD_KEYBAG       0x05
-#define SKS_KC_WRAP             0x08
-#define SKS_NULL_D_KEY          0x0a
-#define SKS_UNWRAP_D_KEY        0x0c
-#define SKS_MAKE_SYSTEM_KEYBAG  0x0d
-#define SKS_GET_DEVICE_STATE    0x19
-#define SKS_CLIENT_TERMINATE    0x1b
-
-/* Stable, opaque values.  AppleSEPKeyStore does not compare them with an
- * AP-held secret; docs/re/sks-feasibility.md traces the only reply check to
- * the self-contained transport digest above. */
-#define SKS_KEYBAG_HANDLE       0x42414731u /* 'BAG1', integer wire value */
-#define SKS_FAKE_KEY_SIZE       0x10
+/* iOS 27 operations established by the live trace.  The public reference's
+ * operation numbers are from an older protocol and are deliberately not used:
+ * docs/re/sep-protocol.md records that its first operation would decode as 77,
+ * while the iOS 27 frame carries operation 1 in byte 2. */
+#define SKS_NEGOTIATE  0x01
+#define SKS_SET_ENV    0x04
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -905,63 +892,38 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         return;
     }
 
+    if (s->debug) {
+        uint32_t n = MIN(request_size, SKS_IPC_V1_HEADER_SIZE + 96);
+        fprintf(stderr, "sep(%s): sks op 0x%02x request bytes:", s->role,
+                frame_op(m));
+        for (uint32_t i = 0; i < n; i++) {
+            if ((i & 15) == 0) {
+                fprintf(stderr, "\n  %04x:", i);
+            }
+            fprintf(stderr, " %02x", request[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     switch (frame_op(m)) {
-    case SKS_CREATE_KEYBAG:
-        name = "create keybag";
+    case SKS_NEGOTIATE:
+        name = "negotiate IPC version";
         payload_size = 8;
         break;
-    case SKS_COPY_KEYBAG:
-        name = "copy keybag";
-        payload_size = 8 + SKS_FAKE_KEY_SIZE;
-        break;
-    case SKS_LOAD_KEYBAG:
-        name = "load keybag";
-        payload_size = 8;
-        break;
-    case SKS_CHANGE_LOCK_STATE:
-        name = "change lock state";
-        payload_size = 16;
-        break;
-    case SKS_UNLOAD_KEYBAG:
-        name = "unload keybag";
+    case SKS_SET_ENV:
+        /* The first probe named the caller by panicking with "set_env failed"
+         * at AppleKeyStore.cpp:6790 after receiving a wrong-sized op 4 reply
+         * (/tmp/dvm/probe/SKS_V1.serial.log:227). */
+        name = "set environment";
         payload_size = 4;
         break;
-    case SKS_NULL_D_KEY:
-        name = "null D key (status-only stub)";
-        payload_size = 4;
-        break;
-    case SKS_UNWRAP_D_KEY:
-        name = "unwrap D key (status-only stub)";
-        payload_size = 4;
-        break;
-    case SKS_MAKE_SYSTEM_KEYBAG:
-        name = "make system keybag (status-only stub)";
-        payload_size = 4;
-        break;
-    case SKS_GET_DEVICE_STATE:
-        name = "get device state (opaque stub)";
-        payload_size = 16;
-        break;
-    case SKS_CLIENT_TERMINATE:
-        name = "client terminate";
-        payload_size = 4;
-        break;
-    case SKS_KC_WRAP:
-        /* The cited public reference has no payload implementation for op
-         * 0x08 (docs/re/sks-feasibility.md).  Preserve that fact as a logged
-         * no-op response rather than inventing a wrapping format. */
-        fprintf(stderr, "sep(%s): sks KC wrap op 0x08 tag %u: unsupported; "
-                "replying with an empty no-op frame\n", s->role,
-                frame_tag(m));
-        sep_send(s, SEP_EP_KEYSTORE, frame_tag(m) | SKS_MSG_REPLY,
-                 frame_op(m), 0, 0);
-        return;
     default:
-        /* Older implementations echo unknown messages.  That behaviour has
-         * not been derived for iOS 27, so leave it silent and diagnostic. */
-        fprintf(stderr, "sep(%s): sks op 0x%02x tag %u is unknown; no reply\n",
-                s->role, frame_op(m), frame_tag(m));
-        return;
+        /* A status-only success is a logged no-op, not a claim that the
+         * operation's side effects are implemented.  It lets the guest name
+         * the next missing operation without fabricating a payload shape. */
+        name = "unknown status-only no-op";
+        payload_size = 4;
+        break;
     }
 
     response = g_malloc(SKS_IPC_V1_HEADER_SIZE + payload_size);
@@ -971,37 +933,13 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     }
     payload = response + SKS_IPC_V1_HEADER_SIZE;
 
-    /* Payload shapes are the operation facts catalogued in
-     * docs/re/sks-feasibility.md.  Values are deliberately deterministic and
-     * opaque; status-only operations are logged above as stubs. */
+    /* Negotiation payload is established by the live request at
+     * /tmp/dvm/probe/SKS_CTL.stderr.log:374-381: status zero followed by
+     * offered version one.  Every unknown operation returns only status zero. */
     switch (frame_op(m)) {
-    case SKS_CREATE_KEYBAG:
-        stl_le_p(payload, 1);
-        stl_le_p(payload + 4, SKS_KEYBAG_HANDLE);
-        break;
-    case SKS_COPY_KEYBAG:
+    case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
-        stl_le_p(payload + 4, SKS_FAKE_KEY_SIZE);
-        memset(payload + 8, 0xaf, SKS_FAKE_KEY_SIZE);
-        break;
-    case SKS_LOAD_KEYBAG:
-        stl_le_p(payload, 0);
-        stl_le_p(payload + 4, SKS_KEYBAG_HANDLE);
-        break;
-    case SKS_CHANGE_LOCK_STATE: {
-        uint32_t lock_state = 0;
-        stl_le_p(payload, 0);
-        if (request_size >= SKS_IPC_V1_HEADER_SIZE + 16) {
-            lock_state = ldl_le_p(request + SKS_IPC_V1_HEADER_SIZE + 12);
-        }
-        stl_le_p(payload + 4, lock_state | BIT(22));
-        stq_le_p(payload + 8, 3);
-        break;
-    }
-    case SKS_GET_DEVICE_STATE:
-        stl_le_p(payload, 0);
-        stl_le_p(payload + 4, 8);
-        memcpy(payload + 8, "applehax", 8);
+        stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
     default:
         stl_le_p(payload, 0);
