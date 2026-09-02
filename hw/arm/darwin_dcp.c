@@ -204,8 +204,34 @@ static bool dcp_handle(void *opaque, uint8_t ep, uint64_t msg) {
              * own heap DVA. This tries the constant first; if it fails, the
              * DVA the AP just announced is the other candidate.
              */
-            uint64_t ack_msg = 0x0004000000000001ULL;
-            darwin_asc_send(d->asc, ep, ack_msg);
+            /*
+             * The firmware hash the AP checks is a *field of this same ack*,
+             * not a later message: link_handle_message's class-1 branch reads
+             * remote = (msg >> 16) & 0xffffffff -- bits [47:16], narrower than
+             * the 48-bit payload the class-0 announce uses -- at
+             * lsr x23, x28, 0x10 (0xfffffff00a0cfb9c) and compares it 32-bit
+             * at 0xa0cfba0.
+             *
+             * An earlier probe sent 0x0004000000000001, which put its 4 in
+             * bits [63:48] and left [47:16] zero, producing exactly
+             *   "Firmware hash checksum mismatched: local=0x15A5C96B,
+             *    remote=0x00000000" @AppleDCPLinkService.cpp:624
+             *
+             * local is crc32(0, G, 4) where G is four bytes of this kext's own
+             * __DATA at 0xfffffff00b880c70 (bootkc file offset 0x487cc70),
+             * which are d3 00 00 00 -- the OSSerialize binary signature. It is
+             * a pure function of a compile-time constant with no dependency on
+             * anything we send, so echoing it is legitimate rather than a
+             * forgery. Verified here: python3 -c "import zlib;
+             * print(hex(zlib.crc32(bytes([0xd3,0,0,0]))))" gives 0x15a5c96b,
+             * matching the panic's own local value.
+             *
+             * It is nonetheless specific to *this* kernelcache. If the guest
+             * build changes, recompute from those four bytes rather than
+             * trusting the constant.
+             */
+            uint64_t fw_hash = 0x15A5C96BULL;
+            uint64_t ack_msg = (fw_hash << 16) | 0x0001ULL;
             fprintf(stderr, "dcp: IOMFB PROBE class-1 init-ack -> 0x%016" PRIx64 "\n", ack_msg);
         }
         return true;
