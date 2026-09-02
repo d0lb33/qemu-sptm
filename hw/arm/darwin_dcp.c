@@ -153,6 +153,38 @@ static bool dcp_handle(void *opaque, uint8_t ep, uint64_t msg) {
     if (d->afk && darwin_afk_owns_endpoint(d->afk, ep)) {
         return darwin_afk_handle(d->afk, ep, msg);
     }
+    if (ep == 0x37) {
+        /*
+         * IOMFB link (AppleDCPLinkServiceSoC). Not AFK: our AFK reader takes
+         * bits [63:48] as the opcode, which gives 0x0100 for the AP's first
+         * message, and AFK opcodes are single bytes -- so the split differs.
+         *
+         * Decoded here two ways so a boot log carries the evidence. The
+         * second is the M1-era Linux "dcpep" layout (drivers/gpu/drm/apple):
+         * TYPE bits[3:0], ACK bit 6, CONTEXT bits[11:8], OFFSET bits[31:12],
+         * LENGTH bits[63:32]. Under it the AP's opening message
+         * 0x0100000000000040 reads as type 0 with the ACK bit set, which is
+         * suggestive but unconfirmed for iOS 27 -- every other M1-era framing
+         * has needed correction here, so treat it as a hypothesis until
+         * docs/re/iomfb-link.md derives the real one.
+         */
+        fprintf(stderr, "dcp: IOMFB ep 0x37 msg 0x%016" PRIx64
+                " | afk-style type 0x%04x | dcpep-style type %u ack %u ctx %u off 0x%05x len 0x%08x\n",
+                msg, (unsigned)((msg >> 48) & 0xffff),
+                (unsigned)(msg & 0xf), (unsigned)((msg >> 6) & 1),
+                (unsigned)((msg >> 8) & 0xf), (unsigned)((msg >> 12) & 0xfffff),
+                (unsigned)(msg >> 32));
+
+        const char *probe = getenv("DARWIN_DCP_IOMFB");
+        if (probe && probe[0] == '2') {
+            /* Probe only: echo it straight back and see whether the AP moves.
+             * A question, not modelled behaviour. */
+            darwin_asc_send(d->asc, ep, msg);
+            fprintf(stderr, "dcp: IOMFB PROBE echo -> 0x%016" PRIx64 "\n", msg);
+        }
+        return true;
+    }
+
     // Endpoints we advertise but do not speak (and the RTKit system
     // endpoints darwin_asc.c does not consume). Log, never fault.
     fprintf(stderr, "dcp: AP -> ep 0x%02x msg 0x%016" PRIx64 " (type 0x%02x, no protocol modelled)\n",
@@ -419,7 +451,7 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     memcpy(dcp_eps_adv, dcp_eps, sizeof(dcp_eps));
     dcp_eps_adv_n = ARRAY_SIZE(dcp_eps);
     const char *iomfb = getenv("DARWIN_DCP_IOMFB");
-    if (iomfb && iomfb[0] == '1') {
+    if (iomfb && iomfb[0] && iomfb[0] != '0' && strcmp(iomfb, "off")) {
         dcp_eps_adv[dcp_eps_adv_n++] = 0x37;
         fprintf(stderr, "dcp: advertising endpoint 0x37 (IOMFB link) -- no protocol modelled, "
                         "every message will be logged and unanswered\n");
