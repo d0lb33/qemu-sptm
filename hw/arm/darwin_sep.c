@@ -357,7 +357,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_SET_ENV    0x2a
 #define SKS_NEW_MEDIA_KEY 0x31
 
-#define SKS_MEDIA_KEY_BLOB_SIZE 32
+/* APFS builds a 0x28-byte media-key record before invoking its unwrap path at
+ * 0xfffffff00a872b90..0xfffffff00a872bac.  Returning only 0x20 bytes produces
+ * an invalid I/O encryption key and reaches "nvme: Missing key!" at
+ * IOEmbeddedNVMeBlockDevice.cpp:432
+ * (/tmp/dvm/probe/SKS_KEYOP_V6B.serial.log:163). */
+#define SKS_MEDIA_KEY_BLOB_SIZE 40
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -961,6 +966,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
             0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
             0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
             0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
         };
         uint32_t off = 0;
 
