@@ -60,6 +60,10 @@
  *   16   'xars'  xART slave    18   'sks '  AppleSEPKeyStore (the keybag)
  *   19   'xarm'  xART master   253  discovery   254  L4Info   255  bootstrap
  *
+ * 'sks' is known but NOT advertised by default -- announcing an endpoint we
+ * cannot answer panics the kernel after 20 unanswered requests. See the long
+ * comment above sep_default_eps.
+ *
  * ---------------------------------------------------------------------------
  * Bootstrap endpoint (255), what AppleSEPBooter sends and what it accepts
  *
@@ -306,7 +310,38 @@ static const SEPEndpointDef sep_all_eps[] = {
     { "sks ", 18,  1, 4, 1, 4 },
     { "xarm", 19,  1, 4, 1, 4 },
 };
-static const char *const sep_default_eps = "cntl,scrd,xars,sks,xarm";
+/*
+ * sks is deliberately not in the default list, even though AppleSEPKeyStore
+ * waits for it by name. An endpoint that is advertised and then never answers
+ * is worse than one that was never advertised: AppleSEPKeyStore sends its
+ * first IPC request the moment `sep-endpoint,sks` appears, re-sends it every
+ * ~5 s logging
+ *
+ *   "AppleSEPKeyStore":pid:0,:3466: sks timeout strike N
+ *
+ * (kext AppleSEPKeyStore 0xfffffff00954c118) and at strike 20 --
+ * `cmp w21, 0x14` / `b.ge` at 0xfffffff00954c0b4 -- hands over to
+ * AppleSEPManager, which panics the kernel outright:
+ *
+ *   panic(cpu 0 caller 0xfffffff0295a6e4c): AppleSEPManager panic for
+ *     "AppleSEPKeyStore": sks request timeout
+ *   Firmware type: UNKNOWN SEPOS   SEP state: 8   PM state: 2
+ *
+ * Measured both ways on the system-volume boot (docs/re/seputil-data-
+ * protection.md): advertising sks, the boot dies at that panic 16,720 serial
+ * lines in, part way through mount-phase-2; not advertising it, the same boot
+ * runs to 42,018 lines with zero panics, finishes mount-phase-2 and reaches
+ * launchd's `keybag` boot task. The restore-ramdisk boot is only two strikes
+ * short of the same panic inside a 120 s probe.
+ *
+ * The request we would have to answer is captured in docs/re/sep-protocol.md
+ * and the reply has to carry an AppleKeyStore ipc.c header of its own: the
+ * kext logs "negotiated to ipc header theirs:v%llu, ours:v%u -> negotiated:
+ * v%llu" (0xfffffff00954cd10) after computing
+ * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc). Put sks back
+ * with DARWIN_SEP_EPS=cntl,scrd,xars,sks,xarm once that reply exists.
+ */
+static const char *const sep_default_eps = "cntl,scrd,xars,xarm";
 
 typedef struct {
     bool advertised;
