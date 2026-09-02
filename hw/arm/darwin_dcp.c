@@ -117,6 +117,25 @@ static const uint8_t dcp_eps[] = {
     0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a
 };
 
+/*
+ * The advertised set, built at create time. dcp_eps above is the AFK block;
+ * DARWIN_DCP_IOMFB=1 appends 0x37.
+ *
+ * 0x37 is DCPEndpoint24 / AppleDCPLinkServiceSoC -- IOMFB, the endpoint the
+ * *framebuffer* actually rides on. It speaks a different RPC framing directly
+ * on RTKit, not AFK, and we model none of it, which is why it is off by
+ * default: advertising an endpoint we cannot answer moves the stall somewhere
+ * harder to read.
+ *
+ * Turning it on is deliberately a question rather than a feature. Every AFK
+ * message the AP sends on it lands in dcp_handle()'s "no protocol modelled"
+ * log, which is exactly how the AFK framing itself was first derived -- the
+ * unhandled-opcode line is what revealed that iOS 27's AP uses 0x85 for the
+ * opposite direction to ours. Same method, new endpoint.
+ */
+static uint8_t dcp_eps_adv[ARRAY_SIZE(dcp_eps) + 1];
+static unsigned dcp_eps_adv_n;
+
 static void dcp_started(void *opaque) {
     fprintf(stderr, "dcp: coprocessor booted\n");
 }
@@ -397,7 +416,15 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     }
     d->next_iface = 1;
 
-    d->asc = darwin_asc_create(dcp, iobase, aic, dcp_eps, ARRAY_SIZE(dcp_eps), &dcp_asc_ops, d);
+    memcpy(dcp_eps_adv, dcp_eps, sizeof(dcp_eps));
+    dcp_eps_adv_n = ARRAY_SIZE(dcp_eps);
+    const char *iomfb = getenv("DARWIN_DCP_IOMFB");
+    if (iomfb && iomfb[0] == '1') {
+        dcp_eps_adv[dcp_eps_adv_n++] = 0x37;
+        fprintf(stderr, "dcp: advertising endpoint 0x37 (IOMFB link) -- no protocol modelled, "
+                        "every message will be logged and unanswered\n");
+    }
+    d->asc = darwin_asc_create(dcp, iobase, aic, dcp_eps_adv, dcp_eps_adv_n, &dcp_asc_ops, d);
 
     /*
      * The AFK rings live in guest memory the DCP reaches through its own
