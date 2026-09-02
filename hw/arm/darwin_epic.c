@@ -296,3 +296,30 @@ char *darwin_epic_describe(const uint8_t *data, uint32_t len)
     return g_strdup_printf("iface %u tlen 0x%x flags 0x%x | %s type 0x%02x opt 0x%x body 0x%x",
                            iface, tlen, flags, epic_cat_name(cat), type, opt, blen);
 }
+
+uint8_t *darwin_epic_build_call(uint16_t iface_id, uint8_t category, uint8_t type,
+                                const uint8_t *body, size_t body_len,
+                                uint8_t options, size_t *out_len)
+{
+    size_t total = EPIC_MSG_HDR_SIZE + EPIC_PKT_HDR_SIZE + body_len;
+    uint8_t *buf = g_malloc0(total);
+
+    /* message header, same shape as build_publish() */
+    buf[0] = 0;                                     /* no extra 0x18 block */
+    buf[1] = 0;
+    stw_le_p(buf + 2, iface_id);
+    stl_le_p(buf + 4, (uint32_t)(EPIC_PKT_HDR_SIZE + body_len));
+
+    /* packet header */
+    uint8_t *pkt = buf + EPIC_MSG_HDR_SIZE;
+    stq_le_p(pkt, 0);                               /* timestamp; the AP sends 0 */
+    pkt[8]  = type;
+    pkt[9]  = category;
+    pkt[10] = options;
+
+    if (body_len && body) {
+        memcpy(buf + EPIC_MSG_HDR_SIZE + EPIC_PKT_HDR_SIZE, body, body_len);
+    }
+    *out_len = total;
+    return buf;
+}

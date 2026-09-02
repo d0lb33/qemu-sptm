@@ -13,6 +13,9 @@
  */
 
 /* ---- packet header, epic_pkt_hdr.category (bootkc 0xfffffff008b8f60c) ---- */
+#define EPIC_MSG_HDR_SIZE 8
+#define EPIC_PKT_HDR_SIZE 16
+
 #define EPIC_CAT_REPORT   0
 #define EPIC_CAT_COMMAND  1
 #define EPIC_CAT_RESPONSE 2
@@ -66,3 +69,15 @@ uint8_t *darwin_epic_build_publish(uint16_t iface_id, const char *name,
  * Returns a g_malloc'd string; never fails, never faults on short frames.
  */
 char *darwin_epic_describe(const uint8_t *data, uint32_t len);
+
+/*
+ * Build one complete AFK queue-entry payload carrying a COMMAND or RESPONSE.
+ *
+ * `body` is the category-specific body, which for the standard-service type
+ * begins with an 8-byte header whose byte 1 is the command id the AP matches
+ * replies against (bootkc 0xfffffff008b8eca8, `ubfx w1, w26, #8, #8`).
+ * Caller frees with g_free().
+ */
+uint8_t *darwin_epic_build_call(uint16_t iface_id, uint8_t category, uint8_t type,
+                                const uint8_t *body, size_t body_len,
+                                uint8_t options, size_t *out_len);

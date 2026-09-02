@@ -268,18 +268,91 @@ static void dcp_afk_started(void *opaque, uint8_t ep) {
 }
 
 /*
- * Diagnostic decode only: darwin_epic_describe() knows the iOS 27 header
- * shapes (8-byte message header + 16-byte packet header, see darwin_epic.c).
- * We print what the guest sent and do not reply -- answering a command
- * without knowing its group/command numbers would be a guess, and a wrong
- * reply is harder to debug than no reply. A driver that binds and then waits
- * here is the expected next stall, and this line is where you see it.
+ * Received EPIC frames.
+ *
+ * Decoding is always on; replying is not. darwin_epic_describe() knows the
+ * iOS 27 header shapes (8-byte message header + 16-byte packet header, see
+ * darwin_epic.c), so we can always say what the guest sent.
+ *
+ * Whether to answer is a different question. Once the service announces are
+ * accepted the AP opens an interface and issues a standard-service command
+ * (type 0xc0), and it waits on that reply with a timeout -- so staying silent
+ * guarantees a stall. But the body layout beyond its 8-byte header is not
+ * derived yet: we know only that byte 1 is the command id the AP matches
+ * replies against (bootkc 0xfffffff008b8eca8, `ubfx w1, w26, #8, #8`).
+ *
+ * So DARWIN_DCP_REPLY=1 turns on a deliberate *probe*: echo the command's
+ * 8-byte body header back as a RESPONSE of the same type and interface, with
+ * the rest of the body zeroed. This is a question we are asking the guest, not
+ * modelled hardware behaviour -- it is off by default precisely because a
+ * wrong reply is harder to read than no reply, and whatever the AP does next
+ * is the evidence that tells us the real layout.
  */
 static void dcp_afk_recv(void *opaque, uint8_t ep, uint32_t channel, uint32_t type,
                          const uint8_t *data, uint32_t len) {
+    DarwinDCP *d = opaque;
     g_autofree char *desc = darwin_epic_describe(data, len);
-    fprintf(stderr, "dcp: UNANSWERED EPIC frame ep 0x%02x qe(chan %u type %u len 0x%x): %s\n",
-            ep, channel, type, len, desc);
+
+    const char *probe = getenv("DARWIN_DCP_REPLY");
+    bool want_reply = probe && probe[0] == '1';
+    size_t hdrs = EPIC_MSG_HDR_SIZE + EPIC_PKT_HDR_SIZE;
+
+    if (!want_reply || len < hdrs) {
+        fprintf(stderr, "dcp: UNANSWERED EPIC frame ep 0x%02x qe(chan %u type %u len 0x%x): %s\n",
+                ep, channel, type, len, desc);
+        return;
+    }
+
+    const uint8_t *pkt = data + EPIC_MSG_HDR_SIZE;
+    uint8_t cat = pkt[9], ptype = pkt[8];
+    uint16_t iface = lduw_le_p(data + 2);
+    uint32_t blen = len - hdrs;
+
+    if (cat != EPIC_CAT_COMMAND || blen < 8) {
+        fprintf(stderr, "dcp: EPIC frame ep 0x%02x (not a command, no reply): %s\n", ep, desc);
+        return;
+    }
+
+    /*
+     * Echo the command's 8-byte body header so the command id (byte 1) matches,
+     * but *not* the u32 at +4, and zero everything after it.
+     *
+     * That u32 is the payload length on the way in -- across three commands in
+     * one boot, arg was always body_len - 8 (0x60/0x68, 0x50/0x58, 0x90/0x98).
+     * On the way back the AP reads the same offset as a return code: echoing it
+     * made DCPAVRemoteSACControllerProxy, which is interface 8 and whose
+     * command carried arg 0x50, report exactly
+     *
+     *   DCPAVRemoteSACControllerProxy::bootCompleteGated() error: ret = 0x50
+     *
+     * So we were handing our own request length back as a status. Zero is the
+     * success value this hypothesis predicts; whatever the AP does next is the
+     * evidence for or against it.
+     */
+    g_autofree uint8_t *body = g_malloc0(blen);
+    memcpy(body, pkt + EPIC_PKT_HDR_SIZE, 4);
+
+    size_t flen = 0;
+    g_autofree uint8_t *frame =
+        darwin_epic_build_call(iface, EPIC_CAT_RESPONSE, ptype, body, blen, 0, &flen);
+
+    /*
+     * Echo the first two bytes of the message header back.
+     *
+     * darwin_epic.c documents byte 0 as flags, "bit 0 means a 0x18-byte extra
+     * block follows". That is not what this build does with it: across one
+     * boot the AP sent 0x0, 0x1, 0x2 ... 0xf on successive frames, a clean
+     * monotonic counter, so it is a sequence/tag the AP almost certainly
+     * correlates replies against. Sending 0 in every reply, as we first did,
+     * got DCPAVRemoteSACControllerProxy::bootCompleteGated() to parse the
+     * response and reject it with ret = 0x50.
+     */
+    frame[0] = data[0];
+    frame[1] = data[1];
+
+    bool ok = darwin_afk_send_qe(d->afk, ep, 0, 0, frame, flen, true);
+    fprintf(stderr, "dcp: PROBE reply ep 0x%02x -> RESPONSE type 0x%02x iface %u body 0x%x (%s): %s\n",
+            ep, ptype, iface, (unsigned)blen, ok ? "queued" : "ring full", desc);
 }
 
 static const DarwinASCOps dcp_asc_ops = {
