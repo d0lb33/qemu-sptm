@@ -497,9 +497,265 @@ static void patch_memdev_4gib(u8 *bkc_macho) {
             (ok_a && n_bc == 2) ? "should now work" : "may still be truncated");
 }
 
+/* ---- bsd_rooted_ramdisk(): let rootdev= boot the memory disk ---------------
+ *
+ * Booting with "rd=md0" puts iOS on its restore path and it never reaches a
+ * usable system: launchd decides "Restore environment" from a plain
+ * strstr(kern.bootargs, "rd=md0"), and libignition (statically linked into
+ * /usr/lib/dyld) selects its two-stage "ramdisk" boot spec when the rd boot-arg
+ * is exactly "md0". Between them that skips mount-phase-1/2, usermanagerd,
+ * keybag and tzinit, leaves the root read-only, and so no persona is ever
+ * created and SpringBoard's spawn never completes.
+ *
+ * XNU accepts "rootdev=" as an alias of "rd=" for the memory-disk root
+ * (iokit/bsddev/IOKitBSDInit.cpp:725-728 and :1027-1028), and neither launchd's
+ * substring test nor libignition's exact-token parser recognises that spelling.
+ * So "rootdev=md0" boots the same memory disk down the normal path.
+ *
+ * The one thing that breaks is bsd_rooted_ramdisk() (bsd/kern/bsd_init.c:460),
+ * which only ever reads "rd". With "rootdev=" its PE_parse_boot_argn fails, it
+ * returns false, and bsd_init then enforces FSIOC_KERNEL_ROOTAUTH and panics
+ * with "rootvp not authenticated after mounting" on our unsealed volume
+ * (bsd_init.c:934-950). Forcing its return to true restores exactly the
+ * behaviour "rd=md0" already gets today.
+ *
+ * The site, in com.apple.kernel __TEXT_EXEC __text, is the tail of that
+ * function:
+ *
+ *      cmp   w0, #0          71 00 00 1f
+ *      cset  w20, eq         1a 9f 17 f4
+ *      b     .+8             14 00 00 02
+ *      mov   w20, #0         52 80 00 14   <-- becomes mov w20, #1
+ *
+ * That run is not unique on its own — this kernel has two of them in __text —
+ * so we additionally require the site to sit just after code that materialises
+ * the "md0" string, which is what bsd_rooted_ramdisk compares the boot-arg
+ * against. Exactly one site must qualify, so a kernel the pattern does not fit
+ * is left alone rather than corrupted.
+ *
+ * Only correct because our root really is a memory disk. Set
+ * DARWIN_ROOTDEV_PATCH=0 to skip it.
+ */
+#define ROOTED_RD_CMP     0x7100001Fu   /* cmp  w0, #0   */
+#define ROOTED_RD_CSET    0x1A9F17F4u   /* cset w20, eq  */
+#define ROOTED_RD_B8      0x14000002u   /* b    .+8      */
+#define ROOTED_RD_MOV0    0x52800014u   /* mov  w20, #0  */
+#define ROOTED_RD_MOV1    0x52800034u   /* mov  w20, #1  */
+#define ROOTED_RD_WINDOW  64            /* insns back to look for the "md0" ref */
+
+static void patch_rooted_ramdisk(u8 *bkc_macho) {
+    const char *off = getenv("DARWIN_ROOTDEV_PATCH");
+    if (off && 0 == strcmp(off, "0")) {
+        fprintf(stderr, "rootdev patch: disabled by DARWIN_ROOTDEV_PATCH=0\n");
+        return;
+    }
+
+    fse_t *kern_fse = macho_find_fileset_entry(bkc_macho, "com.apple.kernel");
+    if (!kern_fse) {
+        fprintf(stderr, "warning: rootdev patch: no com.apple.kernel fileset entry\n");
+        return;
+    }
+    u8 *kern_macho = &bkc_macho[kern_fse->fileoff];
+
+    sect_t *cstr = macho_find_sect(kern_macho, "__TEXT", "__cstring");
+    sect_t *text = macho_find_sect(kern_macho, "__TEXT_EXEC", "__text");
+    if (!cstr || !text) {
+        fprintf(stderr, "warning: rootdev patch: kernel __cstring/__text not found\n");
+        return;
+    }
+
+    /* The "md0" the boot-arg is compared against, as a whole string. */
+    u64 strva = 0;
+    char *strs = (char*)&bkc_macho[cstr->offset];
+    for (size_t i = 0; i + 4 <= cstr->size; i++) {
+        if (i != 0 && strs[i - 1] != '\0') continue;      /* real string start */
+        if (0 == strncmp(&strs[i], "md0", 4)) {           /* includes the NUL */
+            strva = cstr->addr + i;
+            break;
+        }
+    }
+    if (0 == strva) {
+        fprintf(stderr, "warning: rootdev patch: \"md0\" string not found in the kernel\n");
+        return;
+    }
+
+    u32 *insns = (u32*)&bkc_macho[text->offset];
+    size_t count = text->size / sizeof(u32);
+    size_t hits = 0, at = 0;
+
+    for (size_t i = 0; i + 3 < count; i++) {
+        if (insns[i]     != ROOTED_RD_CMP  ||
+            insns[i + 1] != ROOTED_RD_CSET ||
+            insns[i + 2] != ROOTED_RD_B8   ||
+            insns[i + 3] != ROOTED_RD_MOV0) continue;
+
+        /* Does an ADRP(+ADD) for "md0" appear shortly before this run?  Only
+         * bsd_rooted_ramdisk both ends this way and mentions md0. */
+        bool near_md0 = false;
+        size_t lo = i > ROOTED_RD_WINDOW ? i - ROOTED_RD_WINDOW : 0;
+        for (size_t k = lo; k < i && !near_md0; k++) {
+            u32 adrp = insns[k];
+            if (!IS_ADRP(adrp)) continue;
+
+            i64 immlo = (adrp >> 29) & 0x3;
+            i64 immhi = (adrp >> 5) & 0x7FFFF;
+            i64 imm   = (immhi << 2) | immlo;
+            if (imm & (1LL << 20)) imm -= (1LL << 21);
+
+            u64 pc   = text->addr + k * sizeof(u32);
+            u64 page = (pc & ~0xFFFULL) + (u64)(imm * 4096);
+            u32 rd   = INSN_RD(adrp);
+
+            for (size_t j = k + 1; j < count && j <= k + 4; j++) {
+                u32 w = insns[j];
+                if (IS_ADD_X_IMM(w) && INSN_RN(w) == rd &&
+                    page + ADD_IMM12(w) == strva) { near_md0 = true; break; }
+                if (INSN_RD(w) == rd) break;
+            }
+        }
+        if (!near_md0) continue;
+
+        if (0 == hits) at = i + 3;
+        hits++;
+    }
+
+    if (0 == hits) {
+        fprintf(stderr, "warning: rootdev patch: bsd_rooted_ramdisk tail not found; "
+                "boot with rd=md0, not rootdev=md0\n");
+        return;
+    }
+    if (hits > 1) {
+        fprintf(stderr, "warning: rootdev patch: %zu candidate sites near \"md0\", "
+                "expected 1; refusing to patch\n", hits);
+        return;
+    }
+
+    u64 va = text->addr + at * sizeof(u32);
+    fprintf(stderr, "rootdev patch: %#llx  %08x -> %08x  mov w20,#1  "
+            "(bsd_rooted_ramdisk returns true, so rootdev=md0 boots)\n",
+            (unsigned long long)va, insns[at], ROOTED_RD_MOV1);
+    insns[at] = ROOTED_RD_MOV1;
+}
+
+/* ---- silence the TXM log flood ------------------------------------------
+ *
+ * XNU emits one line often enough to dominate everything else:
+ *
+ *   TXM [Error]: selector: 38 | 42
+ *
+ * 1,626,184 times in a 300-second boot, 5,371,513 in a 900-second one — about
+ * 99.8% of all serial output, and over 2,000,000 lines against 42,000 useful
+ * ones on the boots that now get furthest. Every byte is an MMIO trap out to
+ * the emulated UART, so this is not merely noisy, it is the guest's largest
+ * single consumer of time.
+ *
+ * It is not a failure we need to fix. The string lives in the kernelcache, not
+ * in TXM (firmware/txm and firmware/sptm contain no "selector: " strings at
+ * all; bootkc contains 28), so this is XNU logging a TXM return code. It is the
+ * generic fallback of five sibling formats, meaning the code is in none of the
+ * TrustCache / CodeSignature / Errno / Image4_V2 domains, and the boot proceeds
+ * regardless. See docs/re/txm-selectors.md.
+ *
+ * We suppress exactly that one message by NOPing its call to the log function,
+ * leaving the other four TXM error formats — including the immediately
+ * preceding "TXM [Error]: Errno: selector: %u | %d" — intact, so a genuinely
+ * new TXM failure still reaches the console.
+ *
+ * Located by string, not by address. On our kernelcache the site is:
+ *
+ *   0xfffffff00b044380  adrp x0, ...        ; -> "TXM [Error]: selector: %u | %u\n"
+ *   0xfffffff00b044384  add  x0, x0, #0x640 ;    at 0xfffffff0070a6640
+ *   0xfffffff00b044388  bl   0xfffffff00b1e1060
+ *
+ * Set DARWIN_TXM_LOG_PATCH=0 to keep the flood (useful if you suspect the
+ * message has become meaningful).
+ */
+#define TXM_FLOOD_STR   "TXM [Error]: selector: %u | %u\n"
+#define IS_BL(w)        (( 0x94000000u == (((w)) & 0xFC000000u) ))
+#define A64_NOP         0xD503201Fu
+
+static void patch_txm_log_flood(u8 *bkc_macho) {
+    const char *off = getenv("DARWIN_TXM_LOG_PATCH");
+    if (off && 0 == strcmp(off, "0")) {
+        fprintf(stderr, "txm log patch: disabled by DARWIN_TXM_LOG_PATCH=0\n");
+        return;
+    }
+
+    fse_t *kern_fse = macho_find_fileset_entry(bkc_macho, "com.apple.kernel");
+    if (!kern_fse) {
+        fprintf(stderr, "warning: txm log patch: no com.apple.kernel fileset entry\n");
+        return;
+    }
+    u8 *kern_macho = &bkc_macho[kern_fse->fileoff];
+
+    sect_t *cstr = macho_find_sect(kern_macho, "__TEXT", "__cstring");
+    sect_t *text = macho_find_sect(kern_macho, "__TEXT_EXEC", "__text");
+    if (!cstr || !text) {
+        fprintf(stderr, "warning: txm log patch: kernel __cstring/__text not found\n");
+        return;
+    }
+
+    u64 strva = 0;
+    size_t needle = strlen(TXM_FLOOD_STR);
+    char *strs = (char*)&bkc_macho[cstr->offset];
+    for (size_t i = 0; i + needle < cstr->size; i++) {
+        if (i != 0 && strs[i - 1] != '\0') continue;      /* real string start */
+        if (0 == strncmp(&strs[i], TXM_FLOOD_STR, needle + 1)) {  /* +1: exact */
+            strva = cstr->addr + i;
+            break;
+        }
+    }
+    if (0 == strva) {
+        fprintf(stderr, "warning: txm log patch: format string not found; "
+                "the serial log will be swamped\n");
+        return;
+    }
+
+    int nrefs = 0;
+    u64 adrp = find_adrp_add_to(bkc_macho, text, strva, &nrefs);
+    if (0 == adrp) {
+        fprintf(stderr, "warning: txm log patch: nothing references %#llx\n",
+                (unsigned long long)strva);
+        return;
+    }
+    if (nrefs > 1) {
+        fprintf(stderr, "warning: txm log patch: %d references to the format "
+                "string, expected 1; refusing to patch\n", nrefs);
+        return;
+    }
+
+    /* The ADD completing the pair is within a few instructions; the BL that
+     * consumes x0 is the next instruction after it. */
+    u32 *insns = (u32*)&bkc_macho[text->offset];
+    size_t count = text->size / sizeof(u32);
+    size_t i = (adrp - text->addr) / sizeof(u32);
+    u32 rd = INSN_RD(insns[i]);
+
+    for (size_t j = i + 1; j < count && j <= i + 5; j++) {
+        if (!(IS_ADD_X_IMM(insns[j]) && INSN_RN(insns[j]) == rd)) continue;
+        if (j + 1 >= count || !IS_BL(insns[j + 1])) {
+            fprintf(stderr, "warning: txm log patch: %#llx is not followed by a "
+                    "BL (%08x); refusing to patch\n",
+                    (unsigned long long)(text->addr + (j + 1) * 4), insns[j + 1]);
+            return;
+        }
+        u64 va = text->addr + (j + 1) * sizeof(u32);
+        fprintf(stderr, "txm log patch: %#llx  %08x -> %08x  nop  "
+                "(drops \"TXM [Error]: selector: %%u | %%u\", ~99%% of serial output)\n",
+                (unsigned long long)va, insns[j + 1], A64_NOP);
+        insns[j + 1] = A64_NOP;
+        return;
+    }
+
+    fprintf(stderr, "warning: txm log patch: no ADD completing the ADRP at %#llx\n",
+            (unsigned long long)adrp);
+}
+
 void patch_kc(u8 *bkc_macho) {
     patch_img4_deadlock(bkc_macho);
     patch_memdev_4gib(bkc_macho);
+    patch_rooted_ramdisk(bkc_macho);
+    patch_txm_log_flood(bkc_macho);
 }
 
 bool kc_uses_mte(u8 *bkc_macho) {
