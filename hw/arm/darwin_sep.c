@@ -63,7 +63,7 @@
  * 'sks' implements the iOS 27 IPC v1 negotiation and the media-key create /
  * unwrap path used by encrypted APFS.  The default list only gained it after
  * a guest-created encrypted volume survived a reboot and mounted successfully
- * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:457..483).
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:476..500).
  *
  * ---------------------------------------------------------------------------
  * Bootstrap endpoint (255), what AppleSEPBooter sends and what it accepts
@@ -370,8 +370,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
 /* The third output is the opaque record which fs_new_media_key gives back to
  * APFS (0xfffffff009572d90..0x9572da8).  A 0x28-byte value is stored verbatim
- * in the guest's 80-byte keybag record
- * (/tmp/dvm/probe/SKS_KEYOP_V7.serial.log:163 and raw offset 0x80a040). */
+ * in the guest's 80-byte keybag record: the write is logged at
+ * /tmp/dvm/probe/SKS_KEYOP_V7A.serial.log:67 and the next boot sends the same
+ * 0x28-byte record back in /tmp/dvm/probe/SKS_LIVEKEY_V9.stderr.log:6463..6473. */
 #define SKS_WRAPPED_KEY_SIZE     40
 
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
@@ -457,7 +458,7 @@ static const SEPEndpointDef sep_all_eps[] = {
  * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc).  It was
  * promoted to the default only after op31 and op32 let the guest mount its
  * encrypted volume after a reboot
- * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:457..483).
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:476..500).
  */
 static const char *const sep_default_eps = "cntl,scrd,sks,xars,xarm";
 
