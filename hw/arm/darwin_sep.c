@@ -349,12 +349,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_IPC_VERSION_1            1
 #define SKS_MSG_REPLY                0x80
 
-/* iOS 27 operations established by the live trace.  The public reference's
- * operation numbers are from an older protocol and are deliberately not used:
- * docs/re/sep-protocol.md records that its first operation would decode as 77,
- * while the iOS 27 frame carries operation 1 in byte 2. */
-#define SKS_NEGOTIATE  0x01
-#define SKS_SET_ENV    0x04
+/* iOS 27 operations established by the live trace and the call sites that
+ * pass them to the IPC serializer: 0xfffffff00957ed30 passes 0x4d for
+ * negotiation, and 0xfffffff00955eb84 passes 0x2a for set_env.  Byte 1 holds
+ * this code plus the reply bit; byte 2 is a request ID. */
+#define SKS_NEGOTIATE  0x4d
+#define SKS_SET_ENV    0x2a
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -482,6 +482,7 @@ static inline uint8_t frame_tag(uint64_t m)    { return (m >> 8) & 0xff; }
 static inline uint8_t frame_op(uint64_t m)     { return (m >> 16) & 0xff; }
 static inline uint8_t frame_param(uint64_t m)  { return (m >> 24) & 0xff; }
 static inline uint32_t frame_data(uint64_t m)  { return m >> 32; }
+static inline uint8_t sks_code(uint64_t m)     { return frame_tag(m) & 0x7f; }
 
 static inline uint64_t frame(uint8_t ep, uint8_t tag, uint8_t op, uint8_t param, uint32_t data) {
     return (uint64_t)ep | ((uint64_t)tag << 8) | ((uint64_t)op << 16) |
@@ -863,9 +864,9 @@ static bool sep_sks_send_response(DarwinSEPState *s, uint64_t m,
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks op 0x%02x tag %u replied with %u-byte "
-            "SHA-256-authenticated IPC v1 message\n", s->role, frame_op(m),
-            frame_tag(m), response_size);
+    fprintf(stderr, "sep(%s): sks code 0x%02x id %u replied with %u-byte "
+            "SHA-256-authenticated IPC v1 message\n", s->role, sks_code(m),
+            frame_op(m), response_size);
     sep_send(s, SEP_EP_KEYSTORE, frame_tag(m) | SKS_MSG_REPLY, frame_op(m),
              0, response_size << 16);
     return true;
@@ -882,9 +883,9 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     const char *name;
 
     if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
-        fprintf(stderr, "sep(%s): sks op 0x%02x tag %u has invalid OOL in "
-                "size 0x%x (buffer 0x%x); no reply\n", s->role, frame_op(m),
-                frame_tag(m), request_size, e->ool_in_size);
+        fprintf(stderr, "sep(%s): sks code 0x%02x id %u has invalid OOL in "
+                "size 0x%x (buffer 0x%x); no reply\n", s->role, sks_code(m),
+                frame_op(m), request_size, e->ool_in_size);
         return;
     }
     request = g_malloc(request_size);
@@ -894,8 +895,8 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
 
     if (s->debug) {
         uint32_t n = MIN(request_size, SKS_IPC_V1_HEADER_SIZE + 96);
-        fprintf(stderr, "sep(%s): sks op 0x%02x request bytes:", s->role,
-                frame_op(m));
+        fprintf(stderr, "sep(%s): sks code 0x%02x id %u request bytes:",
+                s->role, sks_code(m), frame_op(m));
         for (uint32_t i = 0; i < n; i++) {
             if ((i & 15) == 0) {
                 fprintf(stderr, "\n  %04x:", i);
@@ -905,14 +906,14 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         fprintf(stderr, "\n");
     }
 
-    switch (frame_op(m)) {
+    switch (sks_code(m)) {
     case SKS_NEGOTIATE:
         name = "negotiate IPC version";
-        payload_size = 8;
+        payload_size = 16;
         break;
     case SKS_SET_ENV:
         /* The first probe named the caller by panicking with "set_env failed"
-         * at AppleKeyStore.cpp:6790 after receiving a wrong-sized op 4 reply
+         * at AppleKeyStore.cpp:6790 after receiving a wrong-sized reply
          * (/tmp/dvm/probe/SKS_V1.serial.log:227). */
         name = "set environment";
         payload_size = 4;
@@ -936,7 +937,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     /* Negotiation payload is established by the live request at
      * /tmp/dvm/probe/SKS_CTL.stderr.log:374-381: status zero followed by
      * offered version one.  Every unknown operation returns only status zero. */
-    switch (frame_op(m)) {
+    switch (sks_code(m)) {
     case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
@@ -946,8 +947,8 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         break;
     }
 
-    fprintf(stderr, "sep(%s): sks op 0x%02x tag %u (%s), request %u bytes\n",
-            s->role, frame_op(m), frame_tag(m), name, request_size);
+    fprintf(stderr, "sep(%s): sks code 0x%02x id %u (%s), request %u bytes\n",
+            s->role, sks_code(m), frame_op(m), name, request_size);
     sep_sks_send_response(s, m, response,
                           SKS_IPC_V1_HEADER_SIZE + payload_size);
 }
