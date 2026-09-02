@@ -32,6 +32,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -145,6 +146,14 @@ struct DarwinASCState {
     const DarwinASCOps *ops;
     void *opaque;
     bool debug;
+
+    // DARWIN_ASC_AUTOSTART=<seconds>: bring the IOP up on our own after this
+    // many seconds of guest time, without waiting for the AP to write
+    // CPU_CONTROL.RUN. This is a diagnostic, not hardware behaviour: it tells
+    // us whether the AP-side RTKit stack will talk to a coprocessor it never
+    // asked to start, which distinguishes "nothing requested power" from
+    // "the mailbox path itself is wrong".
+    QEMUTimer *autostart_timer;
 };
 
 static const char *rtk_type_name(unsigned t) {
@@ -405,6 +414,12 @@ static const MemoryRegionOps asc_ops = {
     .valid.max_access_size = 8,
 };
 
+static void asc_autostart_fire(void *opaque) {
+    DarwinASCState *s = opaque;
+    fprintf(stderr, "asc(%s): DARWIN_ASC_AUTOSTART firing, starting IOP without an AP request\n", s->role);
+    rtk_boot(s);
+}
+
 static void darwin_asc_realize(DeviceState *dev, Error **errp) {
     DarwinASCState *s = DARWIN_ASC(dev);
     if (!s->mmio_size) {
@@ -417,6 +432,15 @@ static void darwin_asc_realize(DeviceState *dev, Error **errp) {
     memory_region_init_io(&s->iomem, OBJECT(s), &asc_ops, s, "darwin-asc", s->mmio_size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     for (int i = 0; i < 4; i++) sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
+
+    const char *autostart = getenv("DARWIN_ASC_AUTOSTART");
+    if (autostart) {
+        int secs = atoi(autostart);
+        if (secs <= 0) secs = 30;
+        s->autostart_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, asc_autostart_fire, s);
+        timer_mod(s->autostart_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + (int64_t)secs * 1000);
+        fprintf(stderr, "asc(%s): will force-start the IOP after %ds (DARWIN_ASC_AUTOSTART)\n", s->role, secs);
+    }
 }
 
 static const Property darwin_asc_properties[] = {
