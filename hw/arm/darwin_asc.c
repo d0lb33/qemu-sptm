@@ -79,6 +79,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinASCState, DARWIN_ASC)
 
 #define MBOX_FIFO_DEPTH 16
 
+// Occupancy is mirrored into a *four-bit* field — I2A_CTRL bits [55:52], and
+// the same count in the high half of I2A_RECV1 (see the comment on that read).
+// Four bits express 0..15, so an occupancy of 16 would mirror as 0 and read as
+// an empty FIFO. Never make more than 15 entries visible at once.
+#define MBOX_FIFO_VISIBLE 15
+
+// Anything beyond that is staged here rather than dropped. A burst of EPIC
+// service announces (16 services on one endpoint) overflowed the visible FIFO,
+// and the message lost was the last and only meaningful one, which stalled the
+// guest. Deepening the visible FIFO is not an option, so we hold the surplus
+// behind it and refill as the AP drains. Real hardware back-pressures the
+// coprocessor instead; a staging queue is the same thing seen from the AP side,
+// since the AP cannot tell how much the IOP has yet to send.
+#define MBOX_PEND_DEPTH 256
+
 // RTKit management endpoint
 #define EP_MGMT       0
 #define EP_CRASHLOG   1
@@ -144,6 +159,8 @@ struct DarwinASCState {
     uint64_t a2i_send0;
     ASCMsg i2a_fifo[MBOX_FIFO_DEPTH];
     int i2a_head, i2a_count;
+    ASCMsg pend_fifo[MBOX_PEND_DEPTH];
+    int pend_head, pend_count;
 
     // rtkit
     int rtk_state;
@@ -195,16 +212,45 @@ static void asc_update_irqs(DarwinASCState *s) {
     qemu_set_irq(s->irq[3], i2a_empty);
 }
 
-void darwin_asc_send(DeviceState *dev, uint8_t ep, uint64_t msg) {
-    DarwinASCState *s = DARWIN_ASC(dev);
-    if (s->i2a_count >= MBOX_FIFO_DEPTH) {
-        fprintf(stderr, "asc(%s): i2a fifo overflow, dropping ep %u msg 0x%016" PRIx64 "\n", s->role, ep, msg);
-        return;
-    }
+static void asc_push_visible(DarwinASCState *s, uint8_t ep, uint64_t msg) {
     int idx = (s->i2a_head + s->i2a_count) % MBOX_FIFO_DEPTH;
     s->i2a_fifo[idx].msg0 = msg;
     s->i2a_fifo[idx].msg1 = ep;
     s->i2a_count++;
+}
+
+// Move staged messages into the visible FIFO as the AP makes room.
+static void asc_refill_visible(DarwinASCState *s) {
+    while (s->i2a_count < MBOX_FIFO_VISIBLE && s->pend_count) {
+        ASCMsg m = s->pend_fifo[s->pend_head];
+        s->pend_head = (s->pend_head + 1) % MBOX_PEND_DEPTH;
+        s->pend_count--;
+        asc_push_visible(s, (uint8_t)m.msg1, m.msg0);
+    }
+}
+
+void darwin_asc_send(DeviceState *dev, uint8_t ep, uint64_t msg) {
+    DarwinASCState *s = DARWIN_ASC(dev);
+
+    if (s->i2a_count < MBOX_FIFO_VISIBLE) {
+        asc_push_visible(s, ep, msg);
+    } else if (s->pend_count < MBOX_PEND_DEPTH) {
+        int idx = (s->pend_head + s->pend_count) % MBOX_PEND_DEPTH;
+        s->pend_fifo[idx].msg0 = msg;
+        s->pend_fifo[idx].msg1 = ep;
+        s->pend_count++;
+        if (s->debug) {
+            fprintf(stderr, "asc(%s): i2a full, staged ep 0x%02x (%d waiting)\n",
+                    s->role, ep, s->pend_count);
+        }
+    } else {
+        // Only reachable if the AP has stopped draining entirely.
+        fprintf(stderr, "asc(%s): i2a fifo and %d-deep staging queue both full, "
+                "dropping ep %u msg 0x%016" PRIx64 "\n",
+                s->role, MBOX_PEND_DEPTH, ep, msg);
+        return;
+    }
+
     if (s->debug) fprintf(stderr, "asc(%s): IOP -> AP ep 0x%02x 0x%016" PRIx64 "\n", s->role, ep, msg);
     asc_update_irqs(s);
 }
@@ -345,7 +391,7 @@ static uint64_t asc_read(void *opaque, hwaddr offset, unsigned size) {
                                       (MBOX_CTRL_PTR_MASK << MBOX_CTRL_RPTR_SHIFT) |
                                       (MBOX_CTRL_PTR_MASK << MBOX_CTRL_WPTR_SHIFT));
             if (s->i2a_count == 0) val |= MBOX_CTRL_EMPTY;
-            if (s->i2a_count >= MBOX_FIFO_DEPTH) val |= MBOX_CTRL_FULL;
+            if (s->i2a_count >= MBOX_FIFO_VISIBLE) val |= MBOX_CTRL_FULL;
             val |= (uint64_t)(s->i2a_count & 0xf) << MBOX_CTRL_CNT_SHIFT;
             val |= (uint64_t)rptr << MBOX_CTRL_RPTR_SHIFT;
             val |= (uint64_t)wptr << MBOX_CTRL_WPTR_SHIFT;
@@ -370,6 +416,7 @@ static uint64_t asc_read(void *opaque, hwaddr offset, unsigned size) {
                 val |= (uint64_t)(s->i2a_count & 0xf) << 52;
                 s->i2a_head = (s->i2a_head + 1) % MBOX_FIFO_DEPTH;
                 s->i2a_count--;
+                asc_refill_visible(s);
                 asc_update_irqs(s);
             }
             break;
@@ -403,6 +450,8 @@ static void asc_write(void *opaque, hwaddr offset, uint64_t val, unsigned size) 
             s->cpu_status = ASC_CPU_STATUS_STOPPED;
             s->rtk_state = RTK_IDLE;
             s->i2a_count = 0;
+            s->pend_count = 0;
+            s->pend_head = 0;
             asc_update_irqs(s);
         }
     } else if (offset == ASC_CPU_STATUS) {
