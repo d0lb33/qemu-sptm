@@ -47,6 +47,23 @@ static struct dtree_node *next_child(struct dtree_node *n) {
     return cursor;
 }
 
+// Public child iteration. next_child() already skips a node's properties and
+// all of its descendants, so walking siblings is just repeated application.
+struct dtree_node *adt_first_child(struct dtree_node *n) {
+    if (0 == n->nChildren) return NULL;
+    return first_child(n);
+}
+
+struct dtree_node *adt_next_sibling(struct dtree_node *parent, struct dtree_node *child) {
+    struct dtree_node *cursor = first_child(parent);
+    for (size_t i = 0; i < parent->nChildren; i++) {
+        struct dtree_node *next = next_child(cursor);
+        if (cursor == child) return (i + 1 < parent->nChildren) ? next : NULL;
+        cursor = next;
+    }
+    return NULL;
+}
+
 static struct dtree_prop *find_prop_in_node(struct dtree_node *n, const char *prop_name) {
     struct dtree_prop *cursor = (struct dtree_prop*)(n+1);
 

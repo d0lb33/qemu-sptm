@@ -29,4 +29,12 @@ DeviceState *darwin_asc_create(struct dtree_node *node, uint64_t iobase, DeviceS
 // Send a message from the IOP to the AP on an endpoint.
 void darwin_asc_send(DeviceState *dev, uint8_t ep, uint64_t msg);
 
+// Instantiate a bare ASC + RTKit coprocessor for every /arm-io node that is
+// still marked compatible "iop,ascwrap-v*" and has not already been claimed by
+// a personality (pass those names in `claimed`). Coprocessors created this way
+// speak the RTKit management protocol and log everything above it, which is
+// enough for XNU's RTBuddy to attach and start them.
+void darwin_ascs_create(struct dtree_node *dt_root, uint64_t iobase, DeviceState *aic,
+                        const char *const *claimed, int n_claimed);
+
 const char *darwin_asc_role(DeviceState *dev);

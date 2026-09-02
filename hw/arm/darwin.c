@@ -24,6 +24,7 @@
 #include "xnu/darwin_fb.h"
 #include "xnu/darwin_aic.h"
 #include "xnu/darwin_dcp.h"
+#include "xnu/darwin_asc.h"
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_unimp.h"
 
@@ -299,6 +300,10 @@ static void darwin_init(MachineState *ms) {
     DeviceState *uart = init_uart(dt_root, iobase, aic);
     darwin_darts_create(dt_root, iobase, aic);
     darwin_dcp_create(dt_root, iobase, aic);
+    // Any other coprocessor left enabled in the device tree gets a bare
+    // RTKit mailbox, so XNU's RTBuddy can attach and start it.
+    static const char *const claimed_ascs[] = { "dcp" };
+    darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, ARRAY_SIZE(claimed_ascs));
     init_sep(dt_root);
     init_cpu_impl(dt_root);
 

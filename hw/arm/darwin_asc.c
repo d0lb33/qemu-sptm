@@ -472,6 +472,30 @@ type_init(darwin_asc_register_types)
 
 /* ---------------- device tree glue ---------------- */
 
+void darwin_ascs_create(struct dtree_node *dt_root, uint64_t iobase, DeviceState *aic,
+                        const char *const *claimed, int n_claimed) {
+    struct dtree_node *arm_io = adt_find_node(dt_root, "arm-io");
+    if (!arm_io) return;
+
+    for (struct dtree_node *c = adt_first_child(arm_io); c; c = adt_next_sibling(arm_io, c)) {
+        const char *compat = adt_get_prop_val(c, "compatible");
+        const char *name = adt_get_prop_val(c, "name");
+        if (!compat || !name) continue;
+        // dt_fixup only leaves "compatible" on hardware we emulate, so anything
+        // still claiming to be an ASC wrapper is one we are expected to provide.
+        if (!strstr(compat, "ascwrap")) continue;
+
+        bool skip = false;
+        for (int i = 0; i < n_claimed; i++) {
+            if (0 == strcmp(name, claimed[i])) skip = true;
+        }
+        if (skip) continue;
+
+        if (!adt_get_prop_val(c, "reg")) continue;
+        darwin_asc_create(c, iobase, aic, NULL, 0, NULL, NULL);
+    }
+}
+
 const char *darwin_asc_role(DeviceState *dev) {
     return DARWIN_ASC(dev)->role;
 }
