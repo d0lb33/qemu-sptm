@@ -105,9 +105,11 @@ static bool aic_pending(DarwinAICState *s, int *out_die, int *out_irq) {
 }
 
 static void aic_update(DarwinAICState *s) {
-    bool level = aic_pending(s, NULL, NULL);
+    int die = 0, irq = 0;
+    bool level = aic_pending(s, &die, &irq);
     if (level != s->line) {
         s->line = level;
+        if (s->debug) fprintf(stderr, "aic: CPU IRQ line -> %d (die %d irq 0x%x)\n", level, die, irq);
         qemu_set_irq(s->irq_out, level);
     }
 }
@@ -122,6 +124,10 @@ static void aic_set_irq(void *opaque, int n, int level) {
         hw[irq / 32] |= BIT(irq % 32);
     } else {
         hw[irq / 32] &= ~BIT(irq % 32);
+    }
+    if (s->debug) {
+        bool masked = die_words(s->mask, s, die)[irq / 32] & BIT(irq % 32);
+        fprintf(stderr, "aic: input irq 0x%x -> %d (%s)\n", irq, level, masked ? "MASKED" : "unmasked");
     }
     aic_update(s);
 }

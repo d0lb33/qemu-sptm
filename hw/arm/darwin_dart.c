@@ -42,6 +42,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinDARTState, DARWIN_DART)
 #define DART_PARAMS1        0x000
 #define DART_PARAMS2        0x004
 #define DART_PARAMS3        0x008
+// PARAMS3[15:0]: major in [15:8], minor in [7:0]
+#define DART_VERSION_2_0    0x0200
 #define DART_PARAMS4        0x00c
 #define DART_TLB_CMD        0x080
 #define DART_TLB_CMD_BUSY   BIT(31)
@@ -94,12 +96,26 @@ static uint64_t dart_read(void *opaque, hwaddr offset, unsigned size) {
     } else if (offset == DART_PARAMS2) {
         val = 1;    // bypass supported
     } else if (offset == DART_PARAMS3) {
-        // SPTM validates the device tree's vm-base/vm-size against the widths
-        // this register advertises, and panics with "Invalid VM page limits" if
-        // the tree asks for more address space than the hardware claims. So
-        // advertise widths derived from what the tree actually asks for rather
-        // than fixed values.
-        val = ((uint32_t)s->pa_width << 24) | ((uint32_t)s->va_width << 16) | (1 << 8) | 0;
+        // The version in bits [15:0] is load bearing: SPTM and XNU both
+        // classify the DART by it and then require the device tree's
+        // vm-base/vm-size to fall inside a window hardcoded per generation.
+        //
+        //   1.x  ->  pages [0,          0x400000)    = bytes [0,    2^36)
+        //   2.x  ->  pages [0x4000000,  0x10000000)  = bytes [2^40, 2^42)
+        //
+        // (t8110dart_init_instance, sptm 0xfffffff0270c5878-0xfffffff0270c5998:
+        //  it panics "Invalid VM page limits" unless required_lo <= dt_lo and
+        //  dt_hi <= required_hi.) Every dart node on t8140 uses vm-base >=
+        //  0x10000000000, so they are all generation 2 and reporting 1.0 makes
+        //  SPTM reject the tree.
+        //
+        // XNU's AppleT8110DART accepts only 1.0, 1.1 and 2.0 through 2.4
+        // (bootkc 0xfffffff00970853c, else "Unsupported DART version"), so 2.0
+        // is the safe choice: SPTM also knows 3.x, but XNU does not.
+        //
+        // The widths are separate and feed only SPTM's "Inconsistent hardware
+        // definition" check, which needs (1 << va_width) >> 14 > required_lo.
+        val = ((uint32_t)s->pa_width << 24) | ((uint32_t)s->va_width << 16) | DART_VERSION_2_0;
     } else if (offset == DART_PARAMS4) {
         val = ((s->num_sids & 0x1ff) << 16) | (s->num_sids & 0x1ff);
     } else if (offset == DART_TLB_CMD) {
