@@ -112,6 +112,19 @@
  * xART endpoints (16, 19): every request is acknowledged with op 0 and the
  * tag, which is all AppleSEPXART checks ("received message for invalid tag").
  *
+ * scrd (10), AppleSEPCredentialManager: its frame is not the generic one.
+ * The receive handler (kext 0xfffffff00952a808) requires byte 0 == 10, takes
+ * byte 1 as the tag, bits [31:16] as the byte length of a response it then
+ * copies out of the endpoint's OOL out-buffer ("readFromSEP == msg.call.
+ * length"), and stores the upper 32 bits as the SEP's status word. Requests
+ * arrive the same way: {ep 10, tag, length of the body in the OOL in-buffer,
+ * 0}; observed 36 bytes for its cmd 10 and 40 for cmd 25 (the developer-mode
+ * query AMFI makes on every spawn). The body format is not modelled. With
+ * DARWIN_SEP_SCRD_FAIL_FAST=1 every request is answered at once with length
+ * 0 and a nonzero status, so ACM reports an SEP error instead of waiting
+ * 5000 ms per command; the status value is a placeholder, not a modelled
+ * SEP error code. Default is to stay silent and log.
+ *
  * ---------------------------------------------------------------------------
  * The TXM secure channel
  *
@@ -343,6 +356,7 @@ struct DarwinSEPState {
     const SEPEndpointDef *adv[ARRAY_SIZE(sep_all_eps)];
     int n_adv;
     bool debug;
+    bool scrd_fail_fast;
 };
 
 /* ---------------- frame helpers ---------------- */
@@ -658,6 +672,30 @@ static void sep_handle_xart(DarwinSEPState *s, uint64_t m) {
     sep_send(s, frame_ep(m), frame_tag(m), 0, 0, 0);
 }
 
+/*
+ * Under DARWIN_SEP_DEBUG, show the request body an unhandled endpoint left in
+ * its OOL in-buffer, so the next protocol can be worked out from a live boot
+ * rather than guessed. The byte count comes from the frame: AppleSEPKeyStore
+ * puts the IPC message size in the top 16 bits of `data`, ACM puts the body
+ * length in the 16 bits at [31:16]; both are tried, capped at 256 bytes.
+ */
+static void sep_dump_ool_in(DarwinSEPState *s, uint8_t ep, uint64_t m) {
+    SEPEndpointState *e = &s->ep[ep];
+    uint32_t n = frame_data(m) >> 16;
+    if (!n) n = (m >> 16) & 0xffff;
+    if (!n || !e->ool_in_addr) return;
+    if (n > 256) n = 256;
+    if (n > e->ool_in_size && e->ool_in_size) n = e->ool_in_size;
+    uint8_t buf[256];
+    if (!sep_dma(s, e->ool_in_addr, buf, n, false)) return;
+    fprintf(stderr, "sep(%s): ep %u OOL in (%u bytes):", s->role, ep, n);
+    for (uint32_t i = 0; i < n; i++) {
+        if ((i & 15) == 0) fprintf(stderr, "\n  %04x:", i);
+        fprintf(stderr, " %02x", buf[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
 static void sep_receive(DarwinSEPState *s, uint64_t m) {
     uint8_t ep = frame_ep(m);
     if (s->os_alive && !s->txm_published) sep_txm_publish(s);
@@ -670,11 +708,23 @@ static void sep_receive(DarwinSEPState *s, uint64_t m) {
     case SEP_EP_CONTROL:   sep_handle_control(s, m); break;
     case SEP_EP_L4INFO:    sep_handle_l4info(s, m); break;
     case 16: case 19:      sep_handle_xart(s, m); break;
+    case 10:
+        fprintf(stderr, "sep(%s): scrd request tag %u, %u byte body: %s\n", s->role,
+                frame_tag(m), (unsigned)((m >> 16) & 0xffff),
+                s->scrd_fail_fast ? "failing fast (DARWIN_SEP_SCRD_FAIL_FAST)" : "no handler");
+        if (s->debug) sep_dump_ool_in(s, ep, m);
+        if (s->scrd_fail_fast) {
+            // {ep 10, tag, length 0, status 1}: see the header. Status 1 is a
+            // placeholder for "SEP said no", not a decoded error code.
+            sep_send_raw(s, frame(10, frame_tag(m), 0, 0, 1));
+        }
+        break;
     default:
         // scrd, sks and friends: logged and left unanswered until their
         // protocols are modelled. This is the honest hole, not a guess.
         fprintf(stderr, "sep(%s): ep %u '%s' op %u tag %u param %u data 0x%08x: no handler\n",
                 s->role, ep, ep_name(s, ep), frame_op(m), frame_tag(m), frame_param(m), frame_data(m));
+        if (s->debug) sep_dump_ool_in(s, ep, m);
         break;
     }
 }
@@ -836,6 +886,7 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     s->cpu_status = ASC_CPU_STATUS_STOPPED;
     s->status = SEP_STATUS_ROM;
     s->debug = getenv("DARWIN_SEP_DEBUG") != NULL;
+    s->scrd_fail_fast = getenv("DARWIN_SEP_SCRD_FAIL_FAST") != NULL;
     sep_pick_endpoints(s);
     memory_region_init_io(&s->iomem, OBJECT(s), &sep_ops, s, "darwin-sep", s->mmio_size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
