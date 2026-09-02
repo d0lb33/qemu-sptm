@@ -155,32 +155,58 @@ static bool dcp_handle(void *opaque, uint8_t ep, uint64_t msg) {
     }
     if (ep == 0x37) {
         /*
-         * IOMFB link (AppleDCPLinkServiceSoC). Not AFK: our AFK reader takes
-         * bits [63:48] as the opcode, which gives 0x0100 for the AP's first
-         * message, and AFK opcodes are single bytes -- so the split differs.
+         * IOMFB link (AppleDCPLinkServiceSoC). Field split derived in
+         * docs/re/iomfb-link.md from link_send_message (fcn.fffffff00a0cecd0)
+         * and link_handle_message (fcn.fffffff00a0cfac0): the *low 16 bits*
+         * are a structured header and bits[63:16] are a class-dependent
+         * 48-bit payload, masked off by a literal
+         * `and x8, x2, 0xffffffffffff0000` in the send path.
          *
-         * Decoded here two ways so a boot log carries the evidence. The
-         * second is the M1-era Linux "dcpep" layout (drivers/gpu/drm/apple):
-         * TYPE bits[3:0], ACK bit 6, CONTEXT bits[11:8], OFFSET bits[31:12],
-         * LENGTH bits[63:32]. Under it the AP's opening message
-         * 0x0100000000000040 reads as type 0 with the ACK bit set, which is
-         * suggestive but unconfirmed for iOS 27 -- every other M1-era framing
-         * has needed correction here, so treat it as a hypothesis until
-         * docs/re/iomfb-link.md derives the real one.
+         *   [1:0]   class
+         *   [7:6]   subkind
+         *   [8]     ack
+         *   [15:10] 6-bit RPC tag
+         *   [63:16] payload
+         *
+         * Note this replaces two earlier readings, both wrong: the AFK split
+         * (bits[63:48] as an opcode -- impossible, AFK opcodes are one byte)
+         * and the M1-era Linux dcpep split, under which this message appeared
+         * to carry a 16 MB length. The 48-bit mask is an explicit instruction
+         * operand rather than an inference from one sample, so it wins.
+         *
+         * The AP's opening message 0x0100000000000040 is therefore class 0,
+         * subkind 1, payload DVA 0x10000000000 -- a shared-heap address
+         * announce, in the same address space as the AFK rings.
          */
+        unsigned mclass = msg & 0x3, subkind = (msg >> 6) & 0x3;
+        unsigned ack = (msg >> 8) & 1, tag = (msg >> 10) & 0x3f;
+        uint64_t payload = msg >> 16;
         fprintf(stderr, "dcp: IOMFB ep 0x37 msg 0x%016" PRIx64
-                " | afk-style type 0x%04x | dcpep-style type %u ack %u ctx %u off 0x%05x len 0x%08x\n",
-                msg, (unsigned)((msg >> 48) & 0xffff),
-                (unsigned)(msg & 0xf), (unsigned)((msg >> 6) & 1),
-                (unsigned)((msg >> 8) & 0xf), (unsigned)((msg >> 12) & 0xfffff),
-                (unsigned)(msg >> 32));
+                " | class %u subkind %u ack %u tag %u payload 0x%" PRIx64 "\n",
+                msg, mclass, subkind, ack, tag, payload);
 
         const char *probe = getenv("DARWIN_DCP_IOMFB");
-        if (probe && probe[0] == '2') {
-            /* Probe only: echo it straight back and see whether the AP moves.
-             * A question, not modelled behaviour. */
-            darwin_asc_send(d->asc, ep, msg);
-            fprintf(stderr, "dcp: IOMFB PROBE echo -> 0x%016" PRIx64 "\n", msg);
+        if (probe && probe[0] == '2' && mclass == 0 && subkind == 1) {
+            /*
+             * Probe. Class 0 / subkind 1 is send-only -- link_handle_message
+             * takes that branch unconditionally -- and echoing it back panics
+             * the guest one message later with
+             *   "link_message_handler failed with 0xe00002bd"
+             *   @AppleDCPLinkService.cpp:882   (kIOReturnNoMemory)
+             * preceded by "link_init_ack_callback failed with 0x6". So the
+             * reply has to be a *class 1* message, the init-ack step:
+             * link_handle_message's class==1 path reaches fcn.fffffff00a0ce0f0,
+             * which itself sends 0x0004000000000001 back through
+             * link_send_message.
+             *
+             * Which payload belongs in bits[63:16] is the one thing static
+             * analysis did not settle -- a small constant, or the firmware's
+             * own heap DVA. This tries the constant first; if it fails, the
+             * DVA the AP just announced is the other candidate.
+             */
+            uint64_t ack_msg = 0x0004000000000001ULL;
+            darwin_asc_send(d->asc, ep, ack_msg);
+            fprintf(stderr, "dcp: IOMFB PROBE class-1 init-ack -> 0x%016" PRIx64 "\n", ack_msg);
         }
         return true;
     }
