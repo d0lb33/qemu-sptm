@@ -36,6 +36,7 @@
 #include "target/arm/gtimer.h"
 #include "qemu/plugin.h"
 #include "xnu/apple_regs.h"
+#include "xnu/gxfstat.h"
 
 static void switch_mode(CPUARMState *env, int mode);
 #ifndef CONFIG_USER_ONLY
@@ -9405,6 +9406,12 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     unsigned int cur_el = arm_current_el(env);
     int rt;
 
+    /* gxfstat: count every guest exception by EXCP_* index. See
+     * include/xnu/gxfstat.h. Slow path already; the increment is free. */
+    if ((unsigned)cs->exception_index < GXFSTAT_NEXC) {
+        gxfstat_exc[cs->exception_index]++;
+    }
+
     if (arm_apple_is_gl(env)) {
         addr = env->vbar_gl[new_el];
     }
@@ -9554,6 +9561,8 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
         }
         break;
     case EXCP_GENTER:
+        gxfstat_genter++;       /* gxfstat: one VM exit each under the HVF scheme */
+        gxfstat_genter_el[cur_el & 3]++;
         assert(0 == env->currentg);
         assert(env->aarch64);
         env->aspsr_gl[new_el] = env->currentg;

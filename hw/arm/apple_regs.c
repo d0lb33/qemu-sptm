@@ -25,6 +25,10 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 
 #define TAG_OFFSET_EL2_LOCK            BIT(63)
 
+/* gxfstat: measurement counters, see include/xnu/gxfstat.h. The generated
+ * accessors below reference gxfstat_sysreg_{rd,wr}. */
+#include "xnu/gxfstat.h"
+
 #include "apple_regs_autogen.h"
 
 static uint64_t pmc0_read(CPUARMState *env, const ARMCPRegInfo *ri) {
@@ -150,4 +154,5 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
 
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);
+    gxfstat_start();
 }

@@ -193,9 +193,35 @@ rs_opaque = [
 ]
 
 macros = '''
+/*
+ * gxfstat_sysreg_{rd,wr} count guest accesses to Apple IMP-DEF system
+ * registers. Under Hypervisor.framework these all trap to the VMM at guest
+ * EL1 with EC=0x18 (hvf-probe/FINDINGS.md), so each is one VM exit; the
+ * counters size that cost. See include/xnu/gxfstat.h.
+ *
+ * The CPU-state and banked registers keep their .fieldoffset so raw/migration
+ * access is unchanged; adding .readfn/.writefn only redirects *guest* access
+ * through a helper. Note QEMU already ends the TB on every sysreg write
+ * (translate-a64.c handle_sys(), "need_exit_tb = true"), so adding a writefn
+ * does not change TB shape; only reads gain a helper call.
+ */
+/* PSTATE.M[3:2] is the current EL in AArch64; same expression as
+ * arm_current_el() in target/arm/cpu.h, which is not visible from hw/arm. */
+#define GXFSTAT_SYSREG(env, ri, wr) \\
+    gxfstat_note_sysreg((ri)->name, ((env)->pstate >> 2) & 3, (wr))
+
 #define OPAQUE_SYSREG_ACCESSORS(n) \\
-static uint64_t n##_read(CPUARMState *env, const ARMCPRegInfo *ri) { return APPLE_STATE(env)->n; } \\
-static void n##_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) { APPLE_STATE(env)->n = val; }
+static uint64_t n##_read(CPUARMState *env, const ARMCPRegInfo *ri) { GXFSTAT_SYSREG(env, ri, 0); return APPLE_STATE(env)->n; } \\
+static void n##_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) { GXFSTAT_SYSREG(env, ri, 1); APPLE_STATE(env)->n = val; }
+
+static uint64_t apple_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri) {
+    GXFSTAT_SYSREG(env, ri, 0);
+    return raw_read(env, ri);   /* target/arm/cpregs.h: the .fieldoffset access */
+}
+static void apple_cnt_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) {
+    GXFSTAT_SYSREG(env, ri, 1);
+    raw_write(env, ri, val);
+}
 '''
 
 def decode_name(regname):
@@ -231,6 +257,9 @@ def dump_struct(r, is_cpustate=False, is_banked=False):
                 raise ValueError("banked register isn't GL or EL")
         else:
             s += f"        .fieldoffset = offsetof(CPUARMState, {r.lower()}),\n"
+        # gxfstat: count guest accesses. .fieldoffset stays, so raw access is
+        # unaffected; these accessors just make guest access visible.
+        s += f"        .readfn = apple_cnt_read, .writefn = apple_cnt_write,\n"
     else:
         s += f"        .readfn = {r.lower()}_read, .writefn = {r.lower()}_write,\n"
 
