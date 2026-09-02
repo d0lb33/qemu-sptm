@@ -356,6 +356,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
 #define SKS_NEW_MEDIA_KEY 0x31
+#define SKS_UNWRAP_MEDIA_KEY 0x32
 
 /* fs_new_media_key's first output is the live CPX key: the bridge stores it at
  * descriptor +0/+8 (0xfffffff00957789c..0x95778b8), and APFS passes that
@@ -371,6 +372,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * in the guest's 80-byte keybag record
  * (/tmp/dvm/probe/SKS_KEYOP_V7.serial.log:163 and raw offset 0x80a040). */
 #define SKS_WRAPPED_KEY_SIZE     40
+
+static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
+    0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+    0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
+    0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+};
+
+static const uint8_t sks_wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
+    0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+    0x57, 0x52, 0x41, 0x50, 0x50, 0x45, 0x44, 0x2d,
+    0x4b, 0x45, 0x59, 0x2d, 0x30, 0x31, 0x00, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+};
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -945,6 +965,14 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         payload_size = 4 + 4 + SKS_MEDIA_KEY_SIZE + 4 + 4 + 4 +
                        SKS_WRAPPED_KEY_SIZE;
         break;
+    case SKS_UNWRAP_MEDIA_KEY:
+        /* fs_unwrap_media_key_from_uid reaches the 0x32 serializer through
+         * 0xfffffff009572e24 -> 0xfffffff009577900 ->
+         * 0xfffffff00957d974.  Its decoder publishes two blobs and a scalar
+         * at 0xfffffff00957da90..0x957db00. */
+        name = "unwrap media key (fake-key mode)";
+        payload_size = 4 + 4 + SKS_MEDIA_KEY_SIZE + 4 + 4;
+        break;
     default:
         /* A status-only success is a logged no-op, not a claim that the
          * operation's side effects are implemented.  It lets the guest name
@@ -970,23 +998,6 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
     case SKS_NEW_MEDIA_KEY: {
-        static const uint8_t media_key[SKS_MEDIA_KEY_SIZE] = {
-            0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
-            0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
-            0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
-            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-            0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
-        };
-        static const uint8_t wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
-            0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
-            0x57, 0x52, 0x41, 0x50, 0x50, 0x45, 0x44, 0x2d,
-            0x4b, 0x45, 0x59, 0x2d, 0x30, 0x31, 0x00, 0x01,
-            0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-            0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
-        };
         uint32_t off = 0;
 
         /* This is the union selector, not a separate status word.  The
@@ -996,7 +1007,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         off += 4;
         stl_le_p(payload + off, SKS_MEDIA_KEY_SIZE);
         off += 4;
-        memcpy(payload + off, media_key, SKS_MEDIA_KEY_SIZE);
+        memcpy(payload + off, sks_media_key, SKS_MEDIA_KEY_SIZE);
         off += SKS_MEDIA_KEY_SIZE;
         /* The auxiliary AES-IV key is optional: APFS only calls
          * cpx_set_aes_iv_key when this length is nonzero at
@@ -1011,10 +1022,31 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         off += 4;
         stl_le_p(payload + off, SKS_WRAPPED_KEY_SIZE);
         off += 4;
-        memcpy(payload + off, wrapped_key, SKS_WRAPPED_KEY_SIZE);
+        memcpy(payload + off, sks_wrapped_key, SKS_WRAPPED_KEY_SIZE);
         fprintf(stderr, "sep(%s): sks op31 supplies CPX key length %u, "
                 "no auxiliary key, wrapped record length %u\n", s->role,
                 SKS_MEDIA_KEY_SIZE, SKS_WRAPPED_KEY_SIZE);
+        break;
+    }
+    case SKS_UNWRAP_MEDIA_KEY: {
+        uint32_t off = 0;
+
+        /* The request's wrapped record is intentionally opaque.  In the
+         * first-party no-effaceable-storage mode observed at
+         * /tmp/dvm/probe/SKS_LIVEKEY_V9.serial.log:481, a stable fake key is
+         * the modeled side effect; there is no unknown storage operation to
+         * pretend succeeded. */
+        stl_le_p(payload + off, 1);
+        off += 4;
+        stl_le_p(payload + off, SKS_MEDIA_KEY_SIZE);
+        off += 4;
+        memcpy(payload + off, sks_media_key, SKS_MEDIA_KEY_SIZE);
+        off += SKS_MEDIA_KEY_SIZE;
+        stl_le_p(payload + off, 0);
+        off += 4;
+        stl_le_p(payload + off, BIT(1));
+        fprintf(stderr, "sep(%s): sks op32 restores CPX key length %u, "
+                "no auxiliary key\n", s->role, SKS_MEDIA_KEY_SIZE);
         break;
     }
     default:
