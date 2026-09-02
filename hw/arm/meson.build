@@ -114,7 +114,7 @@ arm_common_ss.add(files('boot.c'))
 
 hw_common_arch += {'arm': arm_common_ss}
 
-arm_common_ss.add(files('darwin.c', 'darwin_fb.c', 'darwin_aic.c', 'darwin_asc.c', 'darwin_dcp.c', 'darwin_dart.c', 'darwin_unimp.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
+arm_common_ss.add(files('darwin.c', 'darwin_fb.c', 'darwin_aic.c', 'darwin_asc.c', 'darwin_dcp.c', 'darwin_dart.c', 'darwin_sart.c', 'darwin_unimp.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
 
 arm_common_ss.add(custom_target('apple_regs_autogen.h',
   output: 'apple_regs_autogen.h',
