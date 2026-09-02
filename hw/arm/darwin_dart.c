@@ -74,6 +74,7 @@ struct DarwinDARTState {
     uint32_t mmio_size;
     uint32_t num_sids;
     uint32_t page_shift;
+    uint32_t va_width, pa_width;
 
     uint32_t streams_enabled[8];
     uint32_t tcr[DART_MAX_SIDS];
@@ -93,7 +94,12 @@ static uint64_t dart_read(void *opaque, hwaddr offset, unsigned size) {
     } else if (offset == DART_PARAMS2) {
         val = 1;    // bypass supported
     } else if (offset == DART_PARAMS3) {
-        val = (36 << 24) | (42 << 16) | (1 << 8) | 0;   // pa width, va width, version 1.0
+        // SPTM validates the device tree's vm-base/vm-size against the widths
+        // this register advertises, and panics with "Invalid VM page limits" if
+        // the tree asks for more address space than the hardware claims. So
+        // advertise widths derived from what the tree actually asks for rather
+        // than fixed values.
+        val = ((uint32_t)s->pa_width << 24) | ((uint32_t)s->va_width << 16) | (1 << 8) | 0;
     } else if (offset == DART_PARAMS4) {
         val = ((s->num_sids & 0x1ff) << 16) | (s->num_sids & 0x1ff);
     } else if (offset == DART_TLB_CMD) {
@@ -216,6 +222,8 @@ static const Property darwin_dart_properties[] = {
     DEFINE_PROP_UINT32("mmio-size", DarwinDARTState, mmio_size, 0),
     DEFINE_PROP_UINT32("num-sids", DarwinDARTState, num_sids, 16),
     DEFINE_PROP_UINT32("page-shift", DarwinDARTState, page_shift, 14),
+    DEFINE_PROP_UINT32("va-width", DarwinDARTState, va_width, 42),
+    DEFINE_PROP_UINT32("pa-width", DarwinDARTState, pa_width, 42),
 };
 
 static void darwin_dart_class_init(ObjectClass *klass, const void *data) {
@@ -253,6 +261,16 @@ DeviceState *darwin_dart_create(struct dtree_node *node, uint64_t iobase, Device
     qdev_prop_set_uint32(dev, "mmio-size", reg[0].len);
     if (sid_count) qdev_prop_set_uint32(dev, "num-sids", *sid_count);
     if (page_size && *page_size) qdev_prop_set_uint32(dev, "page-shift", ctz32(*page_size));
+
+    // Advertise a VA width that covers the largest vm-base + vm-size the node
+    // asks for. SPTM checks this and panics otherwise.
+    uint64_t top = 0;
+    uint64_t *vm_base = adt_get_prop_val(node, "vm-base");
+    uint64_t *vm_size = adt_get_prop_val(node, "vm-size");
+    if (vm_base && vm_size) top = *vm_base + *vm_size;
+    unsigned va_bits = 42;
+    while (va_bits < 64 && (top >= (1ULL << va_bits))) va_bits++;
+    qdev_prop_set_uint32(dev, "va-width", va_bits);
 
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
