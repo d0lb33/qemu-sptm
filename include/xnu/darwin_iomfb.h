@@ -29,6 +29,20 @@ typedef struct DarwinIOMFB DarwinIOMFB;
  *        (iomfb_level4[] in darwin_iomfb.c carries the evidence for each).
  *        This is the level at which AppleCLCD2 registers.
  *
+ * The outbound (DCP -> AP, "D-series") callback direction is orthogonal to
+ * the level and off at every one of them. DARWIN_DCP_IOMFB_CB scripts it:
+ *
+ *   DARWIN_DCP_IOMFB_CB='D000::4,D003:00000000:0x14'
+ *      a comma separated list of NAME[:INHEX[:OUTLEN]], issued one at a time,
+ *      each after the previous completes.
+ *   DARWIN_DCP_IOMFB_CB_AFTER='A353'
+ *      which inbound RPC's completion starts the script; empty or 'ack'
+ *      starts it as soon as the class-1 handshake finishes. Default A353.
+ *
+ * That is an experiment harness, not a model: the transport is derived from
+ * the firmware (docs/re/iomfb-dseries.md) but nothing tells us which callback
+ * a real DCP would send or when, so the model never sends one on its own.
+ *
  * asc is the mailbox to reply on; dart/sid is the IOMMU path the DCP's DMA
  * takes, so the model can read the shared RPC heap the AP announces.
  */
