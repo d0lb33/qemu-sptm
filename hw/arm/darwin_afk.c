@@ -53,6 +53,7 @@
  * (linux-asahi afk.h:74-82), then `bufsz` bytes of payload:
  *
  *   +0*block  bufsz   payload bytes, excluding this header
+ *   +0*block+4 version  selects the queue entry layout; see AFK_RING_VERSION
  *   +1*block  rptr    reader's cursor, byte offset into the payload
  *   +2*block  wptr    writer's cursor, byte offset into the payload
  *   +3*block  payload
@@ -97,9 +98,15 @@
  *
  *   +0x00  magic    "IOP " == 0x20504f49 (per-coprocessor; AOP uses "AOP ")
  *   +0x04  size     bytes of payload following this 16-byte header
- *   +0x08  channel  EPIC channel number
- *   +0x0c  type     EPIC type (NOTIFY/COMMAND/REPLY/NOTIFY_ACK)
+ *   +0x08  channel  linux-asahi's name for it; iOS 27's AP writes 0 and never
+ *   +0x0c  type     reads either back (its drain reads only magic and size,
+ *                   0xfffffff008b94a7c / 0xfffffff008b9492c). We send 0 too.
  *   +0x10  data[size]
+ *
+ * ...but only when the ring header's version word says so -- see
+ * AFK_RING_VERSION below. With any other version the AP expects
+ * {size, 0, 0, magic} instead, which is what it read before this model
+ * started publishing a version, and why nothing above the transport worked.
  *
  * wptr/rptr always advance to a `block` boundary and wrap to 0 exactly at
  * bufsz (afk.c:658, 872-874). If an entry would not fit before the end of
@@ -166,6 +173,37 @@
 #define AFK_HDR_RPTR_BLOCK  1
 #define AFK_HDR_WPTR_BLOCK  2
 
+/*
+ * The second u32 of the ring header -- the field linux-asahi's
+ * afk_ringbuffer_header calls `unk` (afk.h:74-82) -- is a version word, and it
+ * *selects the queue entry layout*. The AP reads it once per drain and
+ * branches on its high half:
+ *
+ *   0xfffffff008b947d8  ldr w21, [x8, #4]        ; ring_header[+4]
+ *   0xfffffff008b9491c  and w28, w21, #0xffff0000
+ *   0xfffffff008b94920  cmp w28, #0x70, lsl #12  ; == 0x00070000 ?
+ *   0xfffffff008b94924  mov w9, #4
+ *   0xfffffff008b94928  csel x9, x9, xzr, eq     ; size at +4, else at +0
+ *   0xfffffff008b94a70  cmp w28, #0x70, lsl #12
+ *   0xfffffff008b94a78  csel x9, xzr, x9(#0xc), eq ; magic at +0, else at +0xc
+ *
+ * i.e. with 0x0007xxxx the entry is {magic, size, channel, type} -- the layout
+ * linux-asahi documents -- and with anything else it is {size, 0, 0, magic}.
+ * The value to write is not a guess either: when the *AP* is the ring
+ * allocator it writes 0x00070006 itself,
+ *
+ *   0xfffffff008b941e0  mov  w9, #6
+ *   0xfffffff008b941e4  movk w9, #7, lsl #16
+ *   0xfffffff008b941e8  stp  w8, w9, [x0]        ; bufsz, version
+ *
+ * so that is what this model writes. Nothing validates it on the path where
+ * the *firmware* owns the ring (the check at 0xfffffff008b94220 compares only
+ * bufsz), but it is read and branched on, so it has to be right or every
+ * queue entry we write is parsed at the wrong offsets.
+ */
+#define AFK_HDR_VERSION_OFF 4
+#define AFK_RING_VERSION    0x00070006u
+
 // Defaults. 0x80 is the ring granule iOS 27's DCP messenger is built with;
 // see the header comment for the kernelcache evidence and for why getting it
 // wrong panics the guest rather than merely failing. The per-ring size is a
@@ -218,6 +256,7 @@ struct DarwinAFK {
     uint32_t block;
     uint32_t hdr_size;
     uint32_t ring_size;
+    uint32_t ring_version;
     bool debug;
     const DarwinAFKOps *ops;
     void *opaque;
@@ -319,6 +358,14 @@ static bool afk_ring_write32(DarwinAFK *a, AFKEndpoint *e, uint8_t ep,
     return afk_dma(a, e, ep, e->dva + r->off + (uint64_t)block * a->block, &v, 4, true);
 }
 
+// Same, but at a raw byte offset inside the ring header -- the version word
+// lives at +4, inside block 0, not in a block of its own.
+static bool afk_ring_write32_at(DarwinAFK *a, AFKEndpoint *e, uint8_t ep,
+                                const AFKRing *r, uint32_t off, uint32_t val) {
+    uint32_t v = cpu_to_le32(val);
+    return afk_dma(a, e, ep, e->dva + r->off + off, &v, 4, true);
+}
+
 // Read/write inside a ring's payload area, wrapping at bufsz.
 static bool afk_ring_payload(DarwinAFK *a, AFKEndpoint *e, uint8_t ep,
                              const AFKRing *r, uint32_t off, void *buf,
@@ -412,6 +459,7 @@ static void afk_handle_getbuf_ack(DarwinAFK *a, uint8_t ep, AFKEndpoint *e, uint
     const AFKRing *rings[2] = { &e->tx, &e->rx };
     for (int i = 0; i < 2 && ok; i++) {
         ok = afk_ring_write32(a, e, ep, rings[i], AFK_HDR_BUFSZ_BLOCK, rings[i]->bufsz) &&
+             afk_ring_write32_at(a, e, ep, rings[i], AFK_HDR_VERSION_OFF, a->ring_version) &&
              afk_ring_write32(a, e, ep, rings[i], AFK_HDR_RPTR_BLOCK, 0) &&
              afk_ring_write32(a, e, ep, rings[i], AFK_HDR_WPTR_BLOCK, 0);
     }
@@ -592,16 +640,13 @@ bool darwin_afk_handle(DarwinAFK *a, uint8_t ep, uint64_t msg) {
 }
 
 /*
- * Write one queue entry into the AP's RX ring and notify it. This is the
- * FW->AP data path; it is the mirror of afk_send_epic() (afk.c:744-880).
- *
- * NOTE: nothing calls this yet. The EPIC layer that will (service announces
- * and replies) is the next task; this exists so that layer has a transport
- * to sit on and so the ring-full / wrap logic lives next to its read-side
- * counterpart.
+ * Write one queue entry into the AP's RX ring and (optionally) notify. This is
+ * the FW->AP data path; it is the mirror of afk_send_epic() (afk.c:744-880).
+ * darwin_dcp.c uses it for EPIC service announces.
  */
 bool darwin_afk_send_qe(DarwinAFK *a, uint8_t ep, uint32_t channel,
-                        uint32_t type, const void *data, uint32_t len) {
+                        uint32_t type, const void *data, uint32_t len,
+                        bool notify) {
     AFKEndpoint *e = &a->eps[ep];
     if (e->state != AFK_EP_STARTED) return false;
 
@@ -651,8 +696,16 @@ bool darwin_afk_send_qe(DarwinAFK *a, uint8_t ep, uint32_t channel,
     // Payload, then queue entry, then wptr, then the notify -- the order
     // afk_send_epic() uses (afk.c:838-878).
     if (!afk_ring_write32(a, e, ep, &e->rx, AFK_HDR_WPTR_BLOCK, wptr)) return false;
-    afk_send(a, ep, AFK_MSG(RBEP_RECV) | wptr);
+    if (notify) {
+        afk_send(a, ep, AFK_MSG(RBEP_RECV) | wptr);
+    }
     return true;
+}
+
+void darwin_afk_notify(DarwinAFK *a, uint8_t ep) {
+    AFKEndpoint *e = &a->eps[ep];
+    if (e->state != AFK_EP_STARTED) return;
+    afk_send(a, ep, AFK_MSG(RBEP_RECV) | e->rx_wptr);
 }
 
 DarwinAFK *darwin_afk_new(DeviceState *asc, const char *role,
@@ -671,6 +724,7 @@ DarwinAFK *darwin_afk_new(DeviceState *asc, const char *role,
     a->block = (cfg && cfg->block) ? cfg->block : AFK_DEF_BLOCK;
     uint32_t hdr_blocks = (cfg && cfg->hdr_blocks) ? cfg->hdr_blocks : AFK_DEF_HDR_BLOCKS;
     a->ring_size = (cfg && cfg->ring_size) ? cfg->ring_size : AFK_DEF_RING_SIZE;
+    a->ring_version = (cfg && cfg->ring_version) ? cfg->ring_version : AFK_RING_VERSION;
 
     // Escape hatches for trying a different geometry against a new iOS
     // without a rebuild; see the header comment on why the defaults are what
@@ -678,11 +732,13 @@ DarwinAFK *darwin_afk_new(DeviceState *asc, const char *role,
     const char *env;
     if ((env = getenv("DARWIN_AFK_BLOCK"))) a->block = strtoul(env, NULL, 0);
     if ((env = getenv("DARWIN_AFK_RING_SIZE"))) a->ring_size = strtoul(env, NULL, 0);
+    if ((env = getenv("DARWIN_AFK_RING_VERSION"))) a->ring_version = strtoul(env, NULL, 0);
     a->hdr_size = a->block * hdr_blocks;
 
     fprintf(stderr, "darwin-afk: %s transport, dart %s sid %u, rings 2 x 0x%x "
-            "(header 0x%x, block 0x%x)\n", a->role,
-            dart ? "ok" : "MISSING", sid, a->ring_size, a->hdr_size, a->block);
+            "(header 0x%x, block 0x%x, version 0x%08x)\n", a->role,
+            dart ? "ok" : "MISSING", sid, a->ring_size, a->hdr_size, a->block,
+            a->ring_version);
     return a;
 }
 

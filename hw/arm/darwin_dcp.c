@@ -17,16 +17,38 @@
  *                                     directly on RTKit, *not* AFK. Not
  *                                     advertised yet, so XNU never starts it.
  *
- * What works today: the RTKit handshake (darwin_asc.c) and the AFK transport
- * handshake for every 0x20..0x2a endpoint, up to and including START_ACK,
- * with both rings live in guest memory reached through dart-dcp's stream 23.
- * What does not: the EPIC framing inside the ring entries, and therefore the
- * service announces (`dcpav-*`, `dcpdptx-*`) XNU's sub-drivers match on. Any
- * ring entry the AP sends us is logged with its EPIC header decoded, and
- * nothing else -- see dcp_afk_recv().
+ * What works today: the RTKit handshake (darwin_asc.c), the AFK transport
+ * handshake for every 0x20..0x2a endpoint (darwin_afk.c), and one EPIC
+ * REPORT/PUBLISH per endpoint announcing a service by name (darwin_epic.c),
+ * which is what XNU's sub-driver personalities match on -- every one of them
+ * is `IOProviderClass = AFKEndpointInterface` plus
+ * `IOPropertyMatch = { EPICName: ... }` in the kernelcache's
+ * __PRELINK_INFO. What does not: any command/response traffic *after* a
+ * driver binds. Commands the AP sends us are decoded and logged, and
+ * deliberately not answered -- see dcp_afk_recv().
+ *
+ * WHAT TO ANNOUNCE is policy, and it lives here rather than in darwin_epic.c.
+ * The service list below is the "confirmed both sides" table from
+ * docs/re/dcp-firmware-services.md: each name appears both as an `-epic`
+ * string in the real t8140 DCP firmware and as an `EPICName` IOPropertyMatch
+ * in this kernelcache, so XNU really will try to bind the named class.
+ *
+ * Which endpoint carries which service is *not* known for t8140 -- the
+ * endpoint-to-service correlation in docs/re/afk-epic-references.md sec. 4 is
+ * M1-era and explicitly unconfirmed. It should not matter: matching keys on
+ * the announced properties, not on the endpoint number. The default is
+ * therefore one service on one endpoint, overridable without a rebuild:
+ *
+ *   DARWIN_DCP_EPIC=off                   announce nothing (pre-EPIC behaviour)
+ *   DARWIN_DCP_EPIC=all                   announce every service in dcp_services[]
+ *   DARWIN_DCP_EPIC=dcpav-device-epic     announce just that one
+ *   DARWIN_DCP_EPIC_EP=0x22               ...on this endpoint (default 0x20)
+ *   DARWIN_DCP_EPIC_OPTIONS=0             packet header options byte
  *
  * Tracing: DARWIN_ASC_DEBUG=1 for the mailbox, DARWIN_AFK_DEBUG=1 for the
- * ring transport, DARWIN_DART_DEBUG=1 for the IOMMU underneath it.
+ * ring transport, DARWIN_DART_DEBUG=1 for the IOMMU underneath it. The
+ * announce itself always logs one line per service (prefix "dcp:", which is
+ * what tools/probe.sh filters device-model traces on).
  */
 
 #include "qemu/osdep.h"
@@ -35,11 +57,52 @@
 #include "xnu/darwin_afk.h"
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_dcp.h"
+#include "xnu/darwin_epic.h"
+
+/*
+ * One announceable EPIC service. `epic_name` is the match key; `provider` is
+ * the IOClass the kernelcache pairs it with -- we publish it as
+ * `EPICProviderClass` because the real firmware's string table keeps
+ * EPICName/EPICProviderClass/EPICUnit adjacent (dcpfw+0x3f6ef6..0x3f6f15) even
+ * though this kernelcache never matches on it.
+ */
+typedef struct {
+    const char *epic_name;
+    const char *provider;
+} DCPService;
+
+/* docs/re/dcp-firmware-services.md, "Confirmed both sides" table. */
+static const DCPService dcp_services[] = {
+    { "dcpav-controller-epic",       "DCPAVControllerProxy" },
+    { "dcpav-device-epic",           "DCPAVDeviceProxy" },
+    { "dcpav-service-epic",          "DCPAVServiceProxy" },
+    { "dcpav-video-interface-epic",  "DCPAVVideoInterfaceProxy" },
+    { "dcpav-power-epic",            "DCPAVPowerControllerProxy" },
+    { "dcpav-audio-interface-epic",  "DCPAVAudioInterfaceProxy" },
+    { "dcpav-cec-interface-epic",    "DCPAVCECInterfaceProxy" },
+    { "dcpav-sac-epic",              "DCPAVRemoteSACControllerProxy" },
+    { "dcpdp-controller-epic",       "DCPDPControllerProxy" },
+    { "dcpdp-device-epic",           "DCPDPDeviceProxy" },
+    { "dcpdp-service-epic",          "DCPDPServiceProxy" },
+    { "dcpdptx-port-epic",           "AppleDCPDPTXRemotePortProxy" },
+    { "dcp-lpdptx-port-epic",        "AppleDCPLPDPTXPortProxy" },
+    { "dcpdptx-hdcp-interface",      "AppleDCPDPTXRemoteHDCPInterfaceProxy" },
+    { "dcpdptx-hdcp-auth-session",   "AppleDCPDPTXRemoteHDCPAuthSessionProxy" },
+    { "dcpmipi-controller-epic",     "DCPMIPIControllerProxy" },
+};
 
 typedef struct DarwinDCP {
     DeviceState *asc;
     DarwinAFK *afk;
     uint64_t msgs;
+
+    /* announce policy, resolved once at create time */
+    bool announce;          /* DARWIN_DCP_EPIC != "off" */
+    bool announce_all;      /* DARWIN_DCP_EPIC == "all" */
+    const char *only;       /* a single EPICName, or NULL */
+    uint8_t announce_ep;    /* which endpoint to announce on */
+    uint8_t options;        /* EPIC packet header options byte */
+    uint16_t next_iface;    /* firmware-chosen interface ids, 1-based */
 } DarwinDCP;
 
 /*
@@ -78,44 +141,126 @@ static bool dcp_handle(void *opaque, uint8_t ep, uint64_t msg) {
     return true;
 }
 
-static void dcp_afk_started(void *opaque, uint8_t ep) {
+/*
+ * Announce one service on `ep` as an EPIC REPORT/PUBLISH.
+ *
+ * The property dictionary is what XNU turns into the nub's property table
+ * (0xfffffff008b7bd5c onwards), so it has to carry everything anyone matches
+ * on or reads:
+ *
+ *   EPICName           the IOPropertyMatch key of every DCP sub-driver
+ *                      personality in this kernelcache
+ *   EPICProviderClass  the class the firmware pairs with that name
+ *   EPICUnit           instance index; 0 for the single-instance services
+ *   name               read back explicitly at 0xfffffff008b7bdf0
+ *   interface-name     read back at 0xfffffff008b7be3c and used to setName()
+ *                      the nub, so it is also what an IONameMatch personality
+ *                      would see
+ *
+ * The AP adds "interface-id" itself from the message header, so we must not.
+ */
+static bool dcp_announce(DarwinDCP *d, uint8_t ep, const DCPService *svc) {
+    const DarwinEpicProp props[] = {
+        { .key = "EPICName",          .str = svc->epic_name },
+        { .key = "EPICProviderClass", .str = svc->provider },
+        { .key = "EPICUnit",          .num = 0, .bits = 64 },
+        { .key = "name",              .str = svc->epic_name },
+        { .key = "interface-name",    .str = svc->epic_name },
+    };
+    size_t plen = 0;
+    g_autofree uint8_t *blob = darwin_epic_serialize_props(props, ARRAY_SIZE(props), &plen);
+
+    uint16_t iface = d->next_iface++;
+    size_t flen = 0;
+    g_autofree uint8_t *frame =
+        darwin_epic_build_publish(iface, svc->epic_name, blob, plen, d->options, &flen);
+
     /*
-     * The AFK transport for this endpoint is live. Real firmware would now
-     * announce its services here with EPIC REPORT/ANNOUNCE frames
-     * (docs/re/afk-epic-references.md §3 step 11, service names in
-     * docs/re/dcp-firmware-services.md). That is the next task; we
-     * deliberately announce nothing rather than guess at a payload.
+     * afk_qe.channel and afk_qe.type are 0: iOS 27's AP writes 0 in both and
+     * its ring drain never reads either back (it reads only magic and size,
+     * 0xfffffff008b94a7c / 0xfffffff008b9492c). The EPIC message header inside
+     * the payload is what carries the multiplexing.
      */
-    fprintf(stderr, "dcp: AFK endpoint 0x%02x is up; no EPIC services announced "
-            "(EPIC layer not implemented)\n", ep);
+    bool ok = darwin_afk_send_qe(d->afk, ep, 0, 0, frame, (uint32_t)flen, false);
+    fprintf(stderr, "dcp: ep 0x%02x announce EPICName=%s provider=%s iface-id %u "
+            "frame 0x%zx bytes (props 0x%zx) -> %s\n",
+            ep, svc->epic_name, svc->provider, iface, flen, plen,
+            ok ? "queued" : "FAILED (ring full, or DMA unreachable)");
+
+    // The exact bytes matter and are awkward to reconstruct from a panic, so
+    // dump them when the transport is already being traced.
+    if (getenv("DARWIN_AFK_DEBUG")) {
+        g_autoptr(GString) s = g_string_new(NULL);
+        for (size_t i = 0; i < flen; i++) {
+            g_string_append_printf(s, "%s%02x", (i && !(i & 15)) ? "\n dcp:   " : " ", frame[i]);
+        }
+        fprintf(stderr, "dcp:   %s\n", s->str);
+    }
+    return ok;
+}
+
+static void dcp_afk_started(void *opaque, uint8_t ep) {
+    DarwinDCP *d = opaque;
+
+    if (!d->announce) {
+        fprintf(stderr, "dcp: AFK endpoint 0x%02x is up; announcing nothing "
+                "(DARWIN_DCP_EPIC=off)\n", ep);
+        return;
+    }
+    if (ep != d->announce_ep) {
+        return;
+    }
+    bool any = false;
+    for (size_t i = 0; i < ARRAY_SIZE(dcp_services); i++) {
+        if (d->only && strcmp(d->only, dcp_services[i].epic_name)) {
+            continue;
+        }
+        if (!dcp_announce(d, ep, &dcp_services[i])) {
+            return;
+        }
+        any = true;
+        if (!d->announce_all && !d->only) {
+            break;      /* default: the first service only */
+        }
+    }
+    /*
+     * A name that is not in the confirmed table is announced verbatim. This is
+     * how you aim at a driver that matches on something other than EPICName --
+     * notably AppleFirmwareKit's own AFKEchoTestEPIC, whose personality is
+     * `IONameMatch = ["ap_echo-test"]` on AFKEndpointInterface, and which sends
+     * traffic of its own accord, so it is the cheapest way to prove that a
+     * driver really bound rather than merely that a nub appeared.
+     */
+    if (!any && d->only) {
+        DCPService synth = { d->only, d->only };
+        any = dcp_announce(d, ep, &synth);
+    }
+    /*
+     * One RBEP_RECV for the whole burst. RECV carries the new wptr and the AP
+     * drains until rptr == wptr, so a single notify covers every entry -- and
+     * one notify per entry overruns darwin_asc.c's inbound FIFO (16 announces
+     * produced "asc(DCP): i2a fifo overflow, dropping ep 32", the dropped
+     * message being the last and therefore the one that mattered; the guest
+     * then stalled with the whole burst unread).
+     */
+    if (any) {
+        darwin_afk_notify(d->afk, ep);
+    }
 }
 
 /*
- * Diagnostic decode only. The two EPIC headers are documented at
- * linux-asahi drivers/gpu/drm/apple/afk.h:93-110:
- *   epic_hdr      (16 bytes) version:u8, seq:u16, pad:u8, unk:u32, ts:u64
- *   epic_sub_hdr  (24 bytes) length:u32, version:u8, category:u8, type:u16,
- *                            ts:u64, tag:u16, unk:u16, inline_len:u32
- * We print them so the next person can see what the guest sent; we do not
- * act on them, and we do not reply.
+ * Diagnostic decode only: darwin_epic_describe() knows the iOS 27 header
+ * shapes (8-byte message header + 16-byte packet header, see darwin_epic.c).
+ * We print what the guest sent and do not reply -- answering a command
+ * without knowing its group/command numbers would be a guess, and a wrong
+ * reply is harder to debug than no reply. A driver that binds and then waits
+ * here is the expected next stall, and this line is where you see it.
  */
 static void dcp_afk_recv(void *opaque, uint8_t ep, uint32_t channel, uint32_t type,
                          const uint8_t *data, uint32_t len) {
-    if (len >= 40) {
-        const uint8_t *sh = data + 16;
-        uint8_t ehdr_ver = data[0];
-        uint16_t seq = data[1] | (data[2] << 8);
-        uint32_t slen = sh[0] | (sh[1] << 8) | (sh[2] << 16) | ((uint32_t)sh[3] << 24);
-        uint8_t sver = sh[4], scat = sh[5];
-        uint16_t stype = sh[6] | (sh[7] << 8);
-        uint16_t tag = sh[16] | (sh[17] << 8);
-        fprintf(stderr, "dcp: UNHANDLED EPIC frame ep 0x%02x chan %u type %u len 0x%x "
-                "[epic v%u seq %u | sub v%u cat 0x%02x subtype 0x%04x tag 0x%04x plen 0x%x]\n",
-                ep, channel, type, len, ehdr_ver, seq, sver, scat, stype, tag, slen);
-    } else {
-        fprintf(stderr, "dcp: UNHANDLED EPIC frame ep 0x%02x chan %u type %u len 0x%x "
-                "(too short for the two EPIC headers)\n", ep, channel, type, len);
-    }
+    g_autofree char *desc = darwin_epic_describe(data, len);
+    fprintf(stderr, "dcp: UNANSWERED EPIC frame ep 0x%02x qe(chan %u type %u len 0x%x): %s\n",
+            ep, channel, type, len, desc);
 }
 
 static const DarwinASCOps dcp_asc_ops = {
@@ -135,6 +280,31 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
         return NULL;
     }
     DarwinDCP *d = g_new0(DarwinDCP, 1);
+
+    /*
+     * Announce policy. Defaults: one service, the first of the confirmed
+     * list, on endpoint 0x20 -- the smallest thing that can prove the framing
+     * end to end. options=1 because that is the value the AP itself puts in
+     * every report it sends (0xfffffff008b8fcbc, 0xfffffff008b8fe58); no
+     * report path we traced reads it back, so it is the least-surprising
+     * choice rather than a modelled behaviour.
+     */
+    const char *env = getenv("DARWIN_DCP_EPIC");
+    d->announce = !(env && !strcmp(env, "off"));
+    d->announce_all = env && !strcmp(env, "all");
+    if (env && strcmp(env, "off") && strcmp(env, "all")) {
+        d->only = env;
+    }
+    d->announce_ep = 0x20;
+    if ((env = getenv("DARWIN_DCP_EPIC_EP"))) {
+        d->announce_ep = (uint8_t)strtoul(env, NULL, 0);
+    }
+    d->options = 1;
+    if ((env = getenv("DARWIN_DCP_EPIC_OPTIONS"))) {
+        d->options = (uint8_t)strtoul(env, NULL, 0);
+    }
+    d->next_iface = 1;
+
     d->asc = darwin_asc_create(dcp, iobase, aic, dcp_eps, ARRAY_SIZE(dcp_eps), &dcp_asc_ops, d);
 
     /*
@@ -166,6 +336,15 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
                             NULL, &dcp_afk_ops, d);
     for (size_t i = 0; i < ARRAY_SIZE(dcp_eps); i++) {
         darwin_afk_add_endpoint(d->afk, dcp_eps[i]);
+    }
+
+    if (!d->announce) {
+        fprintf(stderr, "dcp: EPIC announces disabled (DARWIN_DCP_EPIC=off)\n");
+    } else {
+        fprintf(stderr, "dcp: will announce %s on ep 0x%02x (options 0x%02x)\n",
+                d->announce_all ? "every confirmed service" :
+                d->only ? d->only : dcp_services[0].epic_name,
+                d->announce_ep, d->options);
     }
     return d->asc;
 }

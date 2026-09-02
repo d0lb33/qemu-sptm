@@ -39,9 +39,11 @@ typedef struct DarwinAFKOps {
 // darwin_afk.c); every field is overridable so a different IOP or a newer
 // iOS can be tried without touching the code.
 typedef struct DarwinAFKConfig {
-    uint32_t block;      // ring granule in bytes (BLOCK_SHIFT 6 -> 0x40)
-    uint32_t hdr_blocks; // ring header size, in `block` units (3)
-    uint32_t ring_size;  // bytes per ring, header included
+    uint32_t block;        // ring granule in bytes (BLOCK_SHIFT 6 -> 0x40)
+    uint32_t hdr_blocks;   // ring header size, in `block` units (3)
+    uint32_t ring_size;    // bytes per ring, header included
+    uint32_t ring_version; // ring header word at +4; selects the queue entry
+                           // layout. See AFK_RING_VERSION in darwin_afk.c.
 } DarwinAFKConfig;
 
 /*
@@ -72,11 +74,22 @@ bool darwin_afk_handle(DarwinAFK *a, uint8_t ep, uint64_t msg);
 // True once we have sent START_ACK for this endpoint.
 bool darwin_afk_ep_started(DarwinAFK *a, uint8_t ep);
 
-// Push one queue entry into the AP's RX ring and notify it with RBEP_RECV.
-// `data`/`len` become afk_qe.data. Returns false if the endpoint is not
-// started, the ring is full, or DMA failed.
+// Push one queue entry into the AP's RX ring. `data`/`len` become afk_qe.data.
+// Returns false if the endpoint is not started, the ring is full, or DMA
+// failed.
+//
+// `notify` sends the RBEP_RECV that tells the AP to drain. Pass false for all
+// but the last entry of a burst and call darwin_afk_notify() once at the end:
+// RECV carries the new wptr and the AP drains until rptr == wptr, so one
+// notify covers any number of entries -- and one per entry overruns the ASC
+// mailbox's inbound FIFO ("asc(...): i2a fifo overflow, dropping ep ..."),
+// which loses the *last* notify and leaves the burst unread.
 bool darwin_afk_send_qe(DarwinAFK *a, uint8_t ep, uint32_t channel,
-                        uint32_t type, const void *data, uint32_t len);
+                        uint32_t type, const void *data, uint32_t len,
+                        bool notify);
+
+// Tell the AP about everything written since the last notify.
+void darwin_afk_notify(DarwinAFK *a, uint8_t ep);
 
 // Forget all endpoint state (the IOP was reset).
 void darwin_afk_reset(DarwinAFK *a);
