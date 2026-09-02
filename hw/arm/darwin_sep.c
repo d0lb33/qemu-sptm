@@ -60,9 +60,10 @@
  *   16   'xars'  xART slave    18   'sks '  AppleSEPKeyStore (the keybag)
  *   19   'xarm'  xART master   253  discovery   254  L4Info   255  bootstrap
  *
- * 'sks' is known but NOT advertised by default -- announcing an endpoint we
- * cannot answer panics the kernel after 20 unanswered requests. See the long
- * comment above sep_default_eps.
+ * 'sks' implements the iOS 27 IPC v1 negotiation and the media-key create /
+ * unwrap path used by encrypted APFS.  The default list only gained it after
+ * a guest-created encrypted volume survived a reboot and mounted successfully
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:457..483).
  *
  * ---------------------------------------------------------------------------
  * Bootstrap endpoint (255), what AppleSEPBooter sends and what it accepts
@@ -428,11 +429,9 @@ static const SEPEndpointDef sep_all_eps[] = {
     { "xarm", 19,  1, 4, 1, 4 },
 };
 /*
- * sks is deliberately not in the default list, even though AppleSEPKeyStore
- * waits for it by name. An endpoint that is advertised and then never answers
- * is worse than one that was never advertised: AppleSEPKeyStore sends its
- * first IPC request the moment `sep-endpoint,sks` appears, re-sends it every
- * ~5 s logging
+ * An advertised but unanswered sks endpoint is fatal: AppleSEPKeyStore sends
+ * its first IPC request the moment `sep-endpoint,sks` appears, re-sends it
+ * every ~5 s logging
  *
  *   "AppleSEPKeyStore":pid:0,:3466: sks timeout strike N
  *
@@ -451,14 +450,16 @@ static const SEPEndpointDef sep_all_eps[] = {
  * launchd's `keybag` boot task. The restore-ramdisk boot is only two strikes
  * short of the same panic inside a 120 s probe.
  *
- * The request we would have to answer is captured in docs/re/sep-protocol.md
- * and the reply has to carry an AppleKeyStore ipc.c header of its own: the
+ * This model answers the request captured in docs/re/sep-protocol.md with an
+ * AppleKeyStore ipc.c header of its own.  The
  * kext logs "negotiated to ipc header theirs:v%llu, ours:v%u -> negotiated:
  * v%llu" (0xfffffff00954cd10) after computing
- * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc). Put sks back
- * with DARWIN_SEP_EPS=cntl,scrd,xars,sks,xarm once that reply exists.
+ * `negotiated = theirs < 2 ? theirs : ours` (0xfffffff00954ccdc).  It was
+ * promoted to the default only after op31 and op32 let the guest mount its
+ * encrypted volume after a reboot
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.serial.log:457..483).
  */
-static const char *const sep_default_eps = "cntl,scrd,xars,xarm";
+static const char *const sep_default_eps = "cntl,scrd,sks,xars,xarm";
 
 typedef struct {
     bool advertised;
