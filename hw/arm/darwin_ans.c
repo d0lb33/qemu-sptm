@@ -242,6 +242,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinANSState, DARWIN_ANS)
 #define NVME_ADM_SET_FEAT   0x09
 #define NVME_ADM_GET_FEAT   0x0a
 #define NVME_ADM_ASYNC_EV   0x0c
+/* Apple vendor admin opcode. Not in the NVMe spec and in none of the reference
+ * bodies; observed being issued twice per boot by the code the guest calls
+ * ProcessTunnelCommand / GetSanitizeCounters. See ans_admin(). */
+#define ANS_ADM_VENDOR_TUNNEL 0xd8
 
 /* NVMe IO opcodes */
 #define NVME_IO_FLUSH       0x00
@@ -328,6 +332,7 @@ struct DarwinANSState {
     uint32_t lba_size;
     uint32_t sqe_stride;
     uint32_t mdts;
+    bool     blk_readonly;      /* the backend would not grant BLK_PERM_WRITE */
     bool     secure_bar;
     bool     linear_sq;
     char    *serial;
@@ -371,6 +376,9 @@ struct DarwinANSState {
     bool     logged_nvmmu_in_nvme, logged_inband_nvme, logged_nvme_in_nvmmu;
     bool     dumped_first_sqe;
     uint64_t n_admin, n_io, n_read_blocks, n_write_blocks;
+    /* How many accesses the SART allow-list did not cover. Always every access
+     * on t8140; see ans_sart_check() for why, and why we only log a few. */
+    uint64_t n_sart_denied;
 };
 
 /* ---------------- small helpers ---------------- */
@@ -417,10 +425,34 @@ static void ans_sart_check(DarwinANSState *s, uint64_t pa, uint64_t len, const c
     if (darwin_sart_allows(s->sart, pa, len)) {
         return;
     }
-    /* Real hardware would drop the transfer. We log by default: see the file
+    /*
+     * On t8140 this fires for *every* access, because the SART region table
+     * never gets programmed through the MMIO window darwin_sart.c backs. That
+     * is consistent with what the kernelcache says the CoastGuard mapper does:
+     * `IOCoastGuardSARTMapper` reaches the filter through
+     * "pmap_iommu_ioctl(&_ppl->super, SART_IOCTL_SET_ACTIVE, ...)"
+     * (string in com.apple.driver.AppleSART) rather than by storing to
+     * CONFIG/PADDR/SIZE, so nothing we can observe ever populates the table and
+     * darwin_sart_allows() can only ever answer false.
+     *
+     * One boot of the real system volume produced 411,000 of these lines
+     * (probe tag A9ROOT5, 186,596 of them for PRP-list pages alone), which
+     * buries everything else in the trace, so print the first few and then only
+     * a periodic running total. The full stream is still available with
+     * DARWIN_ANS_DEBUG.
+     *
+     * Real hardware would drop the transfer. We log by default: see the file
      * header for why refusing looks like a disk error rather than a bug. */
-    ans_log(s, "SART does not allow %s at 0x%" PRIx64 "+0x%" PRIx64 "%s\n",
-            what, pa, len, s->sart_enforce ? " (DENIED)" : " (allowing anyway)");
+    s->n_sart_denied++;
+    if (s->debug || s->n_sart_denied <= 4 ||
+        (s->n_sart_denied % 100000) == 0) {
+        ans_log(s, "SART does not allow %s at 0x%" PRIx64 "+0x%" PRIx64
+                "%s (%" PRIu64 " so far; the CoastGuard mapper programs the "
+                "filter through pmap_iommu_ioctl, not this window, so the "
+                "region table we can see is always empty)\n",
+                what, pa, len, s->sart_enforce ? " (DENIED)" : " (allowing anyway)",
+                s->n_sart_denied);
+    }
 }
 
 static bool ans_dma(DarwinANSState *s, uint64_t pa, void *buf, size_t len,
@@ -832,6 +864,35 @@ static uint16_t ans_admin(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
         ans_log(s, "Async Event Request rejected: the ANS does not support AEN "
                 "(Linux apple.c:68-69)\n");
         return NVME_SC_INVALID_OPCODE;
+    case ANS_ADM_VENDOR_TUNNEL:
+        /*
+         * Apple's vendor "tunnel" command, used to pull firmware statistics out
+         * of the coprocessor. Named from the guest's own reaction to us
+         * refusing it (probe A9ROOT5, twice per boot):
+         *
+         *   AppleNVMeController::ProcessTunnelCommand():1227:
+         *       nvme: ProcessTunnelCommand failed with status 0xe00002e9
+         *   AppleANS2NVMeController::GetSanitizeCounters():5499:
+         *       nvme: CORE_DEBUG_EXPORT_STATS failed with status 0xe00002e9
+         *
+         * Refusing it is *measured* to be non-fatal, which is why this stays an
+         * honest hole rather than a fabricated answer: in probe tags A9LONG2
+         * and A9FINAL the guest reaches
+         * "(boot) Early boot complete. Continuing system boot." with these
+         * rejections in the log, and the three AppleNVMe "Assert failed" lines
+         * that follow each one are logging asserts -- execution continues past
+         * them. The payload is real firmware state (sanitize counters, debug
+         * statistics) we have no way to synthesise, and a zero-filled reply
+         * would be a guess the driver might divide by.
+         *
+         * If a later boot stage does turn out to need it, complete it with a
+         * zeroed buffer and say in the comment that the contents are a stub --
+         * do not invent a layout.
+         */
+        ans_log(s, "vendor tunnel command 0x%02x (CORE_DEBUG_EXPORT_STATS et al) "
+                "refused: the firmware statistics it wants are not modelled\n",
+                c->opcode);
+        return NVME_SC_INVALID_OPCODE;
     default:
         ans_log(s, "UNMODELLED admin opcode 0x%02x (cid %u nsid %u "
                 "cdw10..12 %08x %08x %08x) -> Invalid Opcode\n",
@@ -848,7 +909,7 @@ static uint16_t ans_io(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
     *result = 0;
 
     if (c->opcode == NVME_IO_FLUSH) {
-        if (s->blk) {
+        if (s->blk && !s->blk_readonly) {
             blk_flush(s->blk);
         }
         return NVME_SC_SUCCESS;
@@ -869,6 +930,18 @@ static uint16_t ans_io(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
             ans_hexdump(s, "unmodelled io SQE", c->raw, ANS_SQE_SIZE);
         }
         return NVME_SC_INVALID_OPCODE;
+    }
+
+    if ((is_write || is_wz) && s->blk_readonly) {
+        /*
+         * The NVMe status for this is "Attempted Write to Read Only Range",
+         * but the sources here disagree on its encoding and we have never seen
+         * the guest react to one, so report a plain Internal Error rather than
+         * guess a code. The log is the real answer.
+         */
+        ans_log(s, "Write to a read-only backing image refused (cid %u lba %u); "
+                "drop readonly=on, or pass a qcow2 overlay\n", c->cid, c->cdw10);
+        return NVME_SC_INTERNAL;
     }
 
     if (!s->blk) {
@@ -1603,11 +1676,57 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
     if (env) {
         s->sqe_stride = strtoul(env, NULL, 0);
     }
+    /* See the "mdts" property: the guest's own PRP-list sizing bounds this from
+     * below, and the bound is not stated anywhere, so it stays adjustable. */
+    env = getenv("DARWIN_ANS_MDTS");
+    if (env) {
+        s->mdts = strtoul(env, NULL, 0);
+    }
     env = getenv("DARWIN_ANS_SART");
     s->sart_enforce = env && !strcmp(env, "enforce");
     s->boot_ready_at_reset = getenv("DARWIN_ANS_BOOT_READY") != NULL;
     if (s->boot_ready_at_reset) {
         s->booted = true;
+    }
+
+    /*
+     * Ask the block layer for write permission.
+     *
+     * DEFINE_PROP_DRIVE only attaches the backend; it does not grant anything.
+     * Devices normally follow up with blkconf_apply_backend_options(), which
+     * exists to parse a BlockConf we do not have, but whose only load-bearing
+     * step for us is the blk_set_perm() at hw/block/block.c:226. Without it the
+     * first guest write aborts the whole process, at the *end* of a five-minute
+     * boot, with no hint that a device model is at fault:
+     *
+     *   ans(ans): IOSQ tag 19 -> opcode 0x01 cid 19 nsid 1 ...   (NVMe Write)
+     *   Assertion failed: (child->perm & BLK_PERM_WRITE),
+     *       function bdrv_co_write_req_prepare, file io.c, line 2016.
+     *
+     * Reads never trip it, which is why this survived a boot that mounts APFS
+     * and reads the whole dyld shared cache: iOS mounts its system volume
+     * read-only, so the first write in practice came from newfs_apfs run by
+     * hand (probe scratch image, tag wtest).
+     *
+     * A backend the user opened read-only (-drive ...,readonly=on, or a
+     * read-only file) is honoured rather than fought: we take read permission
+     * only and refuse Writes in ans_io() instead of aborting.
+     */
+    if (s->blk) {
+        s->blk_readonly = !blk_supports_write_perm(s->blk);
+        uint64_t perm = BLK_PERM_CONSISTENT_READ;
+        if (!s->blk_readonly) {
+            perm |= BLK_PERM_WRITE;
+        }
+        if (blk_set_perm(s->blk, perm,
+                         BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE_UNCHANGED,
+                         errp) < 0) {
+            return;
+        }
+        if (s->blk_readonly) {
+            ans_log(s, "the backing image is read-only; NVMe Write, Write "
+                    "Zeroes and Flush will be refused\n");
+        }
     }
 
     s->nvmmu_store = g_new0(uint32_t, s->nvmmu_size / 4);
@@ -1693,10 +1812,36 @@ static const Property darwin_ans_properties[] = {
     /* 64 per Linux/m1n1's struct nvme_command; see the header for why this is
      * a property and not a constant. */
     DEFINE_PROP_UINT32("sqe-stride", DarwinANSState, sqe_stride, 64),
-    /* MDTS: 2^n * CAP.MPSMIN pages, so 5 => 128K per command. No source states
-     * the real value; this is large enough not to be a bottleneck and small
-     * enough that a bad PRP list cannot ask us for a huge allocation. */
-    DEFINE_PROP_UINT32("mdts", DarwinANSState, mdts, 5),
+    /*
+     * MDTS: Identify Controller byte 0x4d, a max transfer of 2^n * CAP.MPSMIN
+     * pages. With MPSMIN 0 (4K), 8 => 1 MiB.
+     *
+     * No source states Apple's real value, but the guest bounds it from below.
+     * At 5 (128 KiB) the boot got as far as dyld opening the shared cache and
+     * then died reading it (probe tag A9ROOT3):
+     *
+     *   libignition: dylib_cache: opened shared cache directory:
+     *                             /System/Library/Caches/com.apple.dyld
+     *   AppleNVMe Assert failed: ( PRPEntryCount <=
+     *       ( ( fPRPSize / sizeof ( PRPEntry ) ) + 1 ) ) Exit
+     *       @AppleNVMeRequest.cpp:901
+     *   IOBlockStorageDriver: executeRequest: request failed to start!
+     *   disk1: resource shortage.
+     *   apfs_vnop_read:11932: disk1s1 ... retval 12 ... resid 262144 ...
+     *   dyld[1]: dyld cache '(null)' not loaded
+     *
+     * i.e. APFS asked for 0x40000 (256 KiB) in one request; IONVMeFamily sizes
+     * its per-request PRP list from MDTS (2^5 * 4K = 32 pages => 32 entries)
+     * and refused to build the 64 entries that transfer needs, returning
+     * ENOMEM up through IOBlockStorageDriver to APFS to dyld. So MDTS must
+     * cover the largest request the block layer above will issue, and 256 KiB
+     * is not the ceiling of that - 1 MiB is the first value with real headroom.
+     *
+     * The cost of being generous is bounded: ans_io() allocates one bounce
+     * buffer of the transfer size per command, so 1 MiB * 64 tags worst case.
+     * DARWIN_ANS_MDTS overrides it without a rebuild.
+     */
+    DEFINE_PROP_UINT32("mdts", DarwinANSState, mdts, 8),
     DEFINE_PROP_BOOL("secure-bar", DarwinANSState, secure_bar, true),
     DEFINE_PROP_BOOL("linear-sq", DarwinANSState, linear_sq, true),
     DEFINE_PROP_STRING("serial", DarwinANSState, serial),
@@ -1753,9 +1898,22 @@ static bool ans_rtkit_handle(void *opaque, uint8_t ep, uint64_t msg)
 static void ans_rtkit_ep_start(void *opaque, uint8_t ep, uint32_t flag)
 {
     DarwinANSState *s = opaque;
-    ans_log(s, "AP %s endpoint 0x%02x -> RTBuddy nub \"%sEndpoint%u\"\n",
-            flag == 2 ? "started" : "stopped", ep,
-            s->name ? "ANS2" : "?", ep - 0x1f);
+    /*
+     * The "%sEndpoint%u" nub naming (kernelcache+0xb1f8ef) only applies to the
+     * coprocessor's own endpoints, which start at 0x20; the shared system ones
+     * (MGMT 0x00, CRASHLOG 0x01, SYSLOG 0x02, DEBUG 0x03, IOREPORT 0x04,
+     * OSLOG 0x08) get their own RTBuddy nubs -- RTBuddyIOReportingEndpoint and
+     * friends, visible in an io=0x1f log. Subtracting 0x1f from those underflows
+     * and printed "ANS2Endpoint4294967273"; name them by index only when the
+     * endpoint really is one of ours.
+     */
+    if (ep >= 0x20) {
+        ans_log(s, "AP %s endpoint 0x%02x -> RTBuddy nub \"ANS2Endpoint%u\"\n",
+                flag == 2 ? "started" : "stopped", ep, ep - 0x1f);
+    } else {
+        ans_log(s, "AP %s system endpoint 0x%02x\n",
+                flag == 2 ? "started" : "stopped", ep);
+    }
 }
 
 static const DarwinASCOps ans_asc_ops = {
