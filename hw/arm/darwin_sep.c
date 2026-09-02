@@ -357,12 +357,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_SET_ENV    0x2a
 #define SKS_NEW_MEDIA_KEY 0x31
 
-/* APFS builds a 0x28-byte media-key record before invoking its unwrap path at
- * 0xfffffff00a872b90..0xfffffff00a872bac.  Returning only 0x20 bytes produces
- * an invalid I/O encryption key and reaches "nvme: Missing key!" at
- * IOEmbeddedNVMeBlockDevice.cpp:432
- * (/tmp/dvm/probe/SKS_KEYOP_V6B.serial.log:163). */
-#define SKS_MEDIA_KEY_BLOB_SIZE 40
+/* fs_new_media_key's first output is the live CPX key: the bridge stores it at
+ * descriptor +0/+8 (0xfffffff00957789c..0x95778b8), and APFS passes that
+ * pointer/length to cpx_set_key_len and memcpy at
+ * 0xfffffff00a8720e8..0xa872190.  The CPX allocator accepts up to 0x40 bytes
+ * (0xfffffff00ad02d98..0xad02db0). */
+#define SKS_MEDIA_KEY_SIZE       32
+
+/* The third output is the opaque record which fs_new_media_key gives back to
+ * APFS (0xfffffff009572d90..0x9572da8).  A 0x28-byte value is stored verbatim
+ * in the guest's 80-byte keybag record
+ * (/tmp/dvm/probe/SKS_KEYOP_V7.serial.log:163 and raw offset 0x80a040). */
+#define SKS_WRAPPED_KEY_SIZE     40
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -934,7 +940,8 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * The values are deliberately stable constants: this model has no
          * SEP secret, and AppleSEPKeyStore treats these fields as opaque. */
         name = "new media key (fake-key mode)";
-        payload_size = 4 + 4 + 4 + 4 + 4 + SKS_MEDIA_KEY_BLOB_SIZE;
+        payload_size = 4 + 4 + SKS_MEDIA_KEY_SIZE + 4 + 4 + 4 +
+                       SKS_WRAPPED_KEY_SIZE;
         break;
     default:
         /* A status-only success is a logged no-op, not a claim that the
@@ -961,11 +968,17 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
     case SKS_NEW_MEDIA_KEY: {
-        static const uint8_t media_key[SKS_MEDIA_KEY_BLOB_SIZE] = {
+        static const uint8_t media_key[SKS_MEDIA_KEY_SIZE] = {
             0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
             0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
             0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
             0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+        };
+        static const uint8_t wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
+            0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+            0x57, 0x52, 0x41, 0x50, 0x50, 0x45, 0x44, 0x2d,
+            0x4b, 0x45, 0x59, 0x2d, 0x30, 0x31, 0x00, 0x01,
+            0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
             0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
         };
         uint32_t off = 0;
@@ -975,9 +988,13 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * layout is decoded at 0xfffffff009567394..0x9567408. */
         stl_le_p(payload + off, 1);
         off += 4;
-        /* The first two blobs are optional for fs_new_media_key. */
-        stl_le_p(payload + off, 0);
+        stl_le_p(payload + off, SKS_MEDIA_KEY_SIZE);
         off += 4;
+        memcpy(payload + off, media_key, SKS_MEDIA_KEY_SIZE);
+        off += SKS_MEDIA_KEY_SIZE;
+        /* The auxiliary AES-IV key is optional: APFS only calls
+         * cpx_set_aes_iv_key when this length is nonzero at
+         * 0xfffffff00a8721a0..0xa8721ac. */
         stl_le_p(payload + off, 0);
         off += 4;
         /* Bit 1 tells the bridge this is a raw wrapped-key reply; it becomes
@@ -986,9 +1003,12 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * keybag_common.c:1086 (/tmp/dvm/probe/SKS_KEYOP_V5.serial.log:199). */
         stl_le_p(payload + off, BIT(1));
         off += 4;
-        stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
+        stl_le_p(payload + off, SKS_WRAPPED_KEY_SIZE);
         off += 4;
-        memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
+        memcpy(payload + off, wrapped_key, SKS_WRAPPED_KEY_SIZE);
+        fprintf(stderr, "sep(%s): sks op31 supplies CPX key length %u, "
+                "no auxiliary key, wrapped record length %u\n", s->role,
+                SKS_MEDIA_KEY_SIZE, SKS_WRAPPED_KEY_SIZE);
         break;
     }
     default:
