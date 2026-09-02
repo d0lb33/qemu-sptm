@@ -28,6 +28,7 @@
 #include "xnu/darwin_sart.h"
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_sep.h"
+#include "xnu/darwin_ans.h"
 #include "xnu/darwin_unimp.h"
 
 // See device tree specification section 2.3.8: ranges
@@ -313,8 +314,25 @@ static void darwin_init(MachineState *ms) {
     darwin_sep_create(dt_root, iobase, aic);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
-    static const char *const claimed_ascs[] = { "dcp", "sep" };
-    darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, ARRAY_SIZE(claimed_ascs));
+    // The ANS storage coprocessor owns its own /arm-io/ans mailbox as well as
+    // the NVMe and NVMMU register banks, so it is created before the generic
+    // pass and claims "ans" below. It returns NULL harmlessly when dt_fixup
+    // was not run with -enable ans, and runs without a backing store when no
+    // -drive if=none,id=ans,file=... was given.
+    //
+    // DARWIN_ANS_SELFWIRE is darwin_ans.c's own bring-up scaffold: it creates
+    // the NVMe half at machine-init-done and expects the generic ASC to
+    // already exist, so in that mode we create nothing and leave "ans"
+    // unclaimed. Delete this branch, and the scaffold, once the guarded path
+    // has been boot-tested. ("ans" must stay last in the array for this.)
+    static const char *const claimed_ascs[] = { "dcp", "sep", "ans" };
+    unsigned n_claimed = ARRAY_SIZE(claimed_ascs);
+    if (getenv("DARWIN_ANS_SELFWIRE")) {
+        n_claimed--;
+    } else {
+        darwin_ans_create(dt_root, iobase, aic);
+    }
+    darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, n_claimed);
     init_sep(dt_root);
     init_cpu_impl(dt_root);
 
