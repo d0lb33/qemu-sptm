@@ -357,6 +357,17 @@ static uint64_t asc_read(void *opaque, hwaddr offset, unsigned size) {
         case MBOX_I2A_RECV1:
             if (s->i2a_count) {
                 val = s->i2a_fifo[s->i2a_head].msg1;
+                // Hardware mirrors the FIFO occupancy, counting the entry being
+                // returned, into bits [55:52] of this register.
+                // AppleASCWrapV6::getMailboxBulk (kext 0xfffffff008538758) reads
+                // I2A_CTRL once to check FIFOCNT != 0, then pops repeatedly with a
+                // single `ldp x8, x9, [base+0x8830]` and ends the loop only when
+                // this field reads 1. It never re-reads I2A_CTRL. Leaving these
+                // bits zero means the loop never terminates: the driver keeps
+                // popping an empty FIFO and treats what it reads as real
+                // messages, which XNU then rejects ("invalid management message
+                // 0", RTBuddyManagementEndpoint.cpp:448).
+                val |= (uint64_t)(s->i2a_count & 0xf) << 52;
                 s->i2a_head = (s->i2a_head + 1) % MBOX_FIFO_DEPTH;
                 s->i2a_count--;
                 asc_update_irqs(s);
