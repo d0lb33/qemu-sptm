@@ -929,7 +929,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * The values are deliberately stable constants: this model has no
          * SEP secret, and AppleSEPKeyStore treats these fields as opaque. */
         name = "new media key (fake-key mode)";
-        payload_size = 4 + 4 + 4 + 4 + 4;
+        payload_size = 4 + 4 + 4 + 4 + 4 + SKS_MEDIA_KEY_BLOB_SIZE;
         break;
     default:
         /* A status-only success is a logged no-op, not a claim that the
@@ -956,22 +956,29 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
     case SKS_NEW_MEDIA_KEY: {
+        static const uint8_t media_key[SKS_MEDIA_KEY_BLOB_SIZE] = {
+            0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+            0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
+            0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+        };
         uint32_t off = 0;
 
-        stl_le_p(payload + off, 0);
+        /* This is the union selector, not a separate status word.  The
+         * request selects variant 1 at payload+0x04; the matching v1 reply
+         * layout is decoded at 0xfffffff009567394..0x9567408. */
+        stl_le_p(payload + off, 1);
         off += 4;
-        /* All three blobs are optional in fake-key mode.  Live probes showed
-         * the first and third destinations are the non-pointer sentinels -1
-         * and 0x10; nonzero lengths make the decoder copy through them at
-         * 0xfffffff00957f97c.  The AP-side fallback at 0xfffffff00954a858
-         * supplies the fake key before this request is issued. */
-        stl_le_p(payload + off, 0);
-        off += 4;
+        /* The first two blobs are optional for fs_new_media_key. */
         stl_le_p(payload + off, 0);
         off += 4;
         stl_le_p(payload + off, 0);
         off += 4;
         stl_le_p(payload + off, 0);
+        off += 4;
+        stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
+        off += 4;
+        memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
         break;
     }
     default:
