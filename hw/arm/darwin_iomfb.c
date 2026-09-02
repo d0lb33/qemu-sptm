@@ -260,6 +260,8 @@ struct DarwinIOMFB {
     unsigned cb_next;
     bool cb_busy;
     bool cb_started;
+    bool cb_flag9;          /* mirror the AP's own bit 9; see iomfb_callback_send */
+    bool cb_kick;           /* PROBE only; see the reflection branch in iomfb_class2 */
     char *cb_after;
     uint64_t cb_sent;
 };
@@ -490,8 +492,20 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
         iomfb_hexdump("cb in", buf + sizeof(h), in_len);
     }
 
+    /*
+     * Bit 9. rpc_caller_gated sets it on every request the AP sends
+     * (`bfi x25, x23, #9, #1` @ 0xa0ce668; every observed A-series message is
+     * 0x...202, not 0x...002) and link_send_message preserves it verbatim
+     * (`val & 0x2ff` @ 0xa0ced0c). rpc_callee_gated never reads it, so its
+     * MEANING is not derived -- but "send what the peer sends" is a better
+     * default than "send what we happen to find simplest", and this is the
+     * only field in which our request differed from the AP's own.
+     * DARWIN_DCP_IOMFB_CB_FLAG9=0 puts it back, so the difference stays
+     * measurable rather than baked in.
+     */
     uint64_t msg = 0x02ULL                       /* class 2, subkind 0      */
                  | (1ULL << 8)                   /* ack bit -- see above    */
+                 | ((uint64_t)(m->cb_flag9 ? 1 : 0) << 9)
                  | ((uint64_t)tag << 10)
                  | (0ULL << 16)                  /* offset within the window */
                  | ((uint64_t)size << 32);
@@ -699,6 +713,72 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
                 "ignored\n", ep, subkind);
         return;
     }
+
+    /*
+     * An AP-originated request always has bit 8 CLEAR. link_send_message takes
+     * that bit from *(ctx+4) when a ctx is passed and from chan[0x70]
+     * otherwise (0xa0ced10); rpc_caller_gated always passes its own slot as
+     * ctx (0xa0ce690); and both chan[0x70] and the AP's own slots carry ack 0,
+     * because link_state_init zeroes chan[0x70] (`str wzr` @ 0xa0cf5e8) and
+     * the slot lookup only hands out the chan+0x78 array when
+     * ack == chan[0x70] (0xa0d0328-0xa0d0334). So ack 1 here cannot be a
+     * request from the AP.
+     *
+     * What it is, measured: the AP emits TWO messages for every inbound
+     * request. First a reflection of our own header and offset/size fields,
+     * byte-identical to what we sent, and then rpc_callee_gated's real
+     * completion (subkind 1, status in bits[47:16]). The reflection is
+     * plausibly built by the `[slot+0x50]` vtable+0xf8 call at 0xa0cfcdc,
+     * which runs immediately after the receive path stores exactly those
+     * fields into the slot (0xa0cfccc-0xa0cfcd8) -- but that is where the
+     * evidence stops, so its PURPOSE is not modelled, only recognised and
+     * dropped. Treating it as a fresh request is actively harmful: it made
+     * us read whatever was stale in the AP's own window and answer that.
+     */
+    if (IOMFB_ACK(msg)) {
+        fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 0 with ack 1 -- the AP's "
+                "answer to our callback (offset 0x%x size 0x%x), not a request\n",
+                ep, off, size);
+        /*
+         * Read our own request window back. This is the only way to tell
+         * "the AP dispatched the handler and wrote an output" from "the AP
+         * acknowledged the message and dropped it": the handler's output is
+         * the one thing in that window we did not put there ourselves.
+         */
+        if (m->cb_busy && m->heap_known && size && size <= IOMFB_WINDOW) {
+            g_autofree uint8_t *win = g_malloc0(size);
+            uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE;
+            if (iomfb_dma(m, dva, win, size, false)) {
+                iomfb_hexdump("cb window after", win, size);
+            }
+        }
+
+        /*
+         * The "kick", DARWIN_DCP_IOMFB_CB_KICK=1. NOT DERIVED -- this exists
+         * only because a measurement handed it to us by accident.
+         *
+         * In probe CB2 the model mistook this acknowledgement for a fresh AP
+         * request and answered it with a class-2/subkind-1 completion. That
+         * bogus message is the only difference between CB2, where the AP ran
+         * the D000 handler and wrote 01 into our output window, and CB3-CB5,
+         * where it acknowledged and did nothing. The mechanism is plausible
+         * from the disassembly -- a subkind-1 message on an in-use slot takes
+         * link_handle_message to the lambda at 0xa0d03f8, which stores the
+         * word at slot+0x48 and then calls `[slot+0x58]` vtable+0x108, a wake
+         * (0xa0cfda0-0xa0cfdf8) -- but "this wake is what dispatches
+         * rpc_callee_gated" is a hypothesis under test, not a modelled fact.
+         * Hence a knob, off by default, rather than something the transport
+         * does on its own.
+         */
+        if (m->cb_busy && m->cb_kick) {
+            uint64_t kick = 0x42ULL
+                          | ((uint64_t)IOMFB_ACK(msg) << 8)
+                          | ((uint64_t)IOMFB_TAG(msg) << 10);
+            iomfb_send(m, ep, kick, "PROBE kick: class-2 subkind-1 on our own slot");
+        }
+        return;
+    }
+
     if (!m->heap_known) {
         fprintf(stderr, "iomfb: ep 0x%02x RPC at offset 0x%x size 0x%x, but the AP never "
                 "announced a heap; cannot read it\n", ep, off, size);
@@ -900,7 +980,11 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     const char *cbs = getenv("DARWIN_DCP_IOMFB_CB");
     if (cbs && *cbs) {
         const char *after = getenv("DARWIN_DCP_IOMFB_CB_AFTER");
+        const char *f9 = getenv("DARWIN_DCP_IOMFB_CB_FLAG9");
         m->cb_after = g_strdup(after ? after : "A353");
+        const char *kick = getenv("DARWIN_DCP_IOMFB_CB_KICK");
+        m->cb_flag9 = !(f9 && f9[0] == '0');
+        m->cb_kick = kick && kick[0] && kick[0] != '0';
         iomfb_parse_callbacks(m, cbs);
         fprintf(stderr, "iomfb: PROBE callback script has %u entr%s, starting "
                 "after %s\n", m->cb_script->len,
