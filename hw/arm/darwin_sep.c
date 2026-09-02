@@ -355,6 +355,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * this code plus the reply bit; byte 2 is a request ID. */
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
+#define SKS_NEW_MEDIA_KEY 0x31
+
+#define SKS_MEDIA_KEY_BLOB_SIZE 32
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -918,6 +921,18 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         name = "set environment";
         payload_size = 4;
         break;
+    case SKS_NEW_MEDIA_KEY:
+        /* The generated IPC decoder at 0xfffffff00957d6f8..0x957d7a8
+         * consumes three length-prefixed blobs with a scalar between the
+         * second and third.  fs_new_media_key reaches that decoder through
+         * 0xfffffff009572d64 -> 0xfffffff009577870 -> 0xfffffff00957d6e4.
+         * The values are deliberately stable constants: this model has no
+         * SEP secret, and AppleSEPKeyStore treats these fields as opaque. */
+        name = "new media key (deterministic constants)";
+        payload_size = 4 + 4 + SKS_MEDIA_KEY_BLOB_SIZE +
+                       4 + SKS_MEDIA_KEY_BLOB_SIZE + 4 +
+                       4 + SKS_MEDIA_KEY_BLOB_SIZE;
+        break;
     default:
         /* A status-only success is a logged no-op, not a claim that the
          * operation's side effects are implemented.  It lets the guest name
@@ -942,6 +957,32 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload, 0);
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
+    case SKS_NEW_MEDIA_KEY: {
+        static const uint8_t media_key[SKS_MEDIA_KEY_BLOB_SIZE] = {
+            0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
+            0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
+            0x59, 0x2d, 0x30, 0x31, 0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+        };
+        uint32_t off = 0;
+
+        stl_le_p(payload + off, 0);
+        off += 4;
+        for (unsigned int blob = 0; blob < 2; blob++) {
+            stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
+            off += 4;
+            memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
+            payload[off] ^= blob;
+            off += SKS_MEDIA_KEY_BLOB_SIZE;
+        }
+        stl_le_p(payload + off, 0);
+        off += 4;
+        stl_le_p(payload + off, SKS_MEDIA_KEY_BLOB_SIZE);
+        off += 4;
+        memcpy(payload + off, media_key, SKS_MEDIA_KEY_BLOB_SIZE);
+        payload[off] ^= 2;
+        break;
+    }
     default:
         stl_le_p(payload, 0);
         break;
