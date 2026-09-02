@@ -113,8 +113,39 @@
  *   (cmsgSET_OOL_IN sends 4 then 2, 0xfffffff00959a030..0x59a07c)
  *   20 security mode, 24 self test, 37 erase-install: acknowledged
  *
- * xART endpoints (16, 19): every request is acknowledged with op 0 and the
- * tag, which is all AppleSEPXART checks ("received message for invalid tag").
+ * xART endpoints (16 'xars', 19 'xarm'), AppleSEPXART. The frame is the
+ * generic one, but the reply's byte 2 is a status and bytes 3..4 are a u16
+ * byte count, both read by the gated sender (0xfffffff00959f20c, called from
+ * the 17 request builders through 0x59f0c4):
+ *
+ *   0x59ef60  the receive handler (0x59eea4) matches byte 1 against the
+ *             outstanding tag and stores the whole 64-bit reply into the
+ *             sender's message ("received message for invalid tag %u opcode
+ *             %u" otherwise)
+ *   0x59f4bc  ldrb w22, [msg, 2]: nonzero is returned to the caller as the
+ *             IOReturn; zero means success
+ *   0x59f530  ldurh w8, [msg, 3]: the byte count, capped at 0x8000, that it
+ *             then copies out of the endpoint's OOL out-buffer (this+0xd0)
+ *             into the caller's buffer and stores through its out_len pointer
+ *             (0x59f568). With no out buffer a nonzero count is an error.
+ *
+ * Requests seen or read out of the builders (op = byte 2 of the message):
+ *
+ *   0x15  get one epoch slot: index in byte 6 (0x5a1c08), 8 bytes out,
+ *         REQUIRE out_len == 8 (0x5a1c44)
+ *   0x16  SEPEpoch::commitEpochs: 8 x u16 Epoch (16 bytes, 0x5a1d14) in the
+ *         OOL in-buffer, no out buffer (0x5a1d1c)
+ *   0x17  AppleSEPXART::getFullEpochs: 8 x 4-byte EpochSlot out. The block
+ *         (0x5a1e3c) sends the bare 0x170000, expects 8 << 2 = 32 bytes
+ *         (0x5a1e5c) and panics "REQUIRE fail: expected_out_len == out_len"
+ *         (0x5bfd30) on anything else -- the AppleSEPXART_embedded.cpp:1021
+ *         panic six lines after "Early boot complete". Consumers read only
+ *         byte 0 of each slot (DispatchGetEpochs, 0x595df4..0x595dfc).
+ *   0x11, 0x12, 0x18..0x1c and the blob save/fetch family (0x5a0a38..)
+ *         not yet modelled; acknowledged with status 0 and length 0.
+ *
+ * The epoch values are constants (zero) standing in for SEP state that this
+ * model does not have, chosen because nothing in the kext validates them.
  *
  * scrd (10), AppleSEPCredentialManager: its frame is not the generic one.
  * The receive handler (kext 0xfffffff00952a808) requires byte 0 == 10, takes
@@ -274,6 +305,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
 #define DISC_ADVERTISE  0
 #define DISC_OOL        1
+
+// xART requests (AppleSEPXART, see the header). Only the three whose reply
+// shape was read out of the kext are named; the rest are acknowledged blind.
+#define XART_GET_EPOCH        0x15
+#define XART_COMMIT_EPOCHS    0x16
+#define XART_GET_FULL_EPOCHS  0x17
+#define XART_STATUS_OK        0
+#define XART_EPOCH_COUNT      8      // SEPEpoch::EPOCH_COUNT, cmp x2, 8 at 0x5a1db8
+#define XART_EPOCH_SLOT_SIZE  4      // lsl x20, x8, 2 at 0x5a1e5c
+#define XART_EPOCH_SIZE       2      // lsl x10, x10, 1 at 0x5a1d14
+#define XART_GET_EPOCH_LEN    8      // stp x8(8), xzr at 0x5a1c14
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -699,25 +741,13 @@ static void sep_handle_l4info(DarwinSEPState *s, uint64_t m) {
             s->role, s->shm_dva, s->shm_size);
 }
 
-static void sep_handle_xart(DarwinSEPState *s, uint64_t m) {
-    // Every xART request gets the generic ack (op 0) it waits for. What the
-    // request meant is logged so a future pass can give real answers.
-    fprintf(stderr, "sep(%s): xART ep %u op %u param %u data 0x%08x: acknowledged without action\n",
-            s->role, frame_ep(m), frame_op(m), frame_param(m), frame_data(m));
-    sep_send(s, frame_ep(m), frame_tag(m), 0, 0, 0);
-}
-
 /*
- * Under DARWIN_SEP_DEBUG, show the request body an unhandled endpoint left in
- * its OOL in-buffer, so the next protocol can be worked out from a live boot
- * rather than guessed. The byte count comes from the frame: AppleSEPKeyStore
- * puts the IPC message size in the top 16 bits of `data`, ACM puts the body
- * length in the 16 bits at [31:16]; both are tried, capped at 256 bytes.
+ * Show `n` bytes of an endpoint's OOL in-buffer, so the next protocol can be
+ * worked out from a live boot rather than guessed. Capped at 256 bytes and at
+ * the buffer size the AP declared.
  */
-static void sep_dump_ool_in(DarwinSEPState *s, uint8_t ep, uint64_t m) {
+static void sep_dump_ool_in_len(DarwinSEPState *s, uint8_t ep, uint32_t n) {
     SEPEndpointState *e = &s->ep[ep];
-    uint32_t n = frame_data(m) >> 16;
-    if (!n) n = (m >> 16) & 0xffff;
     if (!n || !e->ool_in_addr) return;
     if (n > 256) n = 256;
     if (n > e->ool_in_size && e->ool_in_size) n = e->ool_in_size;
@@ -729,6 +759,88 @@ static void sep_dump_ool_in(DarwinSEPState *s, uint8_t ep, uint64_t m) {
         fprintf(stderr, " %02x", buf[i]);
     }
     fprintf(stderr, "\n");
+}
+
+/*
+ * Under DARWIN_SEP_DEBUG, show the request body an unhandled endpoint left in
+ * its OOL in-buffer. The byte count comes from the frame: AppleSEPKeyStore
+ * puts the IPC message size in the top 16 bits of `data`, ACM puts the body
+ * length in the 16 bits at [31:16]; both are tried.
+ */
+static void sep_dump_ool_in(DarwinSEPState *s, uint8_t ep, uint64_t m) {
+    uint32_t n = frame_data(m) >> 16;
+    if (!n) n = (m >> 16) & 0xffff;
+    sep_dump_ool_in_len(s, ep, n);
+}
+
+/*
+ * The xART reply: { ep, tag, u8 status, u16 byte count } -- byte 2 is what
+ * the gated sender returns as its IOReturn (ldrb w22, [msg, 2] at
+ * 0xfffffff00959f4bc) and bytes 3..4 are how many bytes it copies out of the
+ * OOL out-buffer (ldurh w8, [msg, 3] at 0x59f530). In our frame helper those
+ * are op, param and the low byte of data.
+ */
+static void sep_xart_reply(DarwinSEPState *s, uint64_t req, uint8_t status, uint16_t len) {
+    sep_send(s, frame_ep(req), frame_tag(req), status, len & 0xff, len >> 8);
+}
+
+// Put `len` bytes into the endpoint's OOL out-buffer and answer with that
+// count. Falls back to an empty success if the buffer cannot be reached, which
+// is logged because the AP will then REQUIRE-panic on the length mismatch.
+static void sep_xart_reply_data(DarwinSEPState *s, uint64_t req, const void *buf, uint16_t len) {
+    SEPEndpointState *e = &s->ep[frame_ep(req)];
+    if (!e->ool_out_addr || len > e->ool_out_size ||
+        !sep_dma(s, e->ool_out_addr, (void *)buf, len, true)) {
+        fprintf(stderr, "sep(%s): xART ep %u op 0x%02x: cannot write %u bytes to OOL out "
+                "(dva 0x%" PRIx64 " size 0x%x); answering empty\n", s->role, frame_ep(req),
+                frame_op(req), len, e->ool_out_addr, e->ool_out_size);
+        len = 0;
+    }
+    sep_xart_reply(s, req, XART_STATUS_OK, len);
+}
+
+static void sep_handle_xart(DarwinSEPState *s, uint64_t m) {
+    uint8_t ep = frame_ep(m), op = frame_op(m);
+
+    switch (op) {
+    case XART_GET_FULL_EPOCHS: {
+        // 8 x EpochSlot { u8 epoch; u8 pad[3]; }, all zero: a constant standing
+        // in for SEP state, accepted because no consumer validates the values
+        // (header). The length is what matters -- anything but 32 panics.
+        uint8_t slots[XART_EPOCH_COUNT * XART_EPOCH_SLOT_SIZE] = { 0 };
+        fprintf(stderr, "sep(%s): xART ep %u getFullEpochs: %u zero slots, %zu bytes\n",
+                s->role, ep, XART_EPOCH_COUNT, sizeof(slots));
+        sep_xart_reply_data(s, m, slots, sizeof(slots));
+        return;
+    }
+    case XART_GET_EPOCH: {
+        // One slot, 8 bytes, same zero constant. The slot index is byte 6 of
+        // the request (sturb at 0x5a1c0c writes [this+0x30] there).
+        uint8_t slot[XART_GET_EPOCH_LEN] = { 0 };
+        fprintf(stderr, "sep(%s): xART ep %u getEpoch(index %u): zero slot, %zu bytes\n",
+                s->role, ep, (unsigned)((m >> 48) & 0xff), sizeof(slot));
+        sep_xart_reply_data(s, m, slot, sizeof(slot));
+        return;
+    }
+    case XART_COMMIT_EPOCHS:
+        // 8 x u16 Epoch in the OOL in-buffer, nothing expected back. Not
+        // stored: the model has no epoch state to update. Logged so the values
+        // the AP commits are on record for whoever models it.
+        fprintf(stderr, "sep(%s): xART ep %u commitEpochs: %u x u16 accepted, not stored\n",
+                s->role, ep, XART_EPOCH_COUNT);
+        sep_dump_ool_in_len(s, ep, XART_EPOCH_COUNT * XART_EPOCH_SIZE);
+        sep_xart_reply(s, m, XART_STATUS_OK, 0);
+        return;
+    default:
+        // Status 0 with an empty payload. Enough for requests without an out
+        // buffer; one that expects data will REQUIRE-panic on the length,
+        // naming the next opcode to model. That is the honest failure mode.
+        fprintf(stderr, "sep(%s): xART ep %u op 0x%02x param %u data 0x%08x: "
+                "acknowledged without action\n",
+                s->role, ep, op, frame_param(m), frame_data(m));
+        sep_xart_reply(s, m, XART_STATUS_OK, 0);
+        return;
+    }
 }
 
 static void sep_receive(DarwinSEPState *s, uint64_t m) {
