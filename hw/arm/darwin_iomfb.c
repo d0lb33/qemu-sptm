@@ -85,14 +85,67 @@
  *    (0xa0ced2c-38) -- it is reply-only, which is a second confirmation that
  *    this is the completion shape.
  *
+ * -------------------------------------------- 5. the callee direction (D) --
+ *
+ * The same class-2 layer runs the other way: the firmware originates a
+ * request and the AP answers it. That is the "D-series", and it is how the
+ * DCP drives display bring-up past the point our AP-only model reaches.
+ * Derived in full in docs/re/iomfb-dseries.md; the parts the code below
+ * depends on:
+ *
+ *  - Correlation. link_handle_message builds a key (ack << 32) | tag from
+ *    every class-2 message (0xa0cfc44-0xa0cfc4c) and hands it to the lambda
+ *    at 0xa0d0318, which picks one of TWO four-entry slot arrays --
+ *    chan+0x78 when the ack bit equals chan[0x70], chan+0x218 when it does
+ *    not (0xa0d0328-0xa0d0334) -- and indexes it by the tag, which must be
+ *    < 4 (0xa0d033c, else a REQUIRE-fail). So the "6-bit tag" is really a
+ *    2-bit slot index per direction.
+ *
+ *  - Which ack bit. link_state_init stores zero to chan[0x70]
+ *    (`str wzr, [x19, #0x260]` at 0xa0cf5e8, and chan == L+0x1f0), and
+ *    link_send_message sources bit 8 from that same byte when no ctx is
+ *    passed -- which is exactly why the AP's own announce and its own RPC
+ *    requests have bit 8 clear. An inbound request must therefore set
+ *    **bit 8**, or it lands in the AP's own outgoing slot array.
+ *
+ *  - Where the bytes go. link_state_init allocates one 0x80000 heap
+ *    (0xa0cf5cc) and carves it into eight fixed 32 KB windows
+ *    (0xa0cf654-0xa0cf6e0). The AP's own request for tag t is at
+ *    heap + t*0x8000 + offset (slot+8); an inbound request for tag t is at
+ *    heap + 0x40000 + t*0x8000 + offset (slot+0x18), which is the pointer
+ *    rpc_callee_gated actually dereferences (0xa0cf0d0). The offset field is
+ *    relative to that window, not to the heap.
+ *
+ *  - What the AP checks (rpc_callee_gated, fcn.fffffff00a0cf020): class 2,
+ *    subkind != 1, size >= 0xc, size == 0xc + in_len + out_len, and the
+ *    whole thing inside the 32 KB window. Then it calls
+ *      handler(chan, slot, in, in_len, out, out_len)      @ 0xa0cf1e8-1fc
+ *    found by a virtual link_rpc_lookup at vtable+0x540 of chan[0x68].
+ *
+ *  - The completion it sends back (0xa0cf298-0xa0cf2b4):
+ *      msg = (our_header & 0xff3e) | 0x40 | (our bits[63:48] << 48)
+ *    i.e. class 2 subkind 1, our tag and our ack bit, and **status 0 in
+ *    bits[47:16]** on success. The output it wrote is at
+ *    window + offset + 0xc + in_len.
+ *
  * ------------------------------------------------------- what is stubbed --
  *
- * The RPC methods themselves. We log every FourCC and hexdump its input, and
- * answer with status 0 and a zeroed output buffer. That is a deliberate,
- * documented hole: no method's semantics have been derived from this
- * firmware, so returning "success, all zeroes" is the only answer that does
- * not invent behaviour. Where it is wrong the AP will say so by name, which
- * is how the next method gets modelled.
+ * The RPC methods themselves, in both directions.
+ *
+ * Inbound (A-series): we log every FourCC and hexdump its input, and answer
+ * with status 0 and a zeroed output buffer. That is a deliberate, documented
+ * hole: no method's semantics have been derived from this firmware, so
+ * returning "success, all zeroes" is the only answer that does not invent
+ * behaviour. Where it is wrong the AP will say so by name, which is how the
+ * next method gets modelled.
+ *
+ * Outbound (D-series): the transport is modelled, the *policy* is not. This
+ * file has no opinion about which callback a real DCP would send, or when.
+ * DARWIN_DCP_IOMFB_CB is an experiment harness that issues a scripted list so
+ * a boot can answer "does the AP accept this name, and what does it do next";
+ * with the variable unset nothing is ever sent. docs/re/iomfb-dseries.md has
+ * the 139 names link_rpc_lookup accepts and the buffer sizes each handler
+ * demands, which is what a script is written from.
  *
  * Class 3 is never sent by either side here and is not modelled. Class 2 /
  * subkind 0 messages with a heap we have not been told about are logged and
@@ -103,7 +156,9 @@
  * request and reply body; DARWIN_DCP_IOMFB_OUT='A401=01,...' substitutes
  * canned output bytes for one FourCC so a probe can test a hypothesis
  * without a rebuild. Level 4 is that same mechanism with the answers a
- * measurement has already justified (see iomfb_level4[]). Every line is
+ * measurement has already justified (see iomfb_level4[]).
+ * DARWIN_DCP_IOMFB_CB='D000,D003:00000000:14' scripts outbound callbacks and
+ * DARWIN_DCP_IOMFB_CB_AFTER names what starts the script. Every line is
  * prefixed "iomfb:", which tools/probe.sh filters on.
  */
 
@@ -127,6 +182,23 @@
 /* class-2 payload split (0xa0ce65c-0xa0ce688) */
 #define IOMFB_RPC_OFF(m)  ((uint32_t)(((m) >> 16) & 0xffff))
 #define IOMFB_RPC_SIZE(m) ((uint32_t)(((m) >> 32) & 0xffff))
+
+/*
+ * Shared-heap geometry, all read out of link_state_init (fcn.fffffff00a0cf5b8)
+ * rather than assumed. See section 5 of the header comment.
+ *
+ *   0x00000 + t*0x8000   AP's own request window for tag t   (slot+0x08)
+ *   0x20000 + t*0x8000   inbound slot's TX window            (slot+0x08)
+ *   0x40000 + t*0x8000   inbound request window for tag t    (slot+0x18)
+ *   0x60000 + t*0x8000   AP's own slot RX window             (slot+0x18)
+ *
+ * IOMFB_TAGS is 4 because the slot lookup REQUIREs tag < 4 (0xa0d033c);
+ * a fifth outstanding call in one direction is a guest panic, not a wrap.
+ */
+#define IOMFB_TAGS        4
+#define IOMFB_WINDOW      0x8000u       /* mov w14, #0x8000 @ 0xa0cf650 */
+#define IOMFB_AP_REQ_BASE 0x00000u      /* str x16,[x17,#8]  @ 0xa0cf664 */
+#define IOMFB_CB_REQ_BASE 0x40000u      /* str x15,[x17,#0x18] @ 0xa0cf6cc */
 
 /*
  * crc32(0, {0xd3,0,0,0}, 4). See step 2 above: the AP recomputes this from
@@ -171,7 +243,34 @@ struct DarwinIOMFB {
      * and none of them is a default.
      */
     GHashTable *out_override;   /* char* FourCC -> GByteArray* */
+
+    /*
+     * The outbound (D-series) experiment harness, DARWIN_DCP_IOMFB_CB. See
+     * section 5 of the header comment for the transport and
+     * docs/re/iomfb-dseries.md for the 139 names the AP will accept.
+     *
+     * cb_script is a list of IOMFBCallback in the order they are issued; one
+     * is outstanding at a time (cb_busy), because the AP correlates purely by
+     * (ack, tag) and we only ever use tag 0, so a second in flight would be
+     * indistinguishable from the first. cb_after names the inbound RPC whose
+     * completion starts the script, or is empty to start right after the
+     * class-1 init ack.
+     */
+    GArray *cb_script;
+    unsigned cb_next;
+    bool cb_busy;
+    bool cb_started;
+    char *cb_after;
+    uint64_t cb_sent;
 };
+
+/* One scripted outbound callback. */
+typedef struct {
+    char name[5];
+    uint32_t name_be;       /* the u32 as it goes into the heap */
+    GByteArray *in;         /* input bytes, verbatim */
+    uint32_t out_len;
+} IOMFBCallback;
 
 /* ------------------------------------------------------------------ DMA -- */
 
@@ -326,6 +425,194 @@ static void iomfb_send(DarwinIOMFB *m, uint8_t ep, uint64_t msg, const char *wha
     darwin_asc_send(m->asc, ep, msg);
 }
 
+/* ------------------------------------------------- outbound callbacks (D) -- */
+
+/*
+ * Issue one D-series callback: build the request in the inbound window and
+ * send the class-2 / subkind-0 message that points at it.
+ *
+ * Every field here has a source in section 5 of the header comment:
+ *
+ *   window   heap + 0x40000 + tag*0x8000        link_state_init 0xa0cf6cc
+ *   layout   u32 name, u32 in_len, u32 out_len, in[], out[]
+ *                                               rpc_callee_gated 0xa0cf0d8-0xa0cf100
+ *   size     0xc + in_len + out_len, and the AP rejects anything else
+ *                                               0xa0cf0dc-0xa0cf0fc
+ *   header   class 2, subkind 0, bit 8 SET      0xa0d0328-0xa0d0334, 0xa0cf5e8
+ *   payload  bits[31:16] offset, bits[47:32] size
+ *                                               rpc_caller_gated 0xa0ce65c-0xa0ce688
+ *
+ * Bit 9 is left clear. The AP sets it in its own requests and
+ * rpc_callee_gated echoes it back untouched (its reply mask 0xff3e preserves
+ * it) but never tests it, so there is nothing to model; a logged no-op by
+ * omission rather than a guessed value.
+ *
+ * The offset within the window is always 0: we have exactly one call
+ * outstanding, so there is nothing to pack around.
+ */
+static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback *cb)
+{
+    const unsigned tag = 0;
+    uint32_t in_len = cb->in ? cb->in->len : 0;
+    uint32_t size = (uint32_t)sizeof(IOMFBRpcHdr) + in_len + cb->out_len;
+
+    if (!m->heap_known) {
+        fprintf(stderr, "iomfb: cannot send callback '%s': the AP has not "
+                "announced its heap yet\n", cb->name);
+        return false;
+    }
+    if (size > IOMFB_WINDOW) {
+        fprintf(stderr, "iomfb: callback '%s' needs 0x%x bytes but a window is "
+                "only 0x%x; not sent\n", cb->name, size, IOMFB_WINDOW);
+        return false;
+    }
+
+    uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE + (uint64_t)tag * IOMFB_WINDOW;
+    g_autofree uint8_t *buf = g_malloc0(size);
+    IOMFBRpcHdr h = { .name = cb->name_be, .in_len = in_len,
+                      .out_len = cb->out_len };
+    memcpy(buf, &h, sizeof(h));
+    if (in_len) {
+        memcpy(buf + sizeof(h), cb->in->data, in_len);
+    }
+    if (!iomfb_dma(m, dva, buf, size, true)) {
+        fprintf(stderr, "iomfb: callback '%s': could not write the request at "
+                "dva 0x%" PRIx64 "\n", cb->name, dva);
+        return false;
+    }
+
+    m->cb_sent++;
+    fprintf(stderr, "iomfb: ep 0x%02x callback #%" PRIu64 " '%s' (0x%08x) in %u "
+            "out %u -> heap+0x%x (tag %u) size 0x%x\n",
+            ep, m->cb_sent, cb->name, cb->name_be, in_len, cb->out_len,
+            IOMFB_CB_REQ_BASE + tag * IOMFB_WINDOW, tag, size);
+    if (m->debug && in_len) {
+        iomfb_hexdump("cb in", buf + sizeof(h), in_len);
+    }
+
+    uint64_t msg = 0x02ULL                       /* class 2, subkind 0      */
+                 | (1ULL << 8)                   /* ack bit -- see above    */
+                 | ((uint64_t)tag << 10)
+                 | (0ULL << 16)                  /* offset within the window */
+                 | ((uint64_t)size << 32);
+    char what[96];
+    snprintf(what, sizeof(what), "class-2 callback '%s'", cb->name);
+    iomfb_send(m, ep, msg, what);
+    m->cb_busy = true;
+    return true;
+}
+
+/* Send the next scripted callback, if any and if none is outstanding. */
+static void iomfb_callback_pump(DarwinIOMFB *m, uint8_t ep)
+{
+    while (!m->cb_busy && m->cb_script && m->cb_next < m->cb_script->len) {
+        const IOMFBCallback *cb =
+            &g_array_index(m->cb_script, IOMFBCallback, m->cb_next++);
+        if (iomfb_callback_send(m, ep, cb)) {
+            return;                     /* wait for the completion */
+        }
+        /* Could not send it at all: move on rather than stalling the script. */
+    }
+}
+
+/*
+ * The AP's completion for a callback we sent. Class 2 / subkind 1, carrying
+ * our tag and our ack bit (rpc_callee_gated passes the slot as ctx, so
+ * link_send_message re-derives both from slot[0]/slot[4], 0xa0cf2b0), with
+ * the status in bits[47:16] -- zero on success.
+ */
+static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
+{
+    const unsigned tag = 0;
+    uint32_t status = (uint32_t)(msg >> 16);
+    const IOMFBCallback *cb =
+        &g_array_index(m->cb_script, IOMFBCallback, m->cb_next - 1);
+    uint32_t in_len = cb->in ? cb->in->len : 0;
+
+    m->cb_busy = false;
+
+    if (!cb->out_len) {
+        fprintf(stderr, "iomfb:   callback '%s' completed, status 0x%x, no output\n",
+                cb->name, status);
+    } else {
+        uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE
+                     + (uint64_t)tag * IOMFB_WINDOW
+                     + sizeof(IOMFBRpcHdr) + in_len;
+        g_autofree uint8_t *out = g_malloc0(cb->out_len);
+        if (!iomfb_dma(m, dva, out, cb->out_len, false)) {
+            fprintf(stderr, "iomfb:   callback '%s' completed, status 0x%x, but "
+                    "its output at dva 0x%" PRIx64 " could not be read\n",
+                    cb->name, status, dva);
+        } else {
+            g_autoptr(GString) hex = g_string_new(NULL);
+            for (uint32_t i = 0; i < cb->out_len && i < 32; i++) {
+                g_string_append_printf(hex, "%02x", out[i]);
+            }
+            fprintf(stderr, "iomfb:   callback '%s' completed, status 0x%x, "
+                    "out: %s%s\n", cb->name, status, hex->str,
+                    cb->out_len > 32 ? "..." : "");
+        }
+    }
+
+    iomfb_callback_pump(m, ep);
+}
+
+/*
+ * Parse DARWIN_DCP_IOMFB_CB. Comma or space separated NAME[:INHEX[:OUTLEN]],
+ * eg. "D000::4,D003:00000000:14". OUTLEN is C-style (0x for hex). A name is
+ * exactly four characters; nothing else is validated here, because the point
+ * of the harness is to be able to send something the AP will reject and read
+ * what it says.
+ */
+static void iomfb_parse_callbacks(DarwinIOMFB *m, const char *spec)
+{
+    g_auto(GStrv) items = g_strsplit_set(spec, ", ", -1);
+
+    m->cb_script = g_array_new(FALSE, TRUE, sizeof(IOMFBCallback));
+    for (char **it = items; it && *it; it++) {
+        if (!**it) continue;
+        g_auto(GStrv) f = g_strsplit(*it, ":", 3);
+        if (!f[0] || strlen(f[0]) != 4) {
+            fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_CB: \"%s\" is not a 4-char "
+                    "name; skipped\n", *it);
+            continue;
+        }
+        IOMFBCallback cb = { 0 };
+        memcpy(cb.name, f[0], 4);
+        /* The heap holds the u32 whose big-endian bytes spell the name --
+         * that is how rpc_callee_gated unpacks it at 0xa0cf108-0xa0cf120. */
+        cb.name_be = ((uint32_t)(uint8_t)f[0][0] << 24)
+                   | ((uint32_t)(uint8_t)f[0][1] << 16)
+                   | ((uint32_t)(uint8_t)f[0][2] << 8)
+                   |  (uint32_t)(uint8_t)f[0][3];
+        if (f[1] && *f[1]) {
+            if (strlen(f[1]) & 1) {
+                fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_CB: odd hex digit count "
+                        "for %s; skipped\n", cb.name);
+                continue;
+            }
+            cb.in = g_byte_array_new();
+            for (const char *q = f[1]; *q; q += 2) {
+                char pair[3] = { q[0], q[1], 0 };
+                char *end = NULL;
+                uint8_t b = (uint8_t)strtoul(pair, &end, 16);
+                if (end != pair + 2) {
+                    fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_CB: bad hex for %s\n",
+                            cb.name);
+                    break;
+                }
+                g_byte_array_append(cb.in, &b, 1);
+            }
+        }
+        if (f[1] && f[2] && *f[2]) {
+            cb.out_len = (uint32_t)strtoul(f[2], NULL, 0);
+        }
+        g_array_append_val(m->cb_script, cb);
+        fprintf(stderr, "iomfb: PROBE callback scripted: '%s' in %u out %u\n",
+                cb.name, cb.in ? cb.in->len : 0, cb.out_len);
+    }
+}
+
 /* --------------------------------------------------------------- class 0 -- */
 
 /*
@@ -361,6 +648,18 @@ static void iomfb_class0(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
      */
     uint64_t ack = ((uint64_t)IOMFB_FW_HASH << 16) | 0x0001ULL;
     iomfb_send(m, ep, ack, "class-1 init ack, firmware hash");
+
+    /*
+     * DARWIN_DCP_IOMFB_CB_AFTER='' (or 'ack') starts the callback script here,
+     * as soon as the link is up. The default waits for a named inbound RPC
+     * instead -- see iomfb_class2 -- because the AP has work of its own to
+     * finish first and a callback that lands mid-start() tells us less.
+     */
+    if (m->cb_script && (!m->cb_after || !*m->cb_after ||
+                         !strcmp(m->cb_after, "ack"))) {
+        m->cb_started = true;
+        iomfb_callback_pump(m, ep);
+    }
 }
 
 /* --------------------------------------------------------------- class 2 -- */
@@ -378,11 +677,24 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     unsigned subkind = IOMFB_SUBKIND(msg);
     uint32_t off = IOMFB_RPC_OFF(msg), size = IOMFB_RPC_SIZE(msg);
 
-    if (subkind != 0) {
+    if (subkind == 1) {
         /*
-         * Subkind 1 is the completion *we* send; the AP does not send it to
-         * us. Anything else here is unexplored.
+         * A completion for a callback we sent. rpc_callee_gated builds it as
+         * (our header & 0xff3e) | 0x40 with our tag and ack bit, so the only
+         * thing that identifies it is that we have one outstanding.
          */
+        if (m->cb_busy) {
+            fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 (callback "
+                    "completion) tag %u ack %u status 0x%x\n",
+                    ep, IOMFB_TAG(msg), IOMFB_ACK(msg), (uint32_t)(msg >> 16));
+            iomfb_callback_done(m, ep, msg);
+        } else {
+            fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 from the AP with "
+                    "no callback outstanding -- not modelled, ignored\n", ep);
+        }
+        return;
+    }
+    if (subkind != 0) {
         fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind %u from the AP -- not modelled, "
                 "ignored\n", ep, subkind);
         return;
@@ -398,10 +710,21 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
         return;
     }
 
+    /*
+     * The offset is relative to *this tag's* 32 KB window, not to the heap:
+     * rpc_caller_gated reads and writes at slot[8] + offset (0xa0ce608), and
+     * link_state_init set slot[8] = heap + tag*0x8000 for the AP's own four
+     * slots (0xa0cf664). Identical to the old `heap + off` for tag 0, which
+     * is the only tag the AP has used so far -- but it would have read the
+     * wrong 32 KB the first time it used tag 1.
+     */
+    unsigned tag = IOMFB_TAG(msg);
+    uint64_t win = m->heap_dva + IOMFB_AP_REQ_BASE
+                 + (uint64_t)(tag % IOMFB_TAGS) * IOMFB_WINDOW;
     g_autofree uint8_t *buf = g_malloc0(size);
-    if (!iomfb_dma(m, m->heap_dva + off, buf, size, false)) {
+    if (!iomfb_dma(m, win + off, buf, size, false)) {
         fprintf(stderr, "iomfb: ep 0x%02x could not read the RPC at dva 0x%" PRIx64
-                "+0x%x\n", ep, m->heap_dva, off);
+                "+0x%x\n", ep, win, off);
         return;
     }
 
@@ -461,7 +784,7 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             memcpy(out, ov->data, MIN(ov->len, h.out_len));
             how = "PROBE override";
         }
-        uint64_t out_dva = m->heap_dva + off + sizeof(h) + h.in_len;
+        uint64_t out_dva = win + off + sizeof(h) + h.in_len;
         if (!iomfb_dma(m, out_dva, out, h.out_len, true)) {
             fprintf(stderr, "iomfb:   could not write the %u-byte output region at dva "
                     "0x%" PRIx64 "\n", h.out_len, out_dva);
@@ -482,6 +805,21 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     char what[96];
     snprintf(what, sizeof(what), "class-2 completion for '%s', status 0, out %s", name, how);
     iomfb_send(m, ep, reply, what);
+
+    /*
+     * Start the outbound experiment script once the AP has asked for the
+     * thing DARWIN_DCP_IOMFB_CB_AFTER names (default 'A353', the last RPC of
+     * the boot before the AP goes quiet). Answering that one first means the
+     * callbacks land at the point real firmware would have the link to
+     * itself, rather than in the middle of IOMobileFramebufferAP::start().
+     */
+    if (m->cb_script && !m->cb_started && m->cb_after && *m->cb_after &&
+        !strcmp(name, m->cb_after)) {
+        m->cb_started = true;
+        fprintf(stderr, "iomfb: '%s' answered; starting the %u-entry callback "
+                "script\n", name, m->cb_script->len);
+        iomfb_callback_pump(m, ep);
+    }
 }
 
 /* ------------------------------------------------------------- dispatch -- */
@@ -550,6 +888,24 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     const char *ov = getenv("DARWIN_DCP_IOMFB_OUT");
     if (ov && *ov) {
         iomfb_parse_overrides(m, ov);
+    }
+
+    /*
+     * The outbound callback script. Unset means nothing is ever sent in that
+     * direction, which is the default at every level: the transport is
+     * modelled, the policy is not. A353 is the default trigger because it is
+     * the last RPC the AP issues before going quiet (docs/re/iomfb-link.md,
+     * addendum 2, run M4/L4).
+     */
+    const char *cbs = getenv("DARWIN_DCP_IOMFB_CB");
+    if (cbs && *cbs) {
+        const char *after = getenv("DARWIN_DCP_IOMFB_CB_AFTER");
+        m->cb_after = g_strdup(after ? after : "A353");
+        iomfb_parse_callbacks(m, cbs);
+        fprintf(stderr, "iomfb: PROBE callback script has %u entr%s, starting "
+                "after %s\n", m->cb_script->len,
+                m->cb_script->len == 1 ? "y" : "ies",
+                *m->cb_after ? m->cb_after : "the class-1 init ack");
     }
 
     fprintf(stderr, "darwin-iomfb: link on ep 0x37, level %u (%s), dart %s sid %u\n",
