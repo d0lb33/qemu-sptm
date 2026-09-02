@@ -58,6 +58,7 @@
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_dcp.h"
 #include "xnu/darwin_epic.h"
+#include "xnu/darwin_iomfb.h"
 
 /*
  * One announceable EPIC service. `epic_name` is the match key; `provider` is
@@ -94,6 +95,13 @@ static const DCPService dcp_services[] = {
 typedef struct DarwinDCP {
     DeviceState *asc;
     DarwinAFK *afk;
+    /*
+     * The IOMFB "link" protocol on endpoint 0x37, or NULL when 0x37 is not
+     * advertised. It is a different framing from AFK and lives in
+     * darwin_iomfb.c; see the DARWIN_DCP_IOMFB note below dcp_eps_adv.
+     */
+    DarwinIOMFB *iomfb;
+    unsigned iomfb_level;
     uint64_t msgs;
 
     /* announce policy, resolved once at create time */
@@ -119,19 +127,29 @@ static const uint8_t dcp_eps[] = {
 
 /*
  * The advertised set, built at create time. dcp_eps above is the AFK block;
- * DARWIN_DCP_IOMFB=1 appends 0x37.
+ * a non-zero DARWIN_DCP_IOMFB appends 0x37.
  *
  * 0x37 is DCPEndpoint24 / AppleDCPLinkServiceSoC -- IOMFB, the endpoint the
- * *framebuffer* actually rides on. It speaks a different RPC framing directly
- * on RTKit, not AFK, and we model none of it, which is why it is off by
- * default: advertising an endpoint we cannot answer moves the stall somewhere
- * harder to read.
+ * *framebuffer* actually rides on. It speaks a different framing directly on
+ * RTKit, not AFK; darwin_iomfb.c models it. Off by default so the known-good
+ * `-enable dcp` boot (shell reached, 0 panics, 11/11 AFK endpoints) cannot
+ * regress on it.
  *
- * Turning it on is deliberately a question rather than a feature. Every AFK
- * message the AP sends on it lands in dcp_handle()'s "no protocol modelled"
- * log, which is exactly how the AFK framing itself was first derived -- the
- * unhandled-opcode line is what revealed that iOS 27's AP uses 0x85 for the
- * opposite direction to ours. Same method, new endpoint.
+ * The value is a level, passed straight to darwin_iomfb_new():
+ *
+ *   DARWIN_DCP_IOMFB=1   advertise 0x37, decode and log, answer nothing.
+ *                        Merely advertising it is what starts the whole
+ *                        framebuffer stack: AppleDCPLinkService matches,
+ *                        "IOMFB: AP DRIVER START!", IOMobileFramebufferAP
+ *                        ::start on disp0.
+ *   DARWIN_DCP_IOMFB=2   + the class-0/class-1 link handshake, and decode the
+ *                        class-2 RPC requests that follow without answering.
+ *   DARWIN_DCP_IOMFB=3   + answer those RPCs (status 0, zeroed output).
+ *   DARWIN_DCP_IOMFB=4   + the canned per-method answers a measurement has
+ *                        justified. This is the level at which AppleCLCD2
+ *                        binds, starts *and* registers on the disp0 nub.
+ *   DARWIN_DCP_IOMFB_DEBUG=1        hexdump every RPC body.
+ *   DARWIN_DCP_IOMFB_OUT='A401=01'  override one method's output bytes.
  */
 static uint8_t dcp_eps_adv[ARRAY_SIZE(dcp_eps) + 1];
 static unsigned dcp_eps_adv_n;
@@ -153,88 +171,13 @@ static bool dcp_handle(void *opaque, uint8_t ep, uint64_t msg) {
     if (d->afk && darwin_afk_owns_endpoint(d->afk, ep)) {
         return darwin_afk_handle(d->afk, ep, msg);
     }
-    if (ep == 0x37) {
+    if (ep == 0x37 && d->iomfb) {
         /*
-         * IOMFB link (AppleDCPLinkServiceSoC). Field split derived in
-         * docs/re/iomfb-link.md from link_send_message (fcn.fffffff00a0cecd0)
-         * and link_handle_message (fcn.fffffff00a0cfac0): the *low 16 bits*
-         * are a structured header and bits[63:16] are a class-dependent
-         * 48-bit payload, masked off by a literal
-         * `and x8, x2, 0xffffffffffff0000` in the send path.
-         *
-         *   [1:0]   class
-         *   [7:6]   subkind
-         *   [8]     ack
-         *   [15:10] 6-bit RPC tag
-         *   [63:16] payload
-         *
-         * Note this replaces two earlier readings, both wrong: the AFK split
-         * (bits[63:48] as an opcode -- impossible, AFK opcodes are one byte)
-         * and the M1-era Linux dcpep split, under which this message appeared
-         * to carry a 16 MB length. The 48-bit mask is an explicit instruction
-         * operand rather than an inference from one sample, so it wins.
-         *
-         * The AP's opening message 0x0100000000000040 is therefore class 0,
-         * subkind 1, payload DVA 0x10000000000 -- a shared-heap address
-         * announce, in the same address space as the AFK rings.
+         * Endpoint 0x37 (AppleDCPLinkServiceSoC). Not AFK, not EPIC: the
+         * mailbox word itself is the message. Everything about that framing,
+         * and every kernelcache address it came from, is in darwin_iomfb.c.
          */
-        unsigned mclass = msg & 0x3, subkind = (msg >> 6) & 0x3;
-        unsigned ack = (msg >> 8) & 1, tag = (msg >> 10) & 0x3f;
-        uint64_t payload = msg >> 16;
-        fprintf(stderr, "dcp: IOMFB ep 0x37 msg 0x%016" PRIx64
-                " | class %u subkind %u ack %u tag %u payload 0x%" PRIx64 "\n",
-                msg, mclass, subkind, ack, tag, payload);
-
-        const char *probe = getenv("DARWIN_DCP_IOMFB");
-        if (probe && probe[0] == '2' && mclass == 0 && subkind == 1) {
-            /*
-             * Probe. Class 0 / subkind 1 is send-only -- link_handle_message
-             * takes that branch unconditionally -- and echoing it back panics
-             * the guest one message later with
-             *   "link_message_handler failed with 0xe00002bd"
-             *   @AppleDCPLinkService.cpp:882   (kIOReturnNoMemory)
-             * preceded by "link_init_ack_callback failed with 0x6". So the
-             * reply has to be a *class 1* message, the init-ack step:
-             * link_handle_message's class==1 path reaches fcn.fffffff00a0ce0f0,
-             * which itself sends 0x0004000000000001 back through
-             * link_send_message.
-             *
-             * Which payload belongs in bits[63:16] is the one thing static
-             * analysis did not settle -- a small constant, or the firmware's
-             * own heap DVA. This tries the constant first; if it fails, the
-             * DVA the AP just announced is the other candidate.
-             */
-            /*
-             * The firmware hash the AP checks is a *field of this same ack*,
-             * not a later message: link_handle_message's class-1 branch reads
-             * remote = (msg >> 16) & 0xffffffff -- bits [47:16], narrower than
-             * the 48-bit payload the class-0 announce uses -- at
-             * lsr x23, x28, 0x10 (0xfffffff00a0cfb9c) and compares it 32-bit
-             * at 0xa0cfba0.
-             *
-             * An earlier probe sent 0x0004000000000001, which put its 4 in
-             * bits [63:48] and left [47:16] zero, producing exactly
-             *   "Firmware hash checksum mismatched: local=0x15A5C96B,
-             *    remote=0x00000000" @AppleDCPLinkService.cpp:624
-             *
-             * local is crc32(0, G, 4) where G is four bytes of this kext's own
-             * __DATA at 0xfffffff00b880c70 (bootkc file offset 0x487cc70),
-             * which are d3 00 00 00 -- the OSSerialize binary signature. It is
-             * a pure function of a compile-time constant with no dependency on
-             * anything we send, so echoing it is legitimate rather than a
-             * forgery. Verified here: python3 -c "import zlib;
-             * print(hex(zlib.crc32(bytes([0xd3,0,0,0]))))" gives 0x15a5c96b,
-             * matching the panic's own local value.
-             *
-             * It is nonetheless specific to *this* kernelcache. If the guest
-             * build changes, recompute from those four bytes rather than
-             * trusting the constant.
-             */
-            uint64_t fw_hash = 0x15A5C96BULL;
-            uint64_t ack_msg = (fw_hash << 16) | 0x0001ULL;
-            fprintf(stderr, "dcp: IOMFB PROBE class-1 init-ack -> 0x%016" PRIx64 "\n", ack_msg);
-        }
-        return true;
+        return darwin_iomfb_handle(d->iomfb, ep, msg);
     }
 
     // Endpoints we advertise but do not speak (and the RTKit system
@@ -505,8 +448,10 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     const char *iomfb = getenv("DARWIN_DCP_IOMFB");
     if (iomfb && iomfb[0] && iomfb[0] != '0' && strcmp(iomfb, "off")) {
         dcp_eps_adv[dcp_eps_adv_n++] = 0x37;
-        fprintf(stderr, "dcp: advertising endpoint 0x37 (IOMFB link) -- no protocol modelled, "
-                        "every message will be logged and unanswered\n");
+        d->iomfb_level = (unsigned)strtoul(iomfb, NULL, 0);
+        if (!d->iomfb_level) d->iomfb_level = 1;   /* "on", "yes", ... */
+        fprintf(stderr, "dcp: advertising endpoint 0x37 (IOMFB link), level %u\n",
+                d->iomfb_level);
     }
     d->asc = darwin_asc_create(dcp, iobase, aic, dcp_eps_adv, dcp_eps_adv_n, &dcp_asc_ops, d);
 
@@ -537,6 +482,15 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
 
     d->afk = darwin_afk_new(d->asc, adt_get_prop_val(dcp, "role"), dart, sid,
                             NULL, &dcp_afk_ops, d);
+    /*
+     * The IOMFB link reaches the AP's RPC heap through the same DART and
+     * stream id as the AFK rings -- both are DMA by the same coprocessor, and
+     * the heap DVA the AP announces (0x10000000000) sits in the same IOVA
+     * space the ring allocations come out of.
+     */
+    if (d->iomfb_level) {
+        d->iomfb = darwin_iomfb_new(d->asc, dart, sid, d->iomfb_level);
+    }
     for (size_t i = 0; i < ARRAY_SIZE(dcp_eps); i++) {
         darwin_afk_add_endpoint(d->afk, dcp_eps[i]);
     }
