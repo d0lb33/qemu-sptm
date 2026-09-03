@@ -108,6 +108,17 @@
  *    requests have bit 8 clear. An inbound request must therefore set
  *    **bit 8**, or it lands in the AP's own outgoing slot array.
  *
+ *    That direction bit remains set for AP calls nested inside a D-series
+ *    handler.  The iOS 27 D120 handler at 0xfffffff00919b338 enters its boot
+ *    continuation at 0xfffffff009188040; that continuation's first nested
+ *    A389 wrapper is 0xfffffff00917f11c (FourCC build at 0x917f124), and its
+ *    live messages are class 2 / subkind 0 / ack 1.  This is also the stack
+ *    rule used by the independent Asahi implementations: Linux
+ *    drivers/gpu/drm/apple/iomfb.c:dcp_call_context() selects callback context
+ *    when channel depth is nonzero, and m1n1 fw/dcp/manager.py:DCPManager
+ *    selects CallContext.CB while in_callback.  Therefore ack 1 distinguishes
+ *    callback context, not "not an AP request".
+ *
  *  - Where the bytes go. link_state_init allocates one 0x80000 heap
  *    (0xa0cf5cc) and carves it into eight fixed 32 KB windows
  *    (0xa0cf654-0xa0cf6e0). The AP's own request for tag t is at
@@ -204,6 +215,7 @@
 #define IOMFB_TAGS        4
 #define IOMFB_WINDOW      0x8000u       /* mov w14, #0x8000 @ 0xa0cf650 */
 #define IOMFB_AP_REQ_BASE 0x00000u      /* str x16,[x17,#8]  @ 0xa0cf664 */
+#define IOMFB_CB_TX_BASE  0x20000u      /* str x13,[x17,#8]  @ 0xa0cf6a0 */
 #define IOMFB_CB_REQ_BASE 0x40000u      /* str x15,[x17,#0x18] @ 0xa0cf6cc */
 
 /* At most 64 sparse rows (1024 input bytes) are printed per unique request. */
@@ -281,7 +293,6 @@ struct DarwinIOMFB {
     bool cb_busy;
     bool cb_started;
     bool cb_flag9;          /* mirror the AP's own bit 9; see iomfb_callback_send */
-    bool cb_kick;           /* PROBE only; see the reflection branch in iomfb_class2 */
     char *cb_after;
     uint64_t cb_sent;
 };
@@ -802,14 +813,15 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
          * (our header & 0xff3e) | 0x40 with our tag and ack bit, so the only
          * thing that identifies it is that we have one outstanding.
          */
-        if (m->cb_busy) {
+        if (m->cb_busy && IOMFB_ACK(msg) == 1 && IOMFB_TAG(msg) == 0) {
             fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 (callback "
                     "completion) tag %u ack %u status 0x%x\n",
                     ep, IOMFB_TAG(msg), IOMFB_ACK(msg), (uint32_t)(msg >> 16));
             iomfb_callback_done(m, ep, msg);
         } else {
-            fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 from the AP with "
-                    "no callback outstanding -- not modelled, ignored\n", ep);
+            fprintf(stderr, "iomfb: ep 0x%02x unexpected class 2 subkind 1 "
+                    "(callback busy %u, tag %u, ack %u) -- ignored\n",
+                    ep, m->cb_busy, IOMFB_TAG(msg), IOMFB_ACK(msg));
         }
         return;
     }
@@ -820,67 +832,25 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     }
 
     /*
-     * An AP-originated request always has bit 8 CLEAR. link_send_message takes
-     * that bit from *(ctx+4) when a ctx is passed and from chan[0x70]
-     * otherwise (0xa0ced10); rpc_caller_gated always passes its own slot as
-     * ctx (0xa0ce690); and both chan[0x70] and the AP's own slots carry ack 0,
-     * because link_state_init zeroes chan[0x70] (`str wzr` @ 0xa0cf5e8) and
-     * the slot lookup only hands out the chan+0x78 array when
-     * ack == chan[0x70] (0xa0d0328-0xa0d0334). So ack 1 here cannot be a
-     * request from the AP.
+     * A normal AP call uses ack 0.  While the AP is handling our D-series
+     * callback, calls nested through rpc_caller_gated use the callback slot
+     * array and consequently carry ack 1.  D120 demonstrates this directly:
+     * its first nested request is A389 (wrapper 0xfffffff00917f11c), followed
+     * by nine more ack-1 calls before the callback completion.  The old model
+     * called these messages reflections and dumped IOMFB_CB_REQ_BASE, which
+     * could only read back the D120 request we wrote; it never inspected the
+     * AP request window and therefore supplied no evidence of a reflection.
      *
-     * What it is, measured: the AP emits TWO messages for every inbound
-     * request. First a reflection of our own header and offset/size fields,
-     * byte-identical to what we sent, and then rpc_callee_gated's real
-     * completion (subkind 1, status in bits[47:16]). The reflection is
-     * plausibly built by the `[slot+0x50]` vtable+0xf8 call at 0xa0cfcdc,
-     * which runs immediately after the receive path stores exactly those
-     * fields into the slot (0xa0cfccc-0xa0cfcd8) -- but that is where the
-     * evidence stops, so its PURPOSE is not modelled, only recognised and
-     * dropped. Treating it as a fresh request is actively harmful: it made
-     * us read whatever was stale in the AP's own window and answer that.
+     * Accept callback-context traffic only while our one tag-0 callback is
+     * outstanding.  This bounded gate preserves the normal ack-0 path and
+     * fails closed on an unsolicited or differently tagged ack-1 request.
      */
-    if (IOMFB_ACK(msg)) {
-        fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 0 with ack 1 -- the AP's "
-                "answer to our callback (offset 0x%x size 0x%x), not a request\n",
-                ep, off, size);
-        /*
-         * Read our own request window back. This is the only way to tell
-         * "the AP dispatched the handler and wrote an output" from "the AP
-         * acknowledged the message and dropped it": the handler's output is
-         * the one thing in that window we did not put there ourselves.
-         */
-        if (m->cb_busy && m->heap_known && size && size <= IOMFB_WINDOW) {
-            g_autofree uint8_t *win = g_malloc0(size);
-            uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE;
-            if (iomfb_dma(m, dva, win, size, false)) {
-                iomfb_hexdump("cb window after", win, size);
-            }
-        }
-
-        /*
-         * The "kick", DARWIN_DCP_IOMFB_CB_KICK=1. NOT DERIVED -- this exists
-         * only because a measurement handed it to us by accident.
-         *
-         * In probe CB2 the model mistook this acknowledgement for a fresh AP
-         * request and answered it with a class-2/subkind-1 completion. That
-         * bogus message is the only difference between CB2, where the AP ran
-         * the D000 handler and wrote 01 into our output window, and CB3-CB5,
-         * where it acknowledged and did nothing. The mechanism is plausible
-         * from the disassembly -- a subkind-1 message on an in-use slot takes
-         * link_handle_message to the lambda at 0xa0d03f8, which stores the
-         * word at slot+0x48 and then calls `[slot+0x58]` vtable+0x108, a wake
-         * (0xa0cfda0-0xa0cfdf8) -- but "this wake is what dispatches
-         * rpc_callee_gated" is a hypothesis under test, not a modelled fact.
-         * Hence a knob, off by default, rather than something the transport
-         * does on its own.
-         */
-        if (m->cb_busy && m->cb_kick) {
-            uint64_t kick = 0x42ULL
-                          | ((uint64_t)IOMFB_ACK(msg) << 8)
-                          | ((uint64_t)IOMFB_TAG(msg) << 10);
-            iomfb_send(m, ep, kick, "PROBE kick: class-2 subkind-1 on our own slot");
-        }
+    bool nested = IOMFB_ACK(msg) != 0;
+    unsigned tag = IOMFB_TAG(msg);
+    if (nested && (!m->cb_busy || tag != 0)) {
+        fprintf(stderr, "iomfb: ep 0x%02x unexpected ack-1 class-2 request "
+                "outside callback context (busy %u, tag %u) -- ignored\n",
+                ep, m->cb_busy, tag);
         return;
     }
 
@@ -889,23 +859,31 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
                 "announced a heap; cannot read it\n", ep, off, size);
         return;
     }
-    if (size < sizeof(IOMFBRpcHdr)) {
+    if (tag >= IOMFB_TAGS) {
+        fprintf(stderr, "iomfb: ep 0x%02x RPC tag %u exceeds the %u-slot "
+                "channel -- ignored\n", ep, tag, IOMFB_TAGS);
+        return;
+    }
+    if (size < sizeof(IOMFBRpcHdr) || off > IOMFB_WINDOW ||
+        size > IOMFB_WINDOW - off) {
         fprintf(stderr, "iomfb: ep 0x%02x RPC size 0x%x is smaller than the 0xc-byte "
-                "header; ignored\n", ep, size);
+                "header or outside its 0x%x-byte window at offset 0x%x; ignored\n",
+                ep, size, IOMFB_WINDOW, off);
         return;
     }
 
     /*
-     * The offset is relative to *this tag's* 32 KB window, not to the heap:
-     * rpc_caller_gated reads and writes at slot[8] + offset (0xa0ce608), and
-     * link_state_init set slot[8] = heap + tag*0x8000 for the AP's own four
-     * slots (0xa0cf664). Identical to the old `heap + off` for tag 0, which
-     * is the only tag the AP has used so far -- but it would have read the
-     * wrong 32 KB the first time it used tag 1.
+     * The offset is relative to *this tag's* 32 KB TX window, not to the
+     * heap: rpc_caller_gated reads and writes at slot[8] + offset
+     * (0xa0ce608). link_state_init assigns heap+0x00000 to the ack-0 array
+     * (0xa0cf664) and heap+0x20000 to the ack-1/callback array (0xa0cf6a0),
+     * each plus tag*0x8000. Our outbound D-series request lives in the
+     * separate ack-1 RX window at heap+0x40000 (0xa0cf6cc), which is why
+     * reading that old location returned D120 instead of nested A389.
      */
-    unsigned tag = IOMFB_TAG(msg);
-    uint64_t win = m->heap_dva + IOMFB_AP_REQ_BASE
-                 + (uint64_t)(tag % IOMFB_TAGS) * IOMFB_WINDOW;
+    uint32_t window_base = nested ? IOMFB_CB_TX_BASE : IOMFB_AP_REQ_BASE;
+    uint64_t win = m->heap_dva + window_base
+                 + (uint64_t)tag * IOMFB_WINDOW;
     g_autofree uint8_t *buf = g_malloc0(size);
     if (!iomfb_dma(m, win + off, buf, size, false)) {
         fprintf(stderr, "iomfb: ep 0x%02x could not read the RPC at dva 0x%" PRIx64
@@ -924,9 +902,11 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     }
 
     m->rpcs++;
-    fprintf(stderr, "iomfb: ep 0x%02x RPC #%" PRIu64 " '%s' (0x%08x) in %u out %u "
+    fprintf(stderr, "iomfb: ep 0x%02x %sRPC #%" PRIu64
+            " '%s' (0x%08x) in %u out %u "
             "at heap+0x%x size 0x%x tag %u ack %u flag9 %u\n",
-            ep, m->rpcs, name, h.name, h.in_len, h.out_len, off, size,
+            ep, nested ? "nested callback-context AP " : "", m->rpcs,
+            name, h.name, h.in_len, h.out_len, off, size,
             IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
 
     if (m->rpc_trace) {
@@ -938,8 +918,8 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
          */
         uint32_t input_available = size - sizeof(h);
         uint32_t input_len = MIN(h.in_len, input_available);
-        unsigned slot = tag % IOMFB_TAGS;
-        uint32_t window_off = IOMFB_AP_REQ_BASE + slot * IOMFB_WINDOW;
+        unsigned slot = tag;
+        uint32_t window_off = window_base + slot * IOMFB_WINDOW;
         uint64_t request_dva = win + off;
         uint64_t input_dva = request_dva + sizeof(h);
         uint64_t output_dva = input_dva + h.in_len;
@@ -966,9 +946,10 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
 
     /* The AP's own accounting: total = 0xc + in_len + out_len (0xa0ce4d8). */
     if ((uint64_t)sizeof(h) + h.in_len + h.out_len != size) {
-        fprintf(stderr, "iomfb:   note: 0xc + in + out = 0x%" PRIx64 " but the message says "
-                "0x%x; trusting the message\n",
+        fprintf(stderr, "iomfb:   malformed RPC: 0xc + in + out = 0x%" PRIx64
+                " but the message says 0x%x; ignored\n",
                 (uint64_t)sizeof(h) + h.in_len + h.out_len, size);
+        return;
     }
 
     if (m->debug) {
@@ -1131,9 +1112,7 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
         const char *after = getenv("DARWIN_DCP_IOMFB_CB_AFTER");
         const char *f9 = getenv("DARWIN_DCP_IOMFB_CB_FLAG9");
         m->cb_after = g_strdup(after ? after : "A353");
-        const char *kick = getenv("DARWIN_DCP_IOMFB_CB_KICK");
         m->cb_flag9 = !(f9 && f9[0] == '0');
-        m->cb_kick = kick && kick[0] && kick[0] != '0';
         iomfb_parse_callbacks(m, cbs);
         fprintf(stderr, "iomfb: PROBE callback script has %u entr%s, starting "
                 "after %s\n", m->cb_script->len,
