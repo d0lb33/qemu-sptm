@@ -403,6 +403,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_MIGRATE_REQUEST_SCALAR     0
 #define SKS_MIGRATE_RESPONSE_CLASS     SKS_MIGRATE_TARGET_CLASS
 
+/* fs_check_class emits two live-captured selector-2 request shapes.  The
+ * 0x70-byte class-1 query was already accepted on remount
+ * (/tmp/dvm/probe/SKS_REMOUNT_V10.stderr.log:1912-1919).  The 0x8c-byte form
+ * carries the requested protection class at wire +0x60 and is the form APFS
+ * uses while creating protected named streams
+ * (/tmp/dvm/probe/DATA_SEED_VISIBLE.stderr.log:1573-1585). */
+#define SKS_CHECK_CLASS_SHORT_REQUEST_SIZE 0x70
+#define SKS_CHECK_CLASS_REQUEST_SIZE       0x8c
+#define SKS_CHECK_CLASS_VARIANT_OFF        0x4c
+#define SKS_CHECK_CLASS_FIXED_ONE_OFF      0x50
+#define SKS_CHECK_CLASS_FIXED_ZERO0_OFF    0x54
+#define SKS_CHECK_CLASS_FIXED_MAX_OFF      0x58
+#define SKS_CHECK_CLASS_FIXED_ZERO1_OFF    0x5c
+#define SKS_CHECK_CLASS_REQUEST_CLASS_OFF  0x60
+#define SKS_CHECK_CLASS_LONG_TAG_OFF       0x64
+#define SKS_CHECK_CLASS_LONG_SIZE_OFF      0x68
+#define SKS_CHECK_CLASS_LONG_ZERO_OFF      0x70
+#define SKS_CHECK_CLASS_LONG_TAIL_OFF      0x74
+#define SKS_CHECK_CLASS_REQUEST_VARIANT    2
+#define SKS_CHECK_CLASS_SHORT_CLASS        1
+#define SKS_CHECK_CLASS_LONG_TAG           2
+#define SKS_CHECK_CLASS_LONG_SIZE          0x1c
+#define SKS_CHECK_CLASS_RESPONSE_SCALAR0_OFF 56
+#define SKS_CHECK_CLASS_RESPONSE_SCALAR1_OFF 60
+
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
     0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
     0x4d, 0x45, 0x44, 0x49, 0x41, 0x2d, 0x4b, 0x45,
@@ -420,6 +445,15 @@ static const uint8_t sks_wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
     0x4b, 0x45, 0x59, 0x2d, 0x30, 0x31, 0x00, 0x01,
     0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
     0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+};
+
+/* The final 24 bytes are identical in every 0x8c-byte request captured during
+ * DATA_SEED_FIRSTERR and DATA_SEED_VISIBLE.  The u32 at +0x6c varies between
+ * calls and remains deliberately opaque. */
+static const uint8_t sks_check_class_long_tail[] = {
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x00, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
@@ -977,6 +1011,73 @@ static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
     return true;
 }
 
+static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
+                                                 const uint8_t *request,
+                                                 uint32_t request_size,
+                                                 uint32_t *requested_class,
+                                                 bool *echo_class)
+{
+    uint32_t header_body_size = 0;
+    uint32_t ipc_version = 0;
+    uint32_t variant = 0;
+    uint32_t protection_class = 0;
+    bool common_shape;
+    bool short_shape;
+    bool long_shape;
+
+    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
+        header_body_size = ldl_le_p(request);
+        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
+    }
+    if (request_size >=
+        SKS_CHECK_CLASS_REQUEST_CLASS_OFF + sizeof(uint32_t)) {
+        variant = ldl_le_p(request + SKS_CHECK_CLASS_VARIANT_OFF);
+        protection_class =
+            ldl_le_p(request + SKS_CHECK_CLASS_REQUEST_CLASS_OFF);
+    }
+
+    common_shape = request_size >=
+            SKS_CHECK_CLASS_REQUEST_CLASS_OFF + sizeof(uint32_t) &&
+        header_body_size == SKS_IPC_V1_HEADER_BODY_SIZE &&
+        ipc_version == SKS_IPC_VERSION_1 &&
+        variant == SKS_CHECK_CLASS_REQUEST_VARIANT &&
+        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ONE_OFF) == 1 &&
+        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ZERO0_OFF) == 0 &&
+        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_MAX_OFF) == UINT32_MAX &&
+        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ZERO1_OFF) == 0;
+    short_shape = request_size == SKS_CHECK_CLASS_SHORT_REQUEST_SIZE &&
+        protection_class == SKS_CHECK_CLASS_SHORT_CLASS &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) == 0 &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) == 0 &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF + 4) == 0;
+    long_shape = request_size == SKS_CHECK_CLASS_REQUEST_SIZE &&
+        (protection_class == 3 || protection_class == 4) &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) ==
+            SKS_CHECK_CLASS_LONG_TAG &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) ==
+            SKS_CHECK_CLASS_LONG_SIZE &&
+        ldl_le_p(request + SKS_CHECK_CLASS_LONG_ZERO_OFF) == 0 &&
+        !memcmp(request + SKS_CHECK_CLASS_LONG_TAIL_OFF,
+                sks_check_class_long_tail,
+                sizeof(sks_check_class_long_tail));
+
+    if (!common_shape || (!short_shape && !long_shape)) {
+        fprintf(stderr, "sep(%s): sks op10 rejected unsupported check-class "
+                "shape: request %u header 0x%x version %u variant %u class "
+                "%u; no reply\n", s->role, request_size, header_body_size,
+                ipc_version, variant, protection_class);
+        return false;
+    }
+
+    *requested_class = protection_class;
+    *echo_class = long_shape;
+    fprintf(stderr, "sep(%s): sks op10 accepted %s request length %u "
+            "variant %u class %u\n", s->role,
+            long_shape ? "protected-object" : "availability", request_size,
+            variant, protection_class);
+    return true;
+}
+
 static bool sep_sks_send_response(DarwinSEPState *s, uint64_t m,
                                   uint8_t *response, uint32_t response_size)
 {
@@ -1009,6 +1110,8 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     g_autofree uint8_t *response = NULL;
     uint8_t *payload;
     uint32_t payload_size;
+    uint32_t check_class = 0;
+    bool check_class_echo = false;
     const char *name;
 
     if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
@@ -1063,8 +1166,13 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
          * variant-2 reply decoder at 0xfffffff009562ee8..0x956302c consumes
          * five length-prefixed blobs and two u32 scalars after the selector.
          * Runtime mask controls establish that outputs 0 and 1 must carry
-         * 16-byte file and IV keys; the last three blobs and both scalars may
-         * remain zero. */
+         * 16-byte file and IV keys.  The protected-object form additionally
+         * requires both trailing scalars to echo its requested class. */
+        if (!sep_sks_validate_check_class_request(s, request, request_size,
+                                                  &check_class,
+                                                  &check_class_echo)) {
+            return;
+        }
         name = "check class available (fake-key mode)";
         payload_size = 4 + 5 * 4 + 2 * SKS_FILE_KEY_SIZE + 2 * 4;
         break;
@@ -1149,11 +1257,22 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         }
         /* APFS consumes output 0 as the file key and output 1 as its IV key;
          * each is required to be 16 bytes by apfs_crypto_state_init at
-         * 0xfffffff00a915158..0xa915174.  The final three blob lengths and
-         * two scalars remain zero. */
-        fprintf(stderr, "sep(%s): sks op10 reports the requested class "
-                "available with %u-byte file and IV keys through fake-key "
-                "union variant 2\n", s->role, SKS_FILE_KEY_SIZE);
+         * 0xfffffff00a915158..0xa915174.  For the 140-byte request,
+         * get_new_crypto_id compares the first returned scalar with the
+         * requested class at 0xfffffff02a91c200; leaving it zero reaches the
+         * EPERM path at 0xfffffff02a915300/0xfffffff02a915344
+         * (/tmp/dvm/probe/DATA_SEED_VISIBLE.stderr.log:1644-1694). */
+        if (check_class_echo) {
+            g_assert(off == SKS_CHECK_CLASS_RESPONSE_SCALAR0_OFF);
+            stl_le_p(payload + SKS_CHECK_CLASS_RESPONSE_SCALAR0_OFF,
+                     check_class);
+            stl_le_p(payload + SKS_CHECK_CLASS_RESPONSE_SCALAR1_OFF,
+                     check_class);
+        }
+        fprintf(stderr, "sep(%s): sks op10 reports class %u available with "
+                "%u-byte file and IV keys%s through fake-key union variant "
+                "2\n", s->role, check_class, SKS_FILE_KEY_SIZE,
+                check_class_echo ? " and two matching class scalars" : "");
         break;
     }
     case SKS_NEW_MEDIA_KEY: {
