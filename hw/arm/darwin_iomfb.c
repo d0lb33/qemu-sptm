@@ -164,10 +164,8 @@
  * same mechanism with the answers a measurement has already justified (see
  * iomfb_level4[]).
  * DARWIN_DCP_IOMFB_CB='D000,D003:00000000:14' scripts outbound callbacks and
- * DARWIN_DCP_IOMFB_CB_AFTER names what starts the script.
- * DARWIN_DCP_IOMFB_CB_KICK_IMMEDIATE=1 sends the experimental own-slot wake
- * immediately after each callback request. Every line is prefixed "iomfb:",
- * which tools/probe.sh filters on.
+ * DARWIN_DCP_IOMFB_CB_AFTER names what starts the script. Every line is
+ * prefixed "iomfb:", which tools/probe.sh filters on.
  */
 
 #include "qemu/osdep.h"
@@ -284,7 +282,6 @@ struct DarwinIOMFB {
     bool cb_started;
     bool cb_flag9;          /* mirror the AP's own bit 9; see iomfb_callback_send */
     bool cb_kick;           /* PROBE only; see the reflection branch in iomfb_class2 */
-    bool cb_kick_immediate; /* PROBE only; wake directly after callback send */
     char *cb_after;
     uint64_t cb_sent;
 };
@@ -537,16 +534,6 @@ static void iomfb_send(DarwinIOMFB *m, uint8_t ep, uint64_t msg, const char *wha
 
 /* ------------------------------------------------- outbound callbacks (D) -- */
 
-static void iomfb_callback_kick(DarwinIOMFB *m, uint8_t ep, unsigned ack,
-                                unsigned tag, const char *what)
-{
-    uint64_t kick = 0x42ULL
-                  | ((uint64_t)ack << 8)
-                  | ((uint64_t)tag << 10);
-
-    iomfb_send(m, ep, kick, what);
-}
-
 /*
  * Issue one D-series callback: build the request in the inbound window and
  * send the class-2 / subkind-0 message that points at it.
@@ -631,21 +618,6 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
     snprintf(what, sizeof(what), "class-2 callback '%s'", cb->name);
     iomfb_send(m, ep, msg, what);
     m->cb_busy = true;
-
-    /*
-     * Experimental immediate wake, opt-in and separate from cb_kick so the
-     * existing reflection-triggered probe retains its exact semantics.
-     * PERSIST_DCP_CALLTRACE_D575_NONNULL1.stderr.log:3060-3070 measured that
-     * the A385 class-2/subkind-1 completion immediately before D575 supplies
-     * the wake that lets D575 dispatch and complete; D575 after A353 stalled.
-     * This emits that same evidence-backed own-slot word (0x142 for ack 1,
-     * tag 0) immediately after the callback request. It remains a transport
-     * experiment, not claimed firmware policy, and is off by default.
-     */
-    if (m->cb_kick_immediate) {
-        iomfb_callback_kick(m, ep, 1, tag,
-                            "PROBE immediate kick: class-2 subkind-1 on our own slot");
-    }
     return true;
 }
 
@@ -904,8 +876,10 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
          * does on its own.
          */
         if (m->cb_busy && m->cb_kick) {
-            iomfb_callback_kick(m, ep, IOMFB_ACK(msg), IOMFB_TAG(msg),
-                                "PROBE kick: class-2 subkind-1 on our own slot");
+            uint64_t kick = 0x42ULL
+                          | ((uint64_t)IOMFB_ACK(msg) << 8)
+                          | ((uint64_t)IOMFB_TAG(msg) << 10);
+            iomfb_send(m, ep, kick, "PROBE kick: class-2 subkind-1 on our own slot");
         }
         return;
     }
@@ -1158,19 +1132,13 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
         const char *f9 = getenv("DARWIN_DCP_IOMFB_CB_FLAG9");
         m->cb_after = g_strdup(after ? after : "A353");
         const char *kick = getenv("DARWIN_DCP_IOMFB_CB_KICK");
-        const char *kick_immediate =
-            getenv("DARWIN_DCP_IOMFB_CB_KICK_IMMEDIATE");
         m->cb_flag9 = !(f9 && f9[0] == '0');
         m->cb_kick = kick && kick[0] && kick[0] != '0';
-        m->cb_kick_immediate = kick_immediate && kick_immediate[0] &&
-                               kick_immediate[0] != '0';
         iomfb_parse_callbacks(m, cbs);
         fprintf(stderr, "iomfb: PROBE callback script has %u entr%s, starting "
-                "after %s%s\n", m->cb_script->len,
+                "after %s\n", m->cb_script->len,
                 m->cb_script->len == 1 ? "y" : "ies",
-                *m->cb_after ? m->cb_after : "the class-1 init ack",
-                m->cb_kick_immediate ?
-                    ", immediate own-slot kick enabled" : "");
+                *m->cb_after ? m->cb_after : "the class-1 init ack");
     }
 
     fprintf(stderr, "darwin-iomfb: link on ep 0x37, level %u (%s), dart %s sid %u\n",
