@@ -154,12 +154,10 @@
  * copies out of the endpoint's OOL out-buffer ("readFromSEP == msg.call.
  * length"), and stores the upper 32 bits as the SEP's status word. Requests
  * arrive the same way: {ep 10, tag, length of the body in the OOL in-buffer,
- * 0}; observed 36 bytes for its cmd 10 and 40 for cmd 25 (the developer-mode
- * query AMFI makes on every spawn). The body format is not modelled. With
- * DARWIN_SEP_SCRD_FAIL_FAST=1 every request is answered at once with length
- * 0 and a nonzero status, so ACM reports an SEP error instead of waiting
- * 5000 ms per command; the status value is a placeholder, not a modelled
- * SEP error code. Default is to stay silent and log.
+ * 0}; observed 36 bytes for cmd 10 and 40 for cmd 25.  The bounded v1/SCRD
+ * positive-control replies below are derived from the ACM receiver checks in
+ * docs/re/acm-scrd-response-contract.md.  All other shapes stay unanswered:
+ * a status-only acknowledgement would hide an unmodelled protocol decision.
  *
  * ---------------------------------------------------------------------------
  * The TXM secure channel
@@ -254,6 +252,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 /* ---------------- SEP protocol ---------------- */
 
 #define SEP_EP_CONTROL     0
+#define SEP_EP_CREDENTIALS 10
 #define SEP_EP_KEYSTORE    18
 #define SEP_EP_DISCOVERY   253
 #define SEP_EP_L4INFO      254
@@ -319,6 +318,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define XART_EPOCH_SLOT_SIZE  4      // lsl x20, x8, 2 at 0x5a1e5c
 #define XART_EPOCH_SIZE       2      // lsl x10, x10, 1 at 0x5a1d14
 #define XART_GET_EPOCH_LEN    8      // stp x8(8), xzr at 0x5a1c14
+
+/*
+ * AppleSEPCredentialManager endpoint-10 requests observed on iOS 27.0 beta 8.
+ * The receiver checks the response version, u16 header length and sequence at
+ * 0xfffffff0095291e4..0xfffffff009529218; see
+ * docs/re/acm-scrd-response-contract.md.
+ * The service's logical FourCC is SCRD but its observed wire bytes at +0x1c
+ * are `DRCS` (the little-endian representation).
+ * These are deliberately not a general SCRD protocol implementation.
+ */
+#define SCRD_REQUEST_VERSION        1
+#define SCRD_REQUEST_HEADER_LEN     0x1c
+#define SCRD_REQUEST_TAG_OFF        0x1c
+#define SCRD_REQUEST_COMMAND_OFF    0x20
+#define SCRD_REQUEST_CMD10_LEN      36
+#define SCRD_REQUEST_CMD25_LEN      40
+#define SCRD_COMMAND_GET_STATE      10
+#define SCRD_COMMAND_GET_ENV        25
+#define SCRD_RESPONSE_VERSION       1
+#define SCRD_RESPONSE_HEADER_LEN    12
+#define SCRD_RESPONSE_CMD10_LEN     12
+#define SCRD_RESPONSE_CMD25_LEN     13
 
 /*
  * AppleSEPKeyStore IPC version 1.  The first live request is 0x5c bytes and
@@ -711,7 +732,6 @@ struct DarwinSEPState {
     const SEPEndpointDef *adv[ARRAY_SIZE(sep_all_eps)];
     int n_adv;
     bool debug;
-    bool scrd_fail_fast;
 };
 
 /* ---------------- frame helpers ---------------- */
@@ -1829,6 +1849,106 @@ static void sep_dump_ool_in(DarwinSEPState *s, uint8_t ep, uint64_t m) {
 }
 
 /*
+ * Endpoint-10 SCRD has a distinct response frame: its length is the u16 at
+ * mailbox bits [31:16], while its status occupies the upper word.  This only
+ * accepts the two request bodies recorded in
+ * docs/re/acm-scrd-response-contract.md.  In particular, an unknown command
+ * remains unanswered rather than being mistaken for a successful SEP call.
+ */
+static void sep_handle_scrd(DarwinSEPState *s, uint64_t m)
+{
+    SEPEndpointState *e = &s->ep[SEP_EP_CREDENTIALS];
+    uint32_t request_size = (m >> 16) & 0xffff;
+    g_autofree uint8_t *request = NULL;
+    uint8_t response[SCRD_RESPONSE_CMD25_LEN] = { 0 };
+    uint8_t command;
+    uint32_t response_size = 0;
+
+    if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
+        fprintf(stderr, "sep(%s): scrd tag %u has invalid OOL in size %u "
+                "(dva 0x%" PRIx64 " size 0x%x); no reply\n", s->role,
+                frame_tag(m), request_size, e->ool_in_addr, e->ool_in_size);
+        return;
+    }
+    request = g_malloc(request_size);
+    if (!sep_dma(s, e->ool_in_addr, request, request_size, false)) {
+        fprintf(stderr, "sep(%s): scrd tag %u could not read %u-byte OOL "
+                "request; no reply\n", s->role, frame_tag(m), request_size);
+        return;
+    }
+
+    if (request_size < SCRD_REQUEST_COMMAND_OFF + 1 ||
+        frame_data(m) != 0 ||
+        lduw_le_p(request) != SCRD_REQUEST_VERSION ||
+        lduw_le_p(request + 2) != SCRD_REQUEST_HEADER_LEN ||
+        memcmp(request + SCRD_REQUEST_TAG_OFF, "DRCS", 4)) {
+        fprintf(stderr, "sep(%s): scrd tag %u unsupported request shape "
+                "(body %u status 0x%08x v %u hdr 0x%x service %02x%02x%02x%02x); no reply\n",
+                s->role, frame_tag(m), request_size,
+                frame_data(m),
+                request_size >= 2 ? lduw_le_p(request) : 0,
+                request_size >= 4 ? lduw_le_p(request + 2) : 0,
+                request_size >= SCRD_REQUEST_TAG_OFF + 4 ?
+                    request[SCRD_REQUEST_TAG_OFF] : 0,
+                request_size >= SCRD_REQUEST_TAG_OFF + 4 ?
+                    request[SCRD_REQUEST_TAG_OFF + 1] : 0,
+                request_size >= SCRD_REQUEST_TAG_OFF + 4 ?
+                    request[SCRD_REQUEST_TAG_OFF + 2] : 0,
+                request_size >= SCRD_REQUEST_TAG_OFF + 4 ?
+                    request[SCRD_REQUEST_TAG_OFF + 3] : 0);
+        if (s->debug) {
+            sep_dump_ool_in_len(s, SEP_EP_CREDENTIALS, request_size);
+        }
+        return;
+    }
+
+    command = request[SCRD_REQUEST_COMMAND_OFF];
+    switch (command) {
+    case SCRD_COMMAND_GET_STATE:
+        if (request_size != SCRD_REQUEST_CMD10_LEN) {
+            break;
+        }
+        response_size = SCRD_RESPONSE_CMD10_LEN;
+        goto send_reply;
+    case SCRD_COMMAND_GET_ENV:
+        if (request_size != SCRD_REQUEST_CMD25_LEN) {
+            break;
+        }
+        response_size = SCRD_RESPONSE_CMD25_LEN;
+        goto send_reply;
+    default:
+        break;
+    }
+
+    fprintf(stderr, "sep(%s): scrd tag %u cmd 0x%02x body %u is unmodelled; "
+            "no reply\n", s->role, frame_tag(m), command, request_size);
+    if (s->debug) {
+        sep_dump_ool_in_len(s, SEP_EP_CREDENTIALS, request_size);
+    }
+    return;
+
+send_reply:
+    response[0] = SCRD_RESPONSE_VERSION;
+    stw_le_p(response + 2, SCRD_RESPONSE_HEADER_LEN);
+    memcpy(response + 4, request + 4, sizeof(uint32_t));
+    if (!e->ool_out_addr || response_size > e->ool_out_size ||
+        !sep_dma(s, e->ool_out_addr, response, response_size, true)) {
+        fprintf(stderr, "sep(%s): scrd tag %u cmd 0x%02x cannot write %u-byte "
+                "OOL reply (dva 0x%" PRIx64 " size 0x%x); no reply\n",
+                s->role, frame_tag(m), command, response_size,
+                e->ool_out_addr, e->ool_out_size);
+        return;
+    }
+
+    sep_send_raw(s, frame(SEP_EP_CREDENTIALS, frame_tag(m),
+                          response_size & 0xff, response_size >> 8, 0));
+    fprintf(stderr, "sep(%s): scrd v1 cmd 0x%02x seq 0x%08x tag %u replied "
+            "with %u-byte OOL envelope at dva 0x%" PRIx64 "\n", s->role,
+            command, ldl_le_p(request + 4), frame_tag(m), response_size,
+            e->ool_out_addr);
+}
+
+/*
  * The xART reply: { ep, tag, u8 status, u16 byte count } -- byte 2 is what
  * the gated sender returns as its IOReturn (ldrb w22, [msg, 2] at
  * 0xfffffff00959f4bc) and bytes 3..4 are how many bytes it copies out of the
@@ -1911,17 +2031,7 @@ static void sep_receive(DarwinSEPState *s, uint64_t m) {
     case SEP_EP_L4INFO:    sep_handle_l4info(s, m); break;
     case SEP_EP_KEYSTORE:  sep_handle_sks(s, m); break;
     case 16: case 19:      sep_handle_xart(s, m); break;
-    case 10:
-        fprintf(stderr, "sep(%s): scrd request tag %u, %u byte body: %s\n", s->role,
-                frame_tag(m), (unsigned)((m >> 16) & 0xffff),
-                s->scrd_fail_fast ? "failing fast (DARWIN_SEP_SCRD_FAIL_FAST)" : "no handler");
-        if (s->debug) sep_dump_ool_in(s, ep, m);
-        if (s->scrd_fail_fast) {
-            // {ep 10, tag, length 0, status 1}: see the header. Status 1 is a
-            // placeholder for "SEP said no", not a decoded error code.
-            sep_send_raw(s, frame(10, frame_tag(m), 0, 0, 1));
-        }
-        break;
+    case SEP_EP_CREDENTIALS: sep_handle_scrd(s, m); break;
     default:
         // scrd and friends: logged and left unanswered until their
         // protocols are modelled. This is the honest hole, not a guess.
@@ -2089,7 +2199,6 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     s->cpu_status = ASC_CPU_STATUS_STOPPED;
     s->status = SEP_STATUS_ROM;
     s->debug = getenv("DARWIN_SEP_DEBUG") != NULL;
-    s->scrd_fail_fast = getenv("DARWIN_SEP_SCRD_FAIL_FAST") != NULL;
     sep_pick_endpoints(s);
     memory_region_init_io(&s->iomem, OBJECT(s), &sep_ops, s, "darwin-sep", s->mmio_size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
