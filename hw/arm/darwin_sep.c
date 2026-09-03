@@ -385,22 +385,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 /*
  * Change Lock State's iOS 27 wrapper is fcn.fffffff00957b058.  It seeds the
  * request inputs at 0xfffffff00957b0d4..0xfffffff00957b0e8 and invokes IPC
- * opcode 4 at 0xfffffff00957b0ec..0xfffffff00957b0f8.  The live request at
- * /tmp/dvm/probe/SKS_OP09_CAPTURE_1.stderr.log:707..737 has the exact body
- * described below.  The success path consumes a u32 output at
+ * opcode 4 at 0xfffffff00957b0ec..0xfffffff00957b0f8.  Captures at
+ * /tmp/dvm/probe/SKS_OP09_CAPTURE_1.stderr.log:707..737 and
+ * /tmp/dvm/probe/SKS_OP04_AB_1.stderr.log:736 have the same body except for
+ * the nonzero u64 at +0x50 (0xbe3138e73ca977e1 versus
+ * 0x8e5143704e6a5385), proving it is an opaque per-boot handle rather than a
+ * protocol constant.  The success path consumes a u32 output at
  * 0xfffffff00957b104..0xfffffff00957b10c and a u64 output at
- * 0xfffffff00957b110..0xfffffff00957b118.  Keep the opaque token and every
- * other captured field strict until another native request shape is proven.
+ * 0xfffffff00957b110..0xfffffff00957b118.  Keep every stable captured field
+ * strict until another native request shape is proven.
  */
 #define SKS_CHANGE_LOCK_STATE_REQUEST_SIZE       0x6c
 #define SKS_CHANGE_LOCK_STATE_SELECTOR_OFF       0x4c
-#define SKS_CHANGE_LOCK_STATE_TOKEN_OFF          0x50
+#define SKS_CHANGE_LOCK_STATE_HANDLE_OFF         0x50
 #define SKS_CHANGE_LOCK_STATE_FIXED_ZERO_OFF     0x58
 #define SKS_CHANGE_LOCK_STATE_FIXED_MAX_OFF      0x5c
 #define SKS_CHANGE_LOCK_STATE_ZERO_TAIL_OFF       0x60
 #define SKS_CHANGE_LOCK_STATE_ZERO_TAIL_SIZE      12
 #define SKS_CHANGE_LOCK_STATE_REQUEST_SELECTOR    1
-#define SKS_CHANGE_LOCK_STATE_TOKEN               UINT64_C(0xbe3138e73ca977e1)
 #define SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE       16
 #define SKS_CHANGE_LOCK_STATE_RESPONSE_SELECTOR   0
 
@@ -1105,7 +1107,7 @@ static bool sep_sks_validate_change_lock_state_request(
     uint32_t header_body_size = 0;
     uint32_t ipc_version = 0;
     uint32_t selector = UINT32_MAX;
-    uint64_t token = 0;
+    uint64_t handle = 0;
     uint32_t fixed_zero = UINT32_MAX;
     uint32_t fixed_max = 0;
 
@@ -1115,7 +1117,7 @@ static bool sep_sks_validate_change_lock_state_request(
     }
     if (request_size == SKS_CHANGE_LOCK_STATE_REQUEST_SIZE) {
         selector = ldl_le_p(request + SKS_CHANGE_LOCK_STATE_SELECTOR_OFF);
-        token = ldq_le_p(request + SKS_CHANGE_LOCK_STATE_TOKEN_OFF);
+        handle = ldq_le_p(request + SKS_CHANGE_LOCK_STATE_HANDLE_OFF);
         fixed_zero =
             ldl_le_p(request + SKS_CHANGE_LOCK_STATE_FIXED_ZERO_OFF);
         fixed_max = ldl_le_p(request + SKS_CHANGE_LOCK_STATE_FIXED_MAX_OFF);
@@ -1125,22 +1127,22 @@ static bool sep_sks_validate_change_lock_state_request(
         header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
         ipc_version != SKS_IPC_VERSION_1 ||
         selector != SKS_CHANGE_LOCK_STATE_REQUEST_SELECTOR ||
-        token != SKS_CHANGE_LOCK_STATE_TOKEN || fixed_zero != 0 ||
+        handle == 0 || fixed_zero != 0 ||
         fixed_max != UINT32_MAX ||
         memcmp(request + SKS_CHANGE_LOCK_STATE_ZERO_TAIL_OFF,
                sks_change_lock_state_zero_tail,
                sizeof(sks_change_lock_state_zero_tail))) {
         fprintf(stderr, "sep(%s): sks op04 rejected unsupported change-lock-"
                 "state shape: request %u header 0x%x version %u selector %u "
-                "token 0x%016" PRIx64 " zero 0x%x max 0x%x; no reply\n",
+                "handle 0x%016" PRIx64 " zero 0x%x max 0x%x; no reply\n",
                 s->role, request_size, header_body_size, ipc_version,
-                selector, token, fixed_zero, fixed_max);
+                selector, handle, fixed_zero, fixed_max);
         return false;
     }
 
     fprintf(stderr, "sep(%s): sks op04 accepted request length %u selector "
-            "%u token 0x%016" PRIx64 "\n", s->role, request_size,
-            selector, token);
+            "%u opaque handle 0x%016" PRIx64 "\n", s->role, request_size,
+            selector, handle);
     return true;
 }
 
