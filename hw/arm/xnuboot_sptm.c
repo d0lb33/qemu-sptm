@@ -48,6 +48,9 @@ static void alloc_ram(Object *cpuobj, struct xnu_boot_info *info, hwaddr base, s
 // physmap block mappings happy.
 #define FB_ALIGN (2 * ONE_MB)
 
+static void set_adt_mmap(struct dtree_node *memory_map,
+                         const char *reg_name, hwaddr paddr, size_t sz);
+
 // Carve the boot framebuffer out of the top of DRAM, exactly like iBoot does:
 // XNU only manages [physBase, physBase + memSize), so shrinking memSize keeps
 // the framebuffer out of the free page pool. XNU then maps it via
@@ -77,6 +80,20 @@ static void setup_framebuffer(struct xnu_boot_info *info, boot_args *args, struc
 
     info->fb_base = fb_base;
     info->fb_size = fb_size;
+
+    /*
+     * IOMobileFramebufferAP's default-surface path requires this iBoot
+     * memory-map entry and panics at IOMobileFramebufferAP.cpp:3290 when it is
+     * absent. Publish the already-reserved boot framebuffer, not a second
+     * display/GPU carveout.
+     */
+    struct dtree_node *memory_map = adt_find_node(dt_root,
+                                                   "chosen/memory-map");
+    if (!memory_map) {
+        fprintf(stderr, "dtree is missing /chosen/memory-map\n");
+        exit(1);
+    }
+    set_adt_mmap(memory_map, "PurpleGfxMem", fb_base, fb_size);
 
     // iBoot publishes the framebuffer in /vram/reg = <base size>
     struct dtree_node *vram = adt_find_node(dt_root, "vram");
