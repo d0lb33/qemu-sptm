@@ -174,9 +174,11 @@
  * FourCC so a probe can test a hypothesis without a rebuild. Level 4 is that
  * same mechanism with the answers a measurement has already justified (see
  * iomfb_level4[]).
- * DARWIN_DCP_IOMFB_CB='D000,D003:00000000:14' scripts outbound callbacks and
- * DARWIN_DCP_IOMFB_CB_AFTER names what starts the script. Every line is
- * prefixed "iomfb:", which tools/probe.sh filters on.
+ * DARWIN_DCP_IOMFB_CB='D000,@A385,D003:00000000:14' scripts outbound
+ * callbacks; an @NAME item is a barrier that waits for that later AP RPC
+ * before the following callback is sent. DARWIN_DCP_IOMFB_CB_AFTER names
+ * what starts the script. Every line is prefixed "iomfb:", which
+ * tools/probe.sh filters on.
  */
 
 #include "qemu/osdep.h"
@@ -281,12 +283,14 @@ struct DarwinIOMFB {
      * section 5 of the header comment for the transport and
      * docs/re/iomfb-dseries.md for the 139 names the AP will accept.
      *
-     * cb_script is a list of IOMFBCallback in the order they are issued; one
-     * is outstanding at a time (cb_busy), because the AP correlates purely by
-     * (ack, tag) and we only ever use tag 0, so a second in flight would be
-     * indistinguishable from the first. cb_after names the inbound RPC whose
-     * completion starts the script, or is empty to start right after the
-     * class-1 init ack.
+     * cb_script is a list of callback or AP-RPC barrier items in execution
+     * order. One callback is outstanding at a time (cb_busy), because the AP
+     * correlates purely by (ack, tag) and we only ever use tag 0, so a second
+     * in flight would be indistinguishable from the first. A barrier never
+     * changes cb_busy or emits a mailbox word; it only holds cb_next until a
+     * later matching AP RPC has been answered. cb_after names the inbound RPC
+     * whose completion starts the script, or is empty to start right after
+     * the class-1 init ack.
      */
     GArray *cb_script;
     unsigned cb_next;
@@ -297,9 +301,10 @@ struct DarwinIOMFB {
     uint64_t cb_sent;
 };
 
-/* One scripted outbound callback. */
+/* One scripted outbound callback, or an @NAME AP-RPC barrier. */
 typedef struct {
     char name[5];
+    bool barrier;
     uint32_t name_be;       /* the u32 as it goes into the heap */
     GByteArray *in;         /* input bytes, verbatim */
     uint32_t out_len;
@@ -637,12 +642,45 @@ static void iomfb_callback_pump(DarwinIOMFB *m, uint8_t ep)
 {
     while (!m->cb_busy && m->cb_script && m->cb_next < m->cb_script->len) {
         const IOMFBCallback *cb =
-            &g_array_index(m->cb_script, IOMFBCallback, m->cb_next++);
+            &g_array_index(m->cb_script, IOMFBCallback, m->cb_next);
+        if (cb->barrier) {
+            fprintf(stderr, "iomfb: callback script waiting at @%s for a "
+                    "later AP RPC\n", cb->name);
+            return;
+        }
+        m->cb_next++;
         if (iomfb_callback_send(m, ep, cb)) {
             return;                     /* wait for the completion */
         }
         /* Could not send it at all: move on rather than stalling the script. */
     }
+}
+
+/*
+ * Release the current @NAME barrier after the matching AP RPC has completed.
+ * This runs after our class-2 completion is sent, so "observed" means the AP
+ * caller has received the same answer it would have received without a
+ * script. The barrier is deliberately independent of cb_busy: it sends no
+ * callback, consumes no tag, and cannot masquerade as callback completion.
+ */
+static void iomfb_callback_barrier(DarwinIOMFB *m, uint8_t ep,
+                                   const char name[5])
+{
+    if (!m->cb_started || m->cb_busy || !m->cb_script ||
+        m->cb_next >= m->cb_script->len) {
+        return;
+    }
+
+    const IOMFBCallback *item =
+        &g_array_index(m->cb_script, IOMFBCallback, m->cb_next);
+    if (!item->barrier || strcmp(item->name, name)) {
+        return;
+    }
+
+    fprintf(stderr, "iomfb: AP RPC '%s' answered; callback script passed "
+            "barrier @%s\n", name, item->name);
+    m->cb_next++;
+    iomfb_callback_pump(m, ep);
 }
 
 /*
@@ -688,11 +726,12 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
 }
 
 /*
- * Parse DARWIN_DCP_IOMFB_CB. Comma or space separated NAME[:INHEX[:OUTLEN]],
- * eg. "D000::4,D003:00000000:14". OUTLEN is C-style (0x for hex). A name is
- * exactly four characters; nothing else is validated here, because the point
- * of the harness is to be able to send something the AP will reject and read
- * what it says.
+ * Parse DARWIN_DCP_IOMFB_CB. Comma or space separated NAME[:INHEX[:OUTLEN]]
+ * callbacks and @NAME barriers, eg. "D120::4,D586:9b040000fc090000:4,@A385,"
+ * "D575". OUTLEN is C-style (0x for hex). A name is exactly four characters;
+ * a barrier is exactly '@' plus four characters and accepts no fields.
+ * Nothing else about callback names is validated here, because the point of
+ * the harness is to send something the AP may reject and read what it says.
  */
 static void iomfb_parse_callbacks(DarwinIOMFB *m, const char *spec)
 {
@@ -701,6 +740,20 @@ static void iomfb_parse_callbacks(DarwinIOMFB *m, const char *spec)
     m->cb_script = g_array_new(FALSE, TRUE, sizeof(IOMFBCallback));
     for (char **it = items; it && *it; it++) {
         if (!**it) continue;
+        if (**it == '@') {
+            if (strlen(*it) != 5 || strchr(*it + 1, ':')) {
+                fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_CB: malformed "
+                        "barrier \"%s\" (want @NAME, NAME exactly 4 chars); "
+                        "skipped\n", *it);
+                continue;
+            }
+            IOMFBCallback barrier = { .barrier = true };
+            memcpy(barrier.name, *it + 1, 4);
+            g_array_append_val(m->cb_script, barrier);
+            fprintf(stderr, "iomfb: PROBE callback barrier scripted: @%s\n",
+                    barrier.name);
+            continue;
+        }
         g_auto(GStrv) f = g_strsplit(*it, ":", 3);
         if (!f[0] || strlen(f[0]) != 4) {
             fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_CB: \"%s\" is not a 4-char "
@@ -1006,6 +1059,9 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     char what[96];
     snprintf(what, sizeof(what), "class-2 completion for '%s', status 0, out %s", name, how);
     iomfb_send(m, ep, reply, what);
+
+    /* A script barrier observes a completed AP call, never merely its arrival. */
+    iomfb_callback_barrier(m, ep, name);
 
     /*
      * Start the outbound experiment script once the AP has asked for the

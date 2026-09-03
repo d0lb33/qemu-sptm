@@ -32,9 +32,11 @@ typedef struct DarwinIOMFB DarwinIOMFB;
  * The outbound (DCP -> AP, "D-series") callback direction is orthogonal to
  * the level and off at every one of them. DARWIN_DCP_IOMFB_CB scripts it:
  *
- *   DARWIN_DCP_IOMFB_CB='D000::4,D003:00000000:0x14'
- *      a comma separated list of NAME[:INHEX[:OUTLEN]], issued one at a time,
- *      each after the previous completes.
+ *   DARWIN_DCP_IOMFB_CB='D120::4,D586:9b040000fc090000:4,@A385,D575'
+ *      a comma separated list of NAME[:INHEX[:OUTLEN]] callbacks and @NAME
+ *      barriers. Callbacks are issued one at a time after the previous one
+ *      completes. A barrier sends nothing and waits until a later matching AP
+ *      RPC has been answered before the script continues.
  *   DARWIN_DCP_IOMFB_CB_AFTER='A353'
  *      which inbound RPC's completion starts the script; empty or 'ack'
  *      starts it as soon as the class-1 handshake finishes. Default A353.
