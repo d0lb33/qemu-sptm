@@ -356,6 +356,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * this code plus the reply bit; byte 2 is a request ID. */
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
+#define SKS_MIGRATE_MEDIA_KEY_TO_CLASS 0x0f
 #define SKS_CHECK_CLASS 0x10
 #define SKS_NEW_MEDIA_KEY 0x31
 #define SKS_UNWRAP_MEDIA_KEY 0x32
@@ -368,6 +369,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * (0xfffffff00a139230..0xa13925c); 0x20 reaches its explicit
  * "Invalid key length for unwrapped key" branch at 0xfffffff00a1392ac. */
 #define SKS_MEDIA_KEY_SIZE       64
+#define SKS_FILE_KEY_SIZE        16
 
 /* The third output is the opaque record which fs_new_media_key gives back to
  * APFS (0xfffffff009572d90..0x9572da8).  A 0x28-byte value is stored verbatim
@@ -375,6 +377,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * /tmp/dvm/probe/SKS_KEYOP_V7A.serial.log:67 and the next boot sends the same
  * 0x28-byte record back in /tmp/dvm/probe/SKS_LIVEKEY_V9.stderr.log:6463..6473. */
 #define SKS_WRAPPED_KEY_SIZE     40
+
+/* fs_migrate_media_key_to_class request shape captured at
+ * /tmp/dvm/probe/BOOTSTRAP_SEED_SKSDEBUG.stderr.log:579-595 and decoded in
+ * docs/re/sks-op0f-media-key-migration.md.  The record itself stays opaque. */
+#define SKS_MIGRATE_REQUEST_SIZE       0xb0
+#define SKS_MIGRATE_VARIANT_OFF        0x4c
+#define SKS_MIGRATE_FIXED_ONE_OFF      0x50
+#define SKS_MIGRATE_FIXED_ZERO0_OFF    0x54
+#define SKS_MIGRATE_FIXED_ZERO1_OFF    0x58
+#define SKS_MIGRATE_FIXED_ZERO2_OFF    0x5c
+#define SKS_MIGRATE_FIXED_U64_OFF      0x60
+#define SKS_MIGRATE_FIXED_ZERO3_OFF    0x68
+#define SKS_MIGRATE_TARGET_CLASS_OFF   0x6c
+#define SKS_MIGRATE_FIXED_ZERO4_OFF    0x70
+#define SKS_MIGRATE_FIXED_ZERO5_OFF    0x74
+#define SKS_MIGRATE_RECORD_LEN_OFF     0x78
+#define SKS_MIGRATE_RECORD_OFF         0x7c
+#define SKS_MIGRATE_OUTPUT_CAP_OFF     0xa4
+#define SKS_MIGRATE_OUTPUT_AUX_OFF     0xa8
+#define SKS_MIGRATE_OUTPUT_SCALAR_OFF  0xac
+#define SKS_MIGRATE_REQUEST_VARIANT    3
+#define SKS_MIGRATE_RESPONSE_VARIANT   3
+#define SKS_MIGRATE_TARGET_CLASS       0x0e
+#define SKS_MIGRATE_REQUEST_SCALAR     0
+#define SKS_MIGRATE_RESPONSE_CLASS     SKS_MIGRATE_TARGET_CLASS
 
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
     0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
@@ -887,6 +914,69 @@ static bool sep_sks_init_response(DarwinSEPState *s, const uint8_t *request,
     return true;
 }
 
+static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
+                                             const uint8_t *request,
+                                             uint32_t request_size)
+{
+    uint32_t header_body_size = 0;
+    uint32_t ipc_version = 0;
+    uint32_t variant = 0;
+    uint32_t target_class = 0;
+    uint32_t record_len = 0;
+    uint32_t output_cap = 0;
+    uint32_t output_scalar = 0;
+
+    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
+        header_body_size = ldl_le_p(request);
+        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
+    }
+    if (request_size >= SKS_MIGRATE_OUTPUT_SCALAR_OFF + sizeof(uint32_t)) {
+        variant = ldl_le_p(request + SKS_MIGRATE_VARIANT_OFF);
+        target_class = ldl_le_p(request + SKS_MIGRATE_TARGET_CLASS_OFF);
+        record_len = ldl_le_p(request + SKS_MIGRATE_RECORD_LEN_OFF);
+        output_cap = ldl_le_p(request + SKS_MIGRATE_OUTPUT_CAP_OFF);
+        output_scalar = ldl_le_p(request + SKS_MIGRATE_OUTPUT_SCALAR_OFF);
+    }
+
+    /* This accepts only the one statically decoded and live-captured variant.
+     * In particular, do not turn another union variant or record shape into a
+     * fake success: its response decoder and SEP side effects are unknown. */
+    if (request_size != SKS_MIGRATE_REQUEST_SIZE ||
+        header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
+        ipc_version != SKS_IPC_VERSION_1 ||
+        variant != SKS_MIGRATE_REQUEST_VARIANT ||
+        target_class != SKS_MIGRATE_TARGET_CLASS ||
+        record_len != SKS_WRAPPED_KEY_SIZE ||
+        output_cap != SKS_MEDIA_KEY_SIZE ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ONE_OFF) != 1 ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO0_OFF) != 0 ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO1_OFF) != 0 ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO2_OFF) != 0 ||
+        ldq_le_p(request + SKS_MIGRATE_FIXED_U64_OFF) != UINT64_MAX ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO3_OFF) != 0 ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO4_OFF) != 0 ||
+        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO5_OFF) != 0 ||
+        ldl_le_p(request + SKS_MIGRATE_OUTPUT_AUX_OFF) != 0 ||
+        output_scalar != SKS_MIGRATE_REQUEST_SCALAR ||
+        SKS_MIGRATE_RECORD_OFF + record_len !=
+            SKS_MIGRATE_OUTPUT_CAP_OFF) {
+        fprintf(stderr, "sep(%s): sks op0f rejected unsupported migration "
+                "shape: request %u header 0x%x version %u variant %u "
+                "class %u record length %u output capacity %u output "
+                "scalar %u; no reply\n",
+                s->role, request_size, header_body_size, ipc_version, variant,
+                target_class, record_len, output_cap, output_scalar);
+        return false;
+    }
+
+    fprintf(stderr, "sep(%s): sks op0f accepted request length %u variant %u "
+            "class %u, opaque record length %u, output capacity %u, output "
+            "scalar %u\n",
+            s->role, request_size, variant, target_class, record_len,
+            output_cap, output_scalar);
+    return true;
+}
+
 static bool sep_sks_send_response(DarwinSEPState *s, uint64_t m,
                                   uint8_t *response, uint32_t response_size)
 {
@@ -957,16 +1047,26 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         name = "set environment";
         payload_size = 4;
         break;
+    case SKS_MIGRATE_MEDIA_KEY_TO_CLASS:
+        /* The request's variant-3 decoder publishes one pointer/length output
+         * pair (AppleSEPKeyStore 0xfffffff00957bbcc..0x957bc60).  Reject any
+         * unobserved input shape rather than returning a misleading success. */
+        if (!sep_sks_validate_migrate_request(s, request, request_size)) {
+            return;
+        }
+        name = "migrate media key to class (fake-key mode)";
+        payload_size = 4 + 4 + SKS_WRAPPED_KEY_SIZE + 4;
+        break;
     case SKS_CHECK_CLASS:
         /* fs_check_class emits union selector 2 at wire payload +0x00
          * (/tmp/dvm/probe/SKS_REMOUNT_V10.stderr.log:1912..1919).  Its
          * variant-2 reply decoder at 0xfffffff009562ee8..0x956302c consumes
          * five length-prefixed blobs and two u32 scalars after the selector.
-         * Empty blobs and zero scalars are the fake-key result; omitting those
-         * fields is rejected as e00002bc at
-         * /tmp/dvm/idle/probe/OP10_TEST.serial.log:486. */
+         * Runtime mask controls establish that outputs 0 and 1 must carry
+         * 16-byte file and IV keys; the last three blobs and both scalars may
+         * remain zero. */
         name = "check class available (fake-key mode)";
-        payload_size = 4 + 5 * 4 + 2 * 4;
+        payload_size = 4 + 5 * 4 + 2 * SKS_FILE_KEY_SIZE + 2 * 4;
         break;
     case SKS_NEW_MEDIA_KEY:
         /* The generated IPC decoder at 0xfffffff00957d6f8..0x957d7a8
@@ -1011,14 +1111,51 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload, 0);
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
         break;
-    case SKS_CHECK_CLASS:
-        stl_le_p(payload, 2);
-        /* sep_sks_init_response() zeroes the five blob lengths and two
-         * trailing scalars required by the decoder. */
-        fprintf(stderr, "sep(%s): sks op10 reports the requested class "
-                "available through 32-byte fake-key union variant 2\n",
-                s->role);
+    case SKS_MIGRATE_MEDIA_KEY_TO_CLASS: {
+        /* The opaque input stays unparsed.  APFS stores the reply as another
+         * wrapped record and rejects lengths >= 0x39 at
+         * 0xfffffff00a875648..0xa875660, so the request's 0x40 is capacity,
+         * not the required returned length.  Reuse the stable wrapped record
+         * already emitted by op31; op32 remains the operation that turns it
+         * into the 64-byte live key. */
+        stl_le_p(payload, SKS_MIGRATE_RESPONSE_VARIANT);
+        stl_le_p(payload + 4, SKS_WRAPPED_KEY_SIZE);
+        memcpy(payload + 8, sks_wrapped_key, SKS_WRAPPED_KEY_SIZE);
+        /* The generated bridge copies a trailing scalar back through its
+         * optional output pointer at 0xfffffff00957bbf4..0x957bc60.  APFS
+         * requires it to match the requested class 14 at
+         * 0xfffffff00a875598..0xa8755a4; zero is the distinct request-side
+         * field captured at +0xac. */
+        stl_le_p(payload + 8 + SKS_WRAPPED_KEY_SIZE,
+                 SKS_MIGRATE_RESPONSE_CLASS);
+        fprintf(stderr, "sep(%s): sks op0f supplies migrated record length %u "
+                "and output class %u for variant %u\n", s->role,
+                SKS_WRAPPED_KEY_SIZE, SKS_MIGRATE_RESPONSE_CLASS,
+                SKS_MIGRATE_RESPONSE_VARIANT);
         break;
+    }
+    case SKS_CHECK_CLASS: {
+        uint32_t off = 0;
+
+        stl_le_p(payload, 2);
+        off += 4;
+        for (uint32_t i = 0; i < 5; i++) {
+            uint32_t key_size = i < 2 ? SKS_FILE_KEY_SIZE : 0;
+
+            stl_le_p(payload + off, key_size);
+            off += 4;
+            memcpy(payload + off, sks_media_key, key_size);
+            off += key_size;
+        }
+        /* APFS consumes output 0 as the file key and output 1 as its IV key;
+         * each is required to be 16 bytes by apfs_crypto_state_init at
+         * 0xfffffff00a915158..0xa915174.  The final three blob lengths and
+         * two scalars remain zero. */
+        fprintf(stderr, "sep(%s): sks op10 reports the requested class "
+                "available with %u-byte file and IV keys through fake-key "
+                "union variant 2\n", s->role, SKS_FILE_KEY_SIZE);
+        break;
+    }
     case SKS_NEW_MEDIA_KEY: {
         uint32_t off = 0;
 
