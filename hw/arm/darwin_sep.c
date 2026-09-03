@@ -354,12 +354,30 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * pass them to the IPC serializer: 0xfffffff00957ed30 passes 0x4d for
  * negotiation, and 0xfffffff00955eb84 passes 0x2a for set_env.  Byte 1 holds
  * this code plus the reply bit; byte 2 is a request ID. */
+#define SKS_LOAD_KEYBAG 0x03
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
 #define SKS_MIGRATE_MEDIA_KEY_TO_CLASS 0x0f
 #define SKS_CHECK_CLASS 0x10
 #define SKS_NEW_MEDIA_KEY 0x31
 #define SKS_UNWRAP_MEDIA_KEY 0x32
+
+/* Load Keybag request shape observed at
+ * /tmp/dvm/probe/PERSIST_DATA_BOOT1.stderr.log:977..988.  The public sep-sim
+ * reference answers this operation with the deterministic handle 'BAG1'
+ * (/tmp/dvm/sep-sim.c:745..769).  docs/re/sks-feasibility.md:182..201 warns
+ * that its constants are hand-picked and do not prove an encrypted-volume
+ * result, so this is an interoperability experiment, not modeled SEP secrecy
+ * or persistent keybag state.  The native iOS 27 schema remains inferred from
+ * that reference until the guest consumes this reply successfully. */
+#define SKS_LOAD_KEYBAG_REQUEST_SIZE  0x6c
+#define SKS_LOAD_KEYBAG_VARIANT_OFF   0x4c
+#define SKS_LOAD_KEYBAG_CONTEXT_OFF   0x50
+#define SKS_LOAD_KEYBAG_UUID_LEN_OFF  0x58
+#define SKS_LOAD_KEYBAG_UUID_OFF      0x5c
+#define SKS_LOAD_KEYBAG_VARIANT       0
+#define SKS_LOAD_KEYBAG_UUID_SIZE     16
+#define SKS_LOAD_KEYBAG_HANDLE        0x42414731u /* 'BAG1' */
 
 /* fs_new_media_key's first output is the live CPX key: the bridge stores it at
  * descriptor +0/+8 (0xfffffff00957789c..0x95778b8), and APFS passes that
@@ -948,6 +966,66 @@ static bool sep_sks_init_response(DarwinSEPState *s, const uint8_t *request,
     return true;
 }
 
+static bool sep_sks_validate_load_keybag_request(DarwinSEPState *s,
+                                                  const uint8_t *request,
+                                                  uint32_t request_size)
+{
+    uint32_t header_body_size = 0;
+    uint32_t ipc_version = 0;
+    uint32_t variant = UINT32_MAX;
+    uint32_t uuid_len = 0;
+    uint64_t context = 0;
+
+    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
+        header_body_size = ldl_le_p(request);
+        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
+    }
+    if (request_size >= SKS_LOAD_KEYBAG_UUID_OFF) {
+        variant = ldl_le_p(request + SKS_LOAD_KEYBAG_VARIANT_OFF);
+        context = ldq_le_p(request + SKS_LOAD_KEYBAG_CONTEXT_OFF);
+        uuid_len = ldl_le_p(request + SKS_LOAD_KEYBAG_UUID_LEN_OFF);
+    }
+
+    /* Only the live-captured variant-0 request is understood.  Context and
+     * UUID are deliberately opaque/dynamic, but every established framing
+     * and length field must match before returning a fabricated handle. */
+    if (request_size != SKS_LOAD_KEYBAG_REQUEST_SIZE ||
+        header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
+        ipc_version != SKS_IPC_VERSION_1 ||
+        variant != SKS_LOAD_KEYBAG_VARIANT ||
+        uuid_len != SKS_LOAD_KEYBAG_UUID_SIZE ||
+        SKS_LOAD_KEYBAG_UUID_OFF + uuid_len != request_size) {
+        fprintf(stderr, "sep(%s): sks op03 rejected unsupported load-keybag "
+                "shape: request %u header 0x%x version %u variant %u UUID "
+                "length %u; no reply\n", s->role, request_size,
+                header_body_size, ipc_version, variant, uuid_len);
+        return false;
+    }
+
+    fprintf(stderr, "sep(%s): sks op03 accepted request length %u variant "
+            "%u context 0x%016" PRIx64 " UUID "
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+            "%02x%02x%02x%02x%02x%02x\n", s->role, request_size,
+            variant, context,
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 0],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 1],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 2],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 3],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 4],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 5],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 6],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 7],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 8],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 9],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 10],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 11],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 12],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 13],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 14],
+            request[SKS_LOAD_KEYBAG_UUID_OFF + 15]);
+    return true;
+}
+
 static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
                                              const uint8_t *request,
                                              uint32_t request_size)
@@ -1139,6 +1217,14 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     }
 
     switch (sks_code(m)) {
+    case SKS_LOAD_KEYBAG:
+        if (!sep_sks_validate_load_keybag_request(s, request,
+                                                  request_size)) {
+            return;
+        }
+        name = "load keybag (deterministic interoperability handle)";
+        payload_size = 2 * sizeof(uint32_t);
+        break;
     case SKS_NEGOTIATE:
         name = "negotiate IPC version";
         payload_size = 16;
@@ -1215,6 +1301,13 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
      * /tmp/dvm/probe/SKS_CTL.stderr.log:374-381: status zero followed by
      * offered version one.  Every unknown operation returns only status zero. */
     switch (sks_code(m)) {
+    case SKS_LOAD_KEYBAG:
+        stl_le_p(payload, 0);
+        stl_le_p(payload + sizeof(uint32_t), SKS_LOAD_KEYBAG_HANDLE);
+        fprintf(stderr, "sep(%s): sks op03 returns deterministic keybag "
+                "handle 0x%08x ('BAG1'); no SEP secret or persistent keybag "
+                "state is modeled\n", s->role, SKS_LOAD_KEYBAG_HANDLE);
+        break;
     case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
         stl_le_p(payload + 4, SKS_IPC_VERSION_1);
