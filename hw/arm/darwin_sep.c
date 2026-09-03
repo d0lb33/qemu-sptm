@@ -438,7 +438,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_CHECK_CLASS_LONG_TAG_OFF       0x64
 #define SKS_CHECK_CLASS_LONG_SIZE_OFF      0x68
 #define SKS_CHECK_CLASS_LONG_ZERO_OFF      0x70
-#define SKS_CHECK_CLASS_LONG_TAIL_OFF      0x74
+#define SKS_CHECK_CLASS_LONG_UUID_VALID_OFF 0x74
+#define SKS_CHECK_CLASS_LONG_UUID_OFF      0x76
+#define SKS_CHECK_CLASS_LONG_UUID_SIZE     16
+#define SKS_CHECK_CLASS_LONG_ZERO_TAIL_OFF 0x86
+#define SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE 6
 #define SKS_CHECK_CLASS_REQUEST_VARIANT    2
 #define SKS_CHECK_CLASS_SHORT_CLASS        1
 #define SKS_CHECK_CLASS_LONG_TAG           2
@@ -465,14 +469,17 @@ static const uint8_t sks_wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
     0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
 };
 
-/* The final 24 bytes are identical in every 0x8c-byte request captured during
- * DATA_SEED_FIRSTERR and DATA_SEED_VISIBLE.  The u32 at +0x6c varies between
- * calls and remains deliberately opaque. */
-static const uint8_t sks_check_class_long_tail[] = {
-    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
-    0x69, 0x64, 0x00, 0x00, 0x76, 0x6f, 0x6c, 0x75,
-    0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
+/* The 0x1c-byte tagged object in the long op10 request contains an opaque,
+ * per-volume UUID at +0x76.  Data and User requests prove that it cannot be
+ * matched as a constant: DATA_SEED_VISIBLE.stderr.log:1573..1582 carries
+ * 61706673-7575-6964-0001-766f6c756d01, while
+ * SKS_OP10_CAPTURE.stderr.log:710..719 carries
+ * 61706673-7575-6964-0002-766f6c756d02.  The surrounding u16 valid marker
+ * and six-byte zero tail are invariant and remain validated. */
+static const uint8_t sks_check_class_long_zero_tail[
+    SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE] = { 0 };
+static const uint8_t sks_check_class_zero_uuid[
+    SKS_CHECK_CLASS_LONG_UUID_SIZE] = { 0 };
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -1135,9 +1142,13 @@ static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) ==
             SKS_CHECK_CLASS_LONG_SIZE &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_ZERO_OFF) == 0 &&
-        !memcmp(request + SKS_CHECK_CLASS_LONG_TAIL_OFF,
-                sks_check_class_long_tail,
-                sizeof(sks_check_class_long_tail));
+        lduw_le_p(request + SKS_CHECK_CLASS_LONG_UUID_VALID_OFF) == 1 &&
+        memcmp(request + SKS_CHECK_CLASS_LONG_UUID_OFF,
+               sks_check_class_zero_uuid,
+               sizeof(sks_check_class_zero_uuid)) != 0 &&
+        !memcmp(request + SKS_CHECK_CLASS_LONG_ZERO_TAIL_OFF,
+                sks_check_class_long_zero_tail,
+                sizeof(sks_check_class_long_zero_tail));
 
     if (!common_shape || (!short_shape && !long_shape)) {
         fprintf(stderr, "sep(%s): sks op10 rejected unsupported check-class "
