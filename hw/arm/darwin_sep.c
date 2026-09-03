@@ -1135,8 +1135,15 @@ static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) == 0 &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) == 0 &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF + 4) == 0;
+    /* The persistent-Data normal boot adds class 2 to the same long-form
+     * request already proven for classes 3 and 4.  It is the final request
+     * before the SKS timeout at /tmp/dvm/probe/
+     * PERSIST_NVME_ROLES_PREINIT_TZ1_BOOT1.stderr.log:1480.  Keep the other
+     * shape checks intact so this does not broaden any selector, object, or
+     * UUID semantics. */
     long_shape = request_size == SKS_CHECK_CLASS_REQUEST_SIZE &&
-        (protection_class == 3 || protection_class == 4) &&
+        (protection_class == 2 || protection_class == 3 ||
+         protection_class == 4) &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) ==
             SKS_CHECK_CLASS_LONG_TAG &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) ==
