@@ -356,7 +356,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * this code plus the reply bit; byte 2 is a request ID. */
 #define SKS_LOAD_KEYBAG 0x03
 #define SKS_CHANGE_LOCK_STATE 0x04
-#define SKS_SELECTOR2_CLASS_QUERY 0x09
+#define SKS_UNWRAP_FILE_KEY 0x09
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
 #define SKS_MIGRATE_MEDIA_KEY_TO_CLASS 0x0f
@@ -486,33 +486,42 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_CHECK_CLASS_RESPONSE_SCALAR1_OFF 60
 
 /*
- * Opcode 0x09's only observed iOS 27 request is the 0x20-byte native
- * descriptor selected at 0xfffffff0081085b0.  The post decoder at
- * 0xfffffff009557430..0xfffffff0095574b8 consumes the selector-2 response
- * below.
- * SKS_OP09_CAPTURE_1.stderr.log records 52 byte-identical payload shapes;
- * all request class fields are 4.  Keep every invariant strict, including
- * the class, until a different shape is captured.
+ * Opcode 0x09 is the filesystem file-key unwrap used by APFS.  Its only
+ * observed iOS 27 request is the 0x20-byte native descriptor selected at
+ * 0xfffffff0081085b0.  SKS_OP09_CAPTURE_1.stderr.log records 52
+ * byte-identical payload shapes; all request class fields are 4.  Keep every
+ * invariant strict, including the class, until a different shape is captured.
+ *
+ * The generated bridge at 0xfffffff00957b4c0 publishes two blob pointer/length
+ * pairs and a trailing scalar at 0xfffffff00957b5fc..0x957b668.  The live
+ * class-4 entry at runtime 0xfffffff029547ffc receives capacities 64 and 16
+ * bytes for the raw key and IV respectively
+ * (/tmp/dvm/FEXT_LLDB_1C.lldb.log:25..50).  Returning only { selector, scalar }
+ * made that bridge fail with 0xe00002bc at runtime 0xfffffff02957b5f0, which
+ * propagated directly to APFS at 0xfffffff02a95d9d8 (same log:66..119).
  */
-#define SKS_SELECTOR2_CLASS_REQUEST_SIZE       0x6c
-#define SKS_SELECTOR2_CLASS_VARIANT_OFF         0x4c
-#define SKS_SELECTOR2_CLASS_FIXED_ONE_OFF       0x50
-#define SKS_SELECTOR2_CLASS_FIXED_ZERO0_OFF     0x54
-#define SKS_SELECTOR2_CLASS_FIXED_MAX_OFF       0x58
-#define SKS_SELECTOR2_CLASS_FIXED_ZERO1_OFF     0x5c
-#define SKS_SELECTOR2_CLASS_CLASS_OFF           0x60
-#define SKS_SELECTOR2_CLASS_FIXED_ZERO2_OFF     0x64
-#define SKS_SELECTOR2_CLASS_OUTPUT_SELECTOR_OFF 0x68
-#define SKS_SELECTOR2_CLASS_VARIANT             1
-#define SKS_SELECTOR2_CLASS_CLASS               4
-#define SKS_SELECTOR2_REQUESTED_OUTPUT          2
+#define SKS_UNWRAP_FILE_KEY_REQUEST_SIZE       0x6c
+#define SKS_UNWRAP_FILE_KEY_VARIANT_OFF         0x4c
+#define SKS_UNWRAP_FILE_KEY_FIXED_ONE_OFF       0x50
+#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF     0x54
+#define SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF       0x58
+#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF     0x5c
+#define SKS_UNWRAP_FILE_KEY_CLASS_OFF           0x60
+#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF     0x64
+#define SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF 0x68
+#define SKS_UNWRAP_FILE_KEY_VARIANT             1
+#define SKS_UNWRAP_FILE_KEY_CLASS               4
+#define SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT    2
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR   2
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_FLAGS      0
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE 48
 
 /*
  * The op19 wrapper at 0xfffffff00957c36c/0xfffffff00957c458 emits a
  * 0x14-byte payload.  Its context and signed state argument vary (live
  * captures include -6 and 'BAG1'), while selector 0 and the trailing zero
- * are invariant.  Its generated reply is the same 8-byte selector-2 union
- * as op09: { le32 selector = 2, le32 scalar = 0 }.
+ * are invariant.  Its generated reply is an 8-byte selector-2 scalar union:
+ * { le32 selector = 2, le32 scalar = 0 }.
  */
 #define SKS_GET_DEVICE_STATE_REQUEST_SIZE       0x60
 #define SKS_GET_DEVICE_STATE_SELECTOR_OFF       0x4c
@@ -520,9 +529,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_GET_DEVICE_STATE_STATE_OFF          0x58
 #define SKS_GET_DEVICE_STATE_TRAILING_ZERO_OFF  0x5c
 #define SKS_GET_DEVICE_STATE_REQUEST_SELECTOR   0
-#define SKS_SELECTOR2_RESPONSE_PAYLOAD_SIZE     8
-#define SKS_SELECTOR2_RESPONSE_SELECTOR         2
-#define SKS_SELECTOR2_RESPONSE_SCALAR           0
+#define SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE 8
+#define SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR     2
+#define SKS_GET_DEVICE_STATE_RESPONSE_SCALAR       0
 
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
     0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
@@ -1298,7 +1307,7 @@ static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
     return true;
 }
 
-static bool sep_sks_validate_selector2_class_request(
+static bool sep_sks_validate_unwrap_file_key_request(
     DarwinSEPState *s, const uint8_t *request, uint32_t request_size)
 {
     uint32_t header_body_size = 0;
@@ -1311,36 +1320,36 @@ static bool sep_sks_validate_selector2_class_request(
         header_body_size = ldl_le_p(request);
         ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
     }
-    if (request_size == SKS_SELECTOR2_CLASS_REQUEST_SIZE) {
-        variant = ldl_le_p(request + SKS_SELECTOR2_CLASS_VARIANT_OFF);
+    if (request_size == SKS_UNWRAP_FILE_KEY_REQUEST_SIZE) {
+        variant = ldl_le_p(request + SKS_UNWRAP_FILE_KEY_VARIANT_OFF);
         protection_class =
-            ldl_le_p(request + SKS_SELECTOR2_CLASS_CLASS_OFF);
+            ldl_le_p(request + SKS_UNWRAP_FILE_KEY_CLASS_OFF);
         output_selector =
-            ldl_le_p(request + SKS_SELECTOR2_CLASS_OUTPUT_SELECTOR_OFF);
+            ldl_le_p(request + SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF);
     }
 
-    if (request_size != SKS_SELECTOR2_CLASS_REQUEST_SIZE ||
+    if (request_size != SKS_UNWRAP_FILE_KEY_REQUEST_SIZE ||
         header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
         ipc_version != SKS_IPC_VERSION_1 ||
-        variant != SKS_SELECTOR2_CLASS_VARIANT ||
-        ldl_le_p(request + SKS_SELECTOR2_CLASS_FIXED_ONE_OFF) != 1 ||
-        ldl_le_p(request + SKS_SELECTOR2_CLASS_FIXED_ZERO0_OFF) != 0 ||
-        ldl_le_p(request + SKS_SELECTOR2_CLASS_FIXED_MAX_OFF) != UINT32_MAX ||
-        ldl_le_p(request + SKS_SELECTOR2_CLASS_FIXED_ZERO1_OFF) != 0 ||
-        protection_class != SKS_SELECTOR2_CLASS_CLASS ||
-        ldl_le_p(request + SKS_SELECTOR2_CLASS_FIXED_ZERO2_OFF) != 0 ||
-        output_selector != SKS_SELECTOR2_REQUESTED_OUTPUT) {
-        fprintf(stderr, "sep(%s): sks op09 rejected unsupported selector-2 "
-                "class shape: request %u header 0x%x version %u variant %u "
+        variant != SKS_UNWRAP_FILE_KEY_VARIANT ||
+        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ONE_OFF) != 1 ||
+        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF) != 0 ||
+        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF) != UINT32_MAX ||
+        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF) != 0 ||
+        protection_class != SKS_UNWRAP_FILE_KEY_CLASS ||
+        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF) != 0 ||
+        output_selector != SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT) {
+        fprintf(stderr, "sep(%s): sks op09 rejected unsupported filesystem "
+                "unwrap shape: request %u header 0x%x version %u variant %u "
                 "class %u output selector %u; no reply\n", s->role,
                 request_size, header_body_size, ipc_version, variant,
                 protection_class, output_selector);
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks op09 accepted request length %u variant "
-            "%u class %u output selector %u\n", s->role, request_size,
-            variant, protection_class, output_selector);
+    fprintf(stderr, "sep(%s): sks op09 accepted filesystem unwrap request "
+            "length %u variant %u class %u output selector %u\n", s->role,
+            request_size, variant, protection_class, output_selector);
     return true;
 }
 
@@ -1466,19 +1475,18 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         name = "change lock state (captured zero-output contract)";
         payload_size = SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE;
         break;
-    case SKS_SELECTOR2_CLASS_QUERY:
+    case SKS_UNWRAP_FILE_KEY:
         /*
-         * The native descriptor at 0xfffffff0081085b0 produces the exact
-         * 0x6c-byte request validated here.  Its post decoder at
-         * 0xfffffff009557430..0xfffffff0095574b8 selects an 8-byte union
-         * response.
+         * The bridge at 0xfffffff00957b4c0 consumes a selector-2 union with
+         * two length-prefixed blobs and a scalar, then publishes both blob
+         * pointer/length pairs at 0xfffffff00957b5fc..0x957b668.
          */
-        if (!sep_sks_validate_selector2_class_request(s, request,
+        if (!sep_sks_validate_unwrap_file_key_request(s, request,
                                                        request_size)) {
             return;
         }
-        name = "selector-2 class query";
-        payload_size = SKS_SELECTOR2_RESPONSE_PAYLOAD_SIZE;
+        name = "unwrap filesystem file key (fake-key mode)";
+        payload_size = SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE;
         break;
     case SKS_NEGOTIATE:
         name = "negotiate IPC version";
@@ -1527,7 +1535,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
             return;
         }
         name = "get device state (selector-2 scalar reply)";
-        payload_size = SKS_SELECTOR2_RESPONSE_PAYLOAD_SIZE;
+        payload_size = SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE;
         break;
     case SKS_NEW_MEDIA_KEY:
         /* The generated IPC decoder at 0xfffffff00957d6f8..0x957d7a8
@@ -1585,16 +1593,45 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
                 SKS_IPC_V1_HEADER_SIZE +
                     SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE);
         break;
-    case SKS_SELECTOR2_CLASS_QUERY:
-    case SKS_GET_DEVICE_STATE:
-        stl_le_p(payload, SKS_SELECTOR2_RESPONSE_SELECTOR);
-        stl_le_p(payload + sizeof(uint32_t), SKS_SELECTOR2_RESPONSE_SCALAR);
-        fprintf(stderr, "sep(%s): sks op%02x returns selector %u scalar %u "
-                "in an %u-byte IPC v1 reply\n", s->role, sks_code(m),
-                SKS_SELECTOR2_RESPONSE_SELECTOR,
-                SKS_SELECTOR2_RESPONSE_SCALAR,
+    case SKS_UNWRAP_FILE_KEY: {
+        uint32_t off = 0;
+
+        stl_le_p(payload + off, SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR);
+        off += sizeof(uint32_t);
+        stl_le_p(payload + off, SKS_FILE_KEY_SIZE);
+        off += sizeof(uint32_t);
+        memcpy(payload + off, sks_media_key, SKS_FILE_KEY_SIZE);
+        off += SKS_FILE_KEY_SIZE;
+        stl_le_p(payload + off, SKS_FILE_KEY_SIZE);
+        off += sizeof(uint32_t);
+        /*
+         * Keep the IV deterministic and distinct from the file key by using
+         * the next 16 bytes of the established stable fake-key material.
+         */
+        memcpy(payload + off, sks_media_key + SKS_FILE_KEY_SIZE,
+               SKS_FILE_KEY_SIZE);
+        off += SKS_FILE_KEY_SIZE;
+        stl_le_p(payload + off, SKS_UNWRAP_FILE_KEY_RESPONSE_FLAGS);
+        off += sizeof(uint32_t);
+        g_assert(off == SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE);
+        fprintf(stderr, "sep(%s): sks op09 supplies %u-byte file key and "
+                "%u-byte IV with flags 0 through selector %u in a %u-byte "
+                "IPC v1 reply\n", s->role, SKS_FILE_KEY_SIZE,
+                SKS_FILE_KEY_SIZE, SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR,
                 SKS_IPC_V1_HEADER_SIZE +
-                    SKS_SELECTOR2_RESPONSE_PAYLOAD_SIZE);
+                    SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE);
+        break;
+    }
+    case SKS_GET_DEVICE_STATE:
+        stl_le_p(payload, SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR);
+        stl_le_p(payload + sizeof(uint32_t),
+                 SKS_GET_DEVICE_STATE_RESPONSE_SCALAR);
+        fprintf(stderr, "sep(%s): sks op19 returns selector %u scalar %u "
+                "in an %u-byte IPC v1 reply\n", s->role,
+                SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR,
+                SKS_GET_DEVICE_STATE_RESPONSE_SCALAR,
+                SKS_IPC_V1_HEADER_SIZE +
+                    SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
         break;
     case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
