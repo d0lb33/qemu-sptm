@@ -355,6 +355,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * negotiation, and 0xfffffff00955eb84 passes 0x2a for set_env.  Byte 1 holds
  * this code plus the reply bit; byte 2 is a request ID. */
 #define SKS_LOAD_KEYBAG 0x03
+#define SKS_CHANGE_LOCK_STATE 0x04
 #define SKS_SELECTOR2_CLASS_QUERY 0x09
 #define SKS_NEGOTIATE  0x4d
 #define SKS_SET_ENV    0x2a
@@ -380,6 +381,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_LOAD_KEYBAG_VARIANT       0
 #define SKS_LOAD_KEYBAG_UUID_SIZE     16
 #define SKS_LOAD_KEYBAG_HANDLE        0x42414731u /* 'BAG1' */
+
+/*
+ * Change Lock State's iOS 27 wrapper is fcn.fffffff00957b058.  It seeds the
+ * request inputs at 0xfffffff00957b0d4..0xfffffff00957b0e8 and invokes IPC
+ * opcode 4 at 0xfffffff00957b0ec..0xfffffff00957b0f8.  The live request at
+ * /tmp/dvm/probe/SKS_OP09_CAPTURE_1.stderr.log:707..737 has the exact body
+ * described below.  The success path consumes a u32 output at
+ * 0xfffffff00957b104..0xfffffff00957b10c and a u64 output at
+ * 0xfffffff00957b110..0xfffffff00957b118.  Keep the opaque token and every
+ * other captured field strict until another native request shape is proven.
+ */
+#define SKS_CHANGE_LOCK_STATE_REQUEST_SIZE       0x6c
+#define SKS_CHANGE_LOCK_STATE_SELECTOR_OFF       0x4c
+#define SKS_CHANGE_LOCK_STATE_TOKEN_OFF          0x50
+#define SKS_CHANGE_LOCK_STATE_FIXED_ZERO_OFF     0x58
+#define SKS_CHANGE_LOCK_STATE_FIXED_MAX_OFF      0x5c
+#define SKS_CHANGE_LOCK_STATE_ZERO_TAIL_OFF       0x60
+#define SKS_CHANGE_LOCK_STATE_ZERO_TAIL_SIZE      12
+#define SKS_CHANGE_LOCK_STATE_REQUEST_SELECTOR    1
+#define SKS_CHANGE_LOCK_STATE_TOKEN               UINT64_C(0xbe3138e73ca977e1)
+#define SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE       16
+#define SKS_CHANGE_LOCK_STATE_RESPONSE_SELECTOR   0
 
 /* fs_new_media_key's first output is the live CPX key: the bridge stores it at
  * descriptor +0/+8 (0xfffffff00957789c..0x95778b8), and APFS passes that
@@ -521,6 +544,8 @@ static const uint8_t sks_check_class_long_zero_tail[
     SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE] = { 0 };
 static const uint8_t sks_check_class_zero_uuid[
     SKS_CHECK_CLASS_LONG_UUID_SIZE] = { 0 };
+static const uint8_t sks_change_lock_state_zero_tail[
+    SKS_CHANGE_LOCK_STATE_ZERO_TAIL_SIZE] = { 0 };
 
 // Length, in bits, that GENERATE_NONCE reports. Both public models use 160;
 // AppleSEPBooter::generateROMNonce checks the reply against NONCE_BIT_LEN
@@ -1074,6 +1099,51 @@ static bool sep_sks_validate_load_keybag_request(DarwinSEPState *s,
     return true;
 }
 
+static bool sep_sks_validate_change_lock_state_request(
+    DarwinSEPState *s, const uint8_t *request, uint32_t request_size)
+{
+    uint32_t header_body_size = 0;
+    uint32_t ipc_version = 0;
+    uint32_t selector = UINT32_MAX;
+    uint64_t token = 0;
+    uint32_t fixed_zero = UINT32_MAX;
+    uint32_t fixed_max = 0;
+
+    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
+        header_body_size = ldl_le_p(request);
+        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
+    }
+    if (request_size == SKS_CHANGE_LOCK_STATE_REQUEST_SIZE) {
+        selector = ldl_le_p(request + SKS_CHANGE_LOCK_STATE_SELECTOR_OFF);
+        token = ldq_le_p(request + SKS_CHANGE_LOCK_STATE_TOKEN_OFF);
+        fixed_zero =
+            ldl_le_p(request + SKS_CHANGE_LOCK_STATE_FIXED_ZERO_OFF);
+        fixed_max = ldl_le_p(request + SKS_CHANGE_LOCK_STATE_FIXED_MAX_OFF);
+    }
+
+    if (request_size != SKS_CHANGE_LOCK_STATE_REQUEST_SIZE ||
+        header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
+        ipc_version != SKS_IPC_VERSION_1 ||
+        selector != SKS_CHANGE_LOCK_STATE_REQUEST_SELECTOR ||
+        token != SKS_CHANGE_LOCK_STATE_TOKEN || fixed_zero != 0 ||
+        fixed_max != UINT32_MAX ||
+        memcmp(request + SKS_CHANGE_LOCK_STATE_ZERO_TAIL_OFF,
+               sks_change_lock_state_zero_tail,
+               sizeof(sks_change_lock_state_zero_tail))) {
+        fprintf(stderr, "sep(%s): sks op04 rejected unsupported change-lock-"
+                "state shape: request %u header 0x%x version %u selector %u "
+                "token 0x%016" PRIx64 " zero 0x%x max 0x%x; no reply\n",
+                s->role, request_size, header_body_size, ipc_version,
+                selector, token, fixed_zero, fixed_max);
+        return false;
+    }
+
+    fprintf(stderr, "sep(%s): sks op04 accepted request length %u selector "
+            "%u token 0x%016" PRIx64 "\n", s->role, request_size,
+            selector, token);
+    return true;
+}
+
 static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
                                              const uint8_t *request,
                                              uint32_t request_size)
@@ -1375,6 +1445,14 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         name = "load keybag (deterministic interoperability handle)";
         payload_size = 2 * sizeof(uint32_t);
         break;
+    case SKS_CHANGE_LOCK_STATE:
+        if (!sep_sks_validate_change_lock_state_request(s, request,
+                                                         request_size)) {
+            return;
+        }
+        name = "change lock state (captured zero-output contract)";
+        payload_size = SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE;
+        break;
     case SKS_SELECTOR2_CLASS_QUERY:
         /*
          * The native descriptor at 0xfffffff0081085b0 produces the exact
@@ -1483,6 +1561,16 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         fprintf(stderr, "sep(%s): sks op03 returns deterministic keybag "
                 "handle 0x%08x ('BAG1'); no SEP secret or persistent keybag "
                 "state is modeled\n", s->role, SKS_LOAD_KEYBAG_HANDLE);
+        break;
+    case SKS_CHANGE_LOCK_STATE:
+        stl_le_p(payload, SKS_CHANGE_LOCK_STATE_RESPONSE_SELECTOR);
+        stl_le_p(payload + sizeof(uint32_t), 0);
+        stq_le_p(payload + 2 * sizeof(uint32_t), 0);
+        fprintf(stderr, "sep(%s): sks op04 returns selector %u, u32 output "
+                "0, and u64 output 0 in a %u-byte IPC v1 reply\n", s->role,
+                SKS_CHANGE_LOCK_STATE_RESPONSE_SELECTOR,
+                SKS_IPC_V1_HEADER_SIZE +
+                    SKS_CHANGE_LOCK_STATE_RESPONSE_SIZE);
         break;
     case SKS_SELECTOR2_CLASS_QUERY:
     case SKS_GET_DEVICE_STATE:
