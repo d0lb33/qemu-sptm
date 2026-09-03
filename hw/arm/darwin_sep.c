@@ -489,8 +489,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * Opcode 0x09 is the filesystem file-key unwrap used by APFS.  Its only
  * observed iOS 27 request is the 0x20-byte native descriptor selected at
  * 0xfffffff0081085b0.  SKS_OP09_CAPTURE_1.stderr.log records 52
- * byte-identical payload shapes; all request class fields are 4.  Keep every
- * invariant strict, including the class, until a different shape is captured.
+ * byte-identical payload shapes; the initial mount requests use class 4.
+ * Later userspace emits the same request with class 3 as the first unanswered
+ * SKS message after Early Boot Complete
+ * (/tmp/dvm/probe/PERSIST_DCP_OP09_FIXED_3.stderr.log:698).  The same class-3
+ * boundary is independently present in the storage-only cold boot at
+ * /tmp/dvm/probe/SKS_OP09_COMPLETE_2.stderr.log:511.  Accept only these two
+ * observed protection classes while keeping every other invariant strict.
  *
  * The selector-2 codec at 0xfffffff0095619e8..0x9561a4c calls the blob helper
  * at 0xfffffff00957f830 three times, then the scalar helper at
@@ -516,7 +521,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF     0x64
 #define SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF 0x68
 #define SKS_UNWRAP_FILE_KEY_VARIANT             1
-#define SKS_UNWRAP_FILE_KEY_CLASS               4
+#define SKS_UNWRAP_FILE_KEY_CLASS_C             3
+#define SKS_UNWRAP_FILE_KEY_CLASS_D             4
 #define SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT    2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR   2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_THIRD_BLOB_SIZE 0
@@ -1343,7 +1349,8 @@ static bool sep_sks_validate_unwrap_file_key_request(
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF) != 0 ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF) != UINT32_MAX ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF) != 0 ||
-        protection_class != SKS_UNWRAP_FILE_KEY_CLASS ||
+        (protection_class != SKS_UNWRAP_FILE_KEY_CLASS_C &&
+         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_D) ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF) != 0 ||
         output_selector != SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT) {
         fprintf(stderr, "sep(%s): sks op09 rejected unsupported filesystem "
