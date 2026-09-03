@@ -356,9 +356,61 @@ static void rtk_handle_mgmt(DarwinASCState *s, uint64_t msg) {
     }
 }
 
+/*
+ * RTBuddyTraceKitEndpoint, endpoint 0x0a. The AP-side protocol was read out of
+ * RTBuddyTraceKitEndpoint.cpp in the iOS 27 kernelcache (com.apple.driver.RTBuddy,
+ * unslid addresses): the message type is bits [55:52] of the mailbox word
+ * (`ubfx x1, x2, #0x34, #4` in _messageHandler at 0xfffffff00a7dec68).
+ *
+ *   AP -> IOP                                   what the AP then does
+ *   0  host version, payload 1  (_hostVersionGated 0xa7e0c54)   nothing, no reply awaited
+ *   1  flush                    (_flushGated 0xa7dfa14)         outstanding++, sleeps
+ *   2/3 disable/enable          (_enableGated 0xa7df7d0)        busy-ACK wait on +0xac
+ *   4  configure, cfg in [46:0], kind in [51:47] (0xa7e0738)    busy-ACK wait, then
+ *                                                               requires _stateIOP == 1
+ *   IOP -> AP (handler cases)
+ *   0  flush complete: clears the flush flag, outstanding--
+ *   1/2  _stateIOP = 2 / 3, wake        3  _stateIOP = (payload != 0), wake
+ *   4  _stateIOP = 0, wake
+ *
+ * Without these replies every RTBuddy instance's boot-time power-on transition
+ * parks in RTBuddyTraceKitEndpoint::_waitForOutstandingRequestsGated holding
+ * _powerStateChangeLocked, and the DCP can never be powered off or on again
+ * (docs/re/setup-launch-runtime.md, "The RTBuddy transition that never ended").
+ */
+#define TK_TYPE(m)  (((m) >> 52) & 0xf)
+#define TK_MSG(t)   ((uint64_t)(t) << 52)
+
+static void rtk_handle_tracekit(DarwinASCState *s, uint64_t msg) {
+    unsigned type = TK_TYPE(msg);
+    uint64_t reply;
+    switch (type) {
+    case 0:
+        fprintf(stderr, "asc(%s): tracekit host version %" PRIu64 " (no reply awaited)\n", s->role, msg & 0xffffffffff);
+        return;
+    case 1:
+        reply = TK_MSG(0);              // flush complete
+        break;
+    case 2:
+    case 3:
+    case 4:
+        reply = TK_MSG(3) | 1;          // _stateIOP = Configured
+        break;
+    default:
+        fprintf(stderr, "asc(%s): tracekit AP -> IOP type %u 0x%016" PRIx64 " (unhandled)\n", s->role, type, msg);
+        return;
+    }
+    fprintf(stderr, "asc(%s): tracekit AP -> IOP type %u 0x%016" PRIx64 ", reply 0x%016" PRIx64 "\n", s->role, type, msg, reply);
+    darwin_asc_send(DEVICE(s), EP_TRACEKIT, reply);
+}
+
 static void rtk_receive(DarwinASCState *s, uint8_t ep, uint64_t msg) {
     if (ep == EP_MGMT) {
         rtk_handle_mgmt(s, msg);
+        return;
+    }
+    if (ep == EP_TRACEKIT) {
+        rtk_handle_tracekit(s, msg);
         return;
     }
     if (s->ops && s->ops->handle && s->ops->handle(s->opaque, ep, msg)) {
