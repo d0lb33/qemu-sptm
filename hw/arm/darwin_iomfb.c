@@ -153,10 +153,16 @@
  *
  * Tracing and knobs: DARWIN_DCP_IOMFB selects the level (see
  * darwin_iomfb.h); DARWIN_DCP_IOMFB_DEBUG=1 adds a hexdump of every RPC
- * request and reply body; DARWIN_DCP_IOMFB_OUT='A401=01,...' substitutes
- * canned output bytes for one FourCC so a probe can test a hypothesis
- * without a rebuild. Level 4 is that same mechanism with the answers a
- * measurement has already justified (see iomfb_level4[]).
+ * request and reply body. DARWIN_DCP_IOMFB_RPC_TRACE=1 is the narrower
+ * reverse-engineering trace: every AP-originated call gets one context line
+ * with its slot, heap/request DVAs and lengths, while the first occurrence of
+ * each exact request body gets a bounded sparse input dump. This is intended
+ * to identify this build's real swap-submit method and its surf_iova field
+ * without assuming that Mac-era method IDs or layouts survived on iOS.
+ * DARWIN_DCP_IOMFB_OUT='A401=01,...' substitutes canned output bytes for one
+ * FourCC so a probe can test a hypothesis without a rebuild. Level 4 is that
+ * same mechanism with the answers a measurement has already justified (see
+ * iomfb_level4[]).
  * DARWIN_DCP_IOMFB_CB='D000,D003:00000000:14' scripts outbound callbacks and
  * DARWIN_DCP_IOMFB_CB_AFTER names what starts the script. Every line is
  * prefixed "iomfb:", which tools/probe.sh filters on.
@@ -200,6 +206,10 @@
 #define IOMFB_AP_REQ_BASE 0x00000u      /* str x16,[x17,#8]  @ 0xa0cf664 */
 #define IOMFB_CB_REQ_BASE 0x40000u      /* str x15,[x17,#0x18] @ 0xa0cf6cc */
 
+/* At most 64 sparse rows (1024 input bytes) are printed per unique request. */
+#define IOMFB_TRACE_ROW_BYTES 16u
+#define IOMFB_TRACE_ROWS_MAX  64u
+
 /*
  * crc32(0, {0xd3,0,0,0}, 4). See step 2 above: the AP recomputes this from
  * its own __DATA on every class-1 message and compares it 32-bit, so it is a
@@ -220,6 +230,7 @@ struct DarwinIOMFB {
     unsigned sid;
     unsigned level;
     bool debug;
+    bool rpc_trace;
 
     /* The AP's shared heap, from the class-0/subkind-1 announce. */
     bool heap_known;
@@ -227,6 +238,15 @@ struct DarwinIOMFB {
 
     bool dma_warned;    /* one DART complaint per boot, not one per message */
     uint64_t rpcs;
+
+    /*
+     * Exact request signatures seen by DARWIN_DCP_IOMFB_RPC_TRACE. Keys are
+     * {RPC header,input bytes}; values are occurrence counters. Exact keys
+     * avoid a digest collision hiding a genuinely new body. The table lives
+     * for one VM, so a repeat can retain its compact context line without
+     * reproducing a potentially large dump on every frame.
+     */
+    GHashTable *rpc_trace_seen; /* GBytes* -> uint64_t* */
 
     /*
      * Experiment harness, DARWIN_DCP_IOMFB_OUT. The default answer to every
@@ -336,6 +356,91 @@ static void iomfb_hexdump(const char *what, const uint8_t *p, uint32_t len) {
         }
         fprintf(stderr, "iomfb:   %s +%04x: %s\n", what, i, line);
     }
+}
+
+/*
+ * Print only 16-byte input rows containing a non-zero byte. For a large,
+ * dense request retain both ends (32 rows each): surface descriptors tend to
+ * live near the front while address arrays can live near the tail. The cap
+ * and selection are deterministic, and the summary says exactly what was
+ * omitted so the trace cannot be mistaken for a complete body.
+ */
+static void iomfb_trace_sparse_input(const uint8_t *p, uint32_t len)
+{
+    g_autoptr(GArray) rows = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    uint32_t nonzero_bytes = 0;
+
+    for (uint32_t off = 0; off < len; off += IOMFB_TRACE_ROW_BYTES) {
+        uint32_t end = MIN(len, off + IOMFB_TRACE_ROW_BYTES);
+        bool any = false;
+
+        for (uint32_t i = off; i < end; i++) {
+            if (p[i]) {
+                any = true;
+                nonzero_bytes++;
+            }
+        }
+        if (any) {
+            g_array_append_val(rows, off);
+        }
+    }
+
+    uint32_t shown = MIN(rows->len, IOMFB_TRACE_ROWS_MAX);
+    fprintf(stderr, "iomfb: TRACE   input len 0x%x nonzero-bytes %u "
+            "nonzero-rows %u shown %u omitted %u\n",
+            len, nonzero_bytes, rows->len, shown, rows->len - shown);
+
+    for (uint32_t n = 0; n < shown; n++) {
+        uint32_t row_index;
+
+        if (rows->len <= IOMFB_TRACE_ROWS_MAX ||
+            n < IOMFB_TRACE_ROWS_MAX / 2) {
+            row_index = n;
+        } else {
+            row_index = rows->len - (IOMFB_TRACE_ROWS_MAX - n);
+        }
+
+        uint32_t off = g_array_index(rows, uint32_t, row_index);
+        uint32_t end = MIN(len, off + IOMFB_TRACE_ROW_BYTES);
+        char line[3 * IOMFB_TRACE_ROW_BYTES + 1];
+        int pos = 0;
+
+        for (uint32_t i = off; i < end; i++) {
+            pos += snprintf(line + pos, sizeof(line) - pos, "%02x ", p[i]);
+        }
+        fprintf(stderr, "iomfb: TRACE   in-nz +0x%04x: %s\n", off, line);
+    }
+}
+
+/*
+ * Return this exact request body's occurrence count. A complete bytewise key
+ * is used instead of a hash-only key so tracing never suppresses a distinct
+ * layout because of a collision. The caller still emits one context line for
+ * every RPC; only duplicate body dumps are suppressed.
+ */
+static uint64_t iomfb_trace_occurrence(DarwinIOMFB *m,
+                                       const IOMFBRpcHdr *h,
+                                       const uint8_t *input,
+                                       uint32_t input_len)
+{
+    GByteArray *key_bytes = g_byte_array_sized_new(sizeof(*h) + input_len);
+    g_byte_array_append(key_bytes, (const uint8_t *)h, sizeof(*h));
+    if (input_len) {
+        g_byte_array_append(key_bytes, input, input_len);
+    }
+    GBytes *key = g_byte_array_free_to_bytes(key_bytes);
+    uint64_t *count = g_hash_table_lookup(m->rpc_trace_seen, key);
+
+    if (count) {
+        (*count)++;
+        g_bytes_unref(key);
+        return *count;
+    }
+
+    count = g_new(uint64_t, 1);
+    *count = 1;
+    g_hash_table_insert(m->rpc_trace_seen, key, count);
+    return 1;
 }
 
 /*
@@ -824,6 +929,41 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             ep, m->rpcs, name, h.name, h.in_len, h.out_len, off, size,
             IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
 
+    if (m->rpc_trace) {
+        /*
+         * Do not read past the message if a malformed header overstates its
+         * input. Keep the claimed lengths in the context line so malformed
+         * traffic remains diagnosable, and mark how many input bytes were
+         * actually available to the tracer.
+         */
+        uint32_t input_available = size - sizeof(h);
+        uint32_t input_len = MIN(h.in_len, input_available);
+        unsigned slot = tag % IOMFB_TAGS;
+        uint32_t window_off = IOMFB_AP_REQ_BASE + slot * IOMFB_WINDOW;
+        uint64_t request_dva = win + off;
+        uint64_t input_dva = request_dva + sizeof(h);
+        uint64_t output_dva = input_dva + h.in_len;
+        uint64_t occurrence = iomfb_trace_occurrence(m, &h,
+                                                     buf + sizeof(h),
+                                                     input_len);
+
+        fprintf(stderr, "iomfb: TRACE AP->DCP rpc #%" PRIu64
+                " method '%s' fourcc 0x%08x slot %u tag %u ack %u flag9 %u "
+                "in %u (available %u) out %u total 0x%x occurrence #%" PRIu64
+                " body %s\n",
+                m->rpcs, name, h.name, slot, tag, IOMFB_ACK(msg),
+                IOMFB_FLAG9(msg), h.in_len, input_len, h.out_len, size,
+                occurrence, occurrence == 1 ? "follows" : "same-as-first");
+        fprintf(stderr, "iomfb: TRACE   heap-dva 0x%" PRIx64
+                " window heap+0x%x request-off 0x%x request-dva 0x%" PRIx64
+                " input-dva 0x%" PRIx64 " output-dva 0x%" PRIx64 "\n",
+                m->heap_dva, window_off, off, request_dva, input_dva,
+                output_dva);
+        if (occurrence == 1) {
+            iomfb_trace_sparse_input(buf + sizeof(h), input_len);
+        }
+    }
+
     /* The AP's own accounting: total = 0xc + in_len + out_len (0xa0ce4d8). */
     if ((uint64_t)sizeof(h) + h.in_len + h.out_len != size) {
         fprintf(stderr, "iomfb:   note: 0xc + in + out = 0x%" PRIx64 " but the message says "
@@ -949,12 +1089,21 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
                               unsigned level) {
     DarwinIOMFB *m = g_new0(DarwinIOMFB, 1);
     const char *dbg = getenv("DARWIN_DCP_IOMFB_DEBUG");
+    const char *trace = getenv("DARWIN_DCP_IOMFB_RPC_TRACE");
 
     m->asc = asc;
     m->dart = dart;
     m->sid = sid;
     m->level = level;
     m->debug = dbg && dbg[0] && dbg[0] != '0';
+    m->rpc_trace = trace && trace[0] && trace[0] != '0';
+    if (m->rpc_trace) {
+        m->rpc_trace_seen = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                                  (GDestroyNotify)g_bytes_unref,
+                                                  g_free);
+        fprintf(stderr, "iomfb: TRACE AP->DCP RPC tracing enabled by "
+                "DARWIN_DCP_IOMFB_RPC_TRACE\n");
+    }
 
     if (level >= 4) {
         for (size_t i = 0; i < ARRAY_SIZE(iomfb_level4); i++) {
