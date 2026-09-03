@@ -492,13 +492,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * byte-identical payload shapes; all request class fields are 4.  Keep every
  * invariant strict, including the class, until a different shape is captured.
  *
- * The generated bridge at 0xfffffff00957b4c0 publishes two blob pointer/length
- * pairs and a trailing scalar at 0xfffffff00957b5fc..0x957b668.  The live
- * class-4 entry at runtime 0xfffffff029547ffc receives capacities 64 and 16
- * bytes for the raw key and IV respectively
+ * The selector-2 codec at 0xfffffff0095619e8..0x9561a4c calls the blob helper
+ * at 0xfffffff00957f830 three times, then the scalar helper at
+ * 0xfffffff00957f7d8.  The generated bridge at 0xfffffff00957b4c0 publishes
+ * the first two blob pointer/length pairs and the trailing scalar at
+ * 0xfffffff00957b5fc..0x957b668.  The live class-4 entry at runtime
+ * 0xfffffff029547ffc receives capacities 64 and 16 bytes for the raw key and IV
+ * respectively
  * (/tmp/dvm/FEXT_LLDB_1C.lldb.log:25..50).  Returning only { selector, scalar }
  * made that bridge fail with 0xe00002bc at runtime 0xfffffff02957b5f0, which
  * propagated directly to APFS at 0xfffffff02a95d9d8 (same log:66..119).
+ * A 124-byte response was then observed consuming the third empty blob before
+ * reaching EOF at the scalar helper and returning -13
+ * (/tmp/dvm/SKS_OP09_DECODE_1.lldb.log:876..924,982..1060).
  */
 #define SKS_UNWRAP_FILE_KEY_REQUEST_SIZE       0x6c
 #define SKS_UNWRAP_FILE_KEY_VARIANT_OFF         0x4c
@@ -513,8 +519,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_UNWRAP_FILE_KEY_CLASS               4
 #define SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT    2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR   2
-#define SKS_UNWRAP_FILE_KEY_RESPONSE_FLAGS      0
-#define SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE 48
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_THIRD_BLOB_SIZE 0
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_SCALAR     0
+#define SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE 52
 
 /*
  * The op19 wrapper at 0xfffffff00957c36c/0xfffffff00957c458 emits a
@@ -1477,9 +1484,10 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         break;
     case SKS_UNWRAP_FILE_KEY:
         /*
-         * The bridge at 0xfffffff00957b4c0 consumes a selector-2 union with
-         * two length-prefixed blobs and a scalar, then publishes both blob
-         * pointer/length pairs at 0xfffffff00957b5fc..0x957b668.
+         * The codec at 0xfffffff0095619e8..0x9561a4c consumes a selector-2
+         * union with three length-prefixed blobs and a scalar.  The bridge
+         * publishes the first two blob pairs at
+         * 0xfffffff00957b5fc..0x957b668.
          */
         if (!sep_sks_validate_unwrap_file_key_request(s, request,
                                                        request_size)) {
@@ -1611,12 +1619,15 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         memcpy(payload + off, sks_media_key + SKS_FILE_KEY_SIZE,
                SKS_FILE_KEY_SIZE);
         off += SKS_FILE_KEY_SIZE;
-        stl_le_p(payload + off, SKS_UNWRAP_FILE_KEY_RESPONSE_FLAGS);
+        stl_le_p(payload + off,
+                 SKS_UNWRAP_FILE_KEY_RESPONSE_THIRD_BLOB_SIZE);
+        off += sizeof(uint32_t);
+        stl_le_p(payload + off, SKS_UNWRAP_FILE_KEY_RESPONSE_SCALAR);
         off += sizeof(uint32_t);
         g_assert(off == SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE);
         fprintf(stderr, "sep(%s): sks op09 supplies %u-byte file key and "
-                "%u-byte IV with flags 0 through selector %u in a %u-byte "
-                "IPC v1 reply\n", s->role, SKS_FILE_KEY_SIZE,
+                "%u-byte IV, empty third blob, and scalar 0 through selector "
+                "%u in a %u-byte IPC v1 reply\n", s->role, SKS_FILE_KEY_SIZE,
                 SKS_FILE_KEY_SIZE, SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR,
                 SKS_IPC_V1_HEADER_SIZE +
                     SKS_UNWRAP_FILE_KEY_RESPONSE_PAYLOAD_SIZE);
