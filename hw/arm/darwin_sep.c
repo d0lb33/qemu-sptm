@@ -533,8 +533,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * The op19 wrapper at 0xfffffff00957c36c/0xfffffff00957c458 emits a
  * 0x14-byte payload.  Its context and signed state argument vary (live
  * captures include -6 and 'BAG1'), while selector 0 and the trailing zero
- * are invariant.  Its generated reply is an 8-byte selector-2 scalar union:
- * { le32 selector = 2, le32 scalar = 0 }.
+ * are invariant.  The generated reply's normal-success arm is selector zero
+ * followed by a length-prefixed DER blob.  The direct consumer at
+ * 0xfffffff00956e6ac accepts decoded `bh` values -6 and -10.  Its parser
+ * descriptor uses the literal DER UTF8String `bh`, and the load/store at
+ * 0xfffffff0095812f0..0x95812f8 places that INTEGER at parsed-record offset
+ * +0x2a.  A SET with
+ * only that recognized field is the smallest bounded record that exercises
+ * the normal-success path; the parser initializes omitted fields to zero.
+ * The blob decoder at 0xfffffff00957f868..0x957f8dc rounds the blob body to
+ * four-byte alignment, so the nine DER bytes require three zero padding bytes.
  */
 #define SKS_GET_DEVICE_STATE_REQUEST_SIZE       0x60
 #define SKS_GET_DEVICE_STATE_SELECTOR_OFF       0x4c
@@ -542,9 +550,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_GET_DEVICE_STATE_STATE_OFF          0x58
 #define SKS_GET_DEVICE_STATE_TRAILING_ZERO_OFF  0x5c
 #define SKS_GET_DEVICE_STATE_REQUEST_SELECTOR   0
-#define SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE 8
-#define SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR     2
-#define SKS_GET_DEVICE_STATE_RESPONSE_SCALAR       0
+#define SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR     0
+#define SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE    9
+#define SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE 12
+#define SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE \
+    (2 * sizeof(uint32_t) + \
+     SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE)
+
+/* DER SET { UTF8String "bh", INTEGER -6 }. */
+static const uint8_t sks_device_state[SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE] = {
+    0x31, 0x07, 0x0c, 0x02, 'b', 'h', 0x02, 0x01, 0xfa,
+};
 
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
     0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
@@ -1549,7 +1565,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
                                                         request_size)) {
             return;
         }
-        name = "get device state (selector-2 scalar reply)";
+        name = "get device state (minimal DER normal-success reply)";
         payload_size = SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE;
         break;
     case SKS_NEW_MEDIA_KEY:
@@ -1643,11 +1659,17 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     case SKS_GET_DEVICE_STATE:
         stl_le_p(payload, SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR);
         stl_le_p(payload + sizeof(uint32_t),
-                 SKS_GET_DEVICE_STATE_RESPONSE_SCALAR);
-        fprintf(stderr, "sep(%s): sks op19 returns selector %u scalar %u "
-                "in an %u-byte IPC v1 reply\n", s->role,
+                 SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE);
+        memcpy(payload + 2 * sizeof(uint32_t), sks_device_state,
+               sizeof(sks_device_state));
+        memset(payload + 2 * sizeof(uint32_t) + sizeof(sks_device_state), 0,
+               SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE -
+                   sizeof(sks_device_state));
+        fprintf(stderr, "sep(%s): sks op19 returns selector %u with a "
+                "%u-byte DER device-state blob (bh=-6) in a %zu-byte "
+                "IPC v1 reply\n", s->role,
                 SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR,
-                SKS_GET_DEVICE_STATE_RESPONSE_SCALAR,
+                SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE,
                 SKS_IPC_V1_HEADER_SIZE +
                     SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
         break;
