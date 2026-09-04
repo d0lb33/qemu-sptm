@@ -31,6 +31,10 @@
 #include "xnu/darwin_sep.h"
 #include "xnu/darwin_ans.h"
 #include "xnu/darwin_unimp.h"
+#include "xnu/darwin_cpm.h"
+#include "xnu/darwin_boot_unlock.h"
+#include "xnu/darwin_pmgr.h"
+#include "xnu/darwin_gpio.h"
 
 // See device tree specification section 2.3.8: ranges
 #define IO_RANGE_BASE_OFFSET     1
@@ -362,6 +366,12 @@ static void darwin_init(MachineState *ms) {
     darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, n_claimed);
     init_sep(dt_root);
     init_cpu_impl(dt_root);
+    if (iboot_mode) {
+        darwin_cpm_bootstrap_init(dt_root, iobase);
+        darwin_boot_unlock_init(dt_root, iobase);
+        darwin_pmgr_iboot_init(dt_root, iobase);
+        darwin_gpio_iboot_init(dt_root, iobase);
+    }
 
     // M4 (T8132) asserts SME's max VQ len is this many.
     // Specifically, rdsvl   x8, #0x1 must return 0x40.
