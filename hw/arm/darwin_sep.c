@@ -481,33 +481,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * serial lines 1401-1418.
  * Pair each observed class with its exact volume identity; do not accept an
  * arbitrary tag or class/volume combination. */
-/* fs_check_class emits two live-captured selector-2 request shapes.  The
- * 0x70-byte class-1 query was already accepted on remount
- * (/tmp/dvm/probe/SKS_REMOUNT_V10.stderr.log:1912-1919).  The 0x8c-byte form
- * carries the requested protection class at wire +0x60 and is the form APFS
- * uses while creating protected named streams
- * (/tmp/dvm/probe/DATA_SEED_VISIBLE.stderr.log:1573-1585). */
-#define SKS_CHECK_CLASS_SHORT_REQUEST_SIZE 0x70
-#define SKS_CHECK_CLASS_REQUEST_SIZE       0x8c
-#define SKS_CHECK_CLASS_VARIANT_OFF        0x4c
-#define SKS_CHECK_CLASS_FIXED_ONE_OFF      0x50
-#define SKS_CHECK_CLASS_FIXED_ZERO0_OFF    0x54
-#define SKS_CHECK_CLASS_FIXED_MAX_OFF      0x58
-#define SKS_CHECK_CLASS_FIXED_ZERO1_OFF    0x5c
-#define SKS_CHECK_CLASS_REQUEST_CLASS_OFF  0x60
-#define SKS_CHECK_CLASS_LONG_TAG_OFF       0x64
-#define SKS_CHECK_CLASS_LONG_SIZE_OFF      0x68
-#define SKS_CHECK_CLASS_LONG_ZERO_OFF      0x70
-#define SKS_CHECK_CLASS_LONG_UUID_VALID_OFF 0x74
-#define SKS_CHECK_CLASS_LONG_UUID_OFF      0x76
-#define SKS_CHECK_CLASS_LONG_UUID_SIZE     16
-#define SKS_CHECK_CLASS_LONG_ZERO_TAIL_OFF 0x86
-#define SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE 6
-#define SKS_CHECK_CLASS_REQUEST_VARIANT    2
-#define SKS_CHECK_CLASS_SHORT_CLASS        1
-#define SKS_CHECK_CLASS_SPECIAL_CLASS      17
-#define SKS_CHECK_CLASS_LONG_TAG           2
-#define SKS_CHECK_CLASS_LONG_SIZE          0x1c
 #define SKS_CHECK_CLASS_RESPONSE_SCALAR0_OFF 56
 #define SKS_CHECK_CLASS_RESPONSE_SCALAR1_OFF 60
 
@@ -571,11 +544,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * 0xfffffff00956e6ac accepts decoded `bh` values -6 and -10.  Its parser
  * descriptor uses the literal DER UTF8String `bh`, and the load/store at
  * 0xfffffff0095812f0..0x95812f8 places that INTEGER at parsed-record offset
- * +0x2a.  A SET with
- * only that recognized field is the smallest bounded record that exercises
- * the normal-success path; the parser initializes omitted fields to zero.
- * The blob decoder at 0xfffffff00957f868..0x957f8dc rounds the blob body to
- * four-byte alignment, so the nine DER bytes require three zero padding bytes.
+ * +0x2a. Each key/value pair needs a SEQUENCE inside the outer SET. The
+ * previous nine-byte record lacked that wrapper and decoded as all zeros.
+ * darwin_sks_build_unlocked_device_state supplies the guest-validated
+ * 20-byte DER record with bh=-6 and ss=4 (first unlock has occurred).
  */
 #define SKS_GET_DEVICE_STATE_REQUEST_SIZE       0x60
 #define SKS_GET_DEVICE_STATE_SELECTOR_OFF       0x4c
@@ -583,17 +555,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_GET_DEVICE_STATE_STATE_OFF          0x58
 #define SKS_GET_DEVICE_STATE_TRAILING_ZERO_OFF  0x5c
 #define SKS_GET_DEVICE_STATE_REQUEST_SELECTOR   0
-#define SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR     0
-#define SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE    9
-#define SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE 12
 #define SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE \
-    (2 * sizeof(uint32_t) + \
-     SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE)
-
-/* DER SET { UTF8String "bh", INTEGER -6 }. */
-static const uint8_t sks_device_state[SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE] = {
-    0x31, 0x07, 0x0c, 0x02, 'b', 'h', 0x02, 0x01, 0xfa,
-};
+    DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE
 
 static const uint8_t sks_media_key[SKS_MEDIA_KEY_SIZE] = {
     0x44, 0x56, 0x4d, 0x2d, 0x53, 0x4b, 0x53, 0x2d,
@@ -621,10 +584,7 @@ static const uint8_t sks_wrapped_key[SKS_WRAPPED_KEY_SIZE] = {
  * SKS_OP10_CAPTURE.stderr.log:710..719 carries
  * 61706673-7575-6964-0002-766f6c756d02.  The surrounding u16 valid marker
  * and six-byte zero tail are invariant and remain validated. */
-static const uint8_t sks_check_class_long_zero_tail[
-    SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE] = { 0 };
-static const uint8_t sks_check_class_zero_uuid[
-    SKS_CHECK_CLASS_LONG_UUID_SIZE] = { 0 };
+
 static const uint8_t sks_change_lock_state_zero_tail[
     SKS_CHANGE_LOCK_STATE_ZERO_TAIL_SIZE] = { 0 };
 
@@ -1271,89 +1231,26 @@ static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
 }
 
 static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
-                                                 const uint8_t *request,
-                                                 uint32_t request_size,
-                                                 uint32_t *requested_class,
-                                                 bool *echo_class)
+                                                const uint8_t *request,
+                                                uint32_t request_size,
+                                                uint32_t *requested_class,
+                                                bool *echo_class)
 {
-    uint32_t header_body_size = 0;
-    uint32_t ipc_version = 0;
-    uint32_t variant = 0;
-    uint32_t protection_class = 0;
-    bool common_shape;
-    bool short_shape;
-    bool long_shape;
+    DarwinSKSCheckClassRequest parsed = { 0 };
 
-    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
-        header_body_size = ldl_le_p(request);
-        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
-    }
-    if (request_size >=
-        SKS_CHECK_CLASS_REQUEST_CLASS_OFF + sizeof(uint32_t)) {
-        variant = ldl_le_p(request + SKS_CHECK_CLASS_VARIANT_OFF);
-        protection_class =
-            ldl_le_p(request + SKS_CHECK_CLASS_REQUEST_CLASS_OFF);
-    }
-
-    common_shape = request_size >=
-            SKS_CHECK_CLASS_REQUEST_CLASS_OFF + sizeof(uint32_t) &&
-        header_body_size == SKS_IPC_V1_HEADER_BODY_SIZE &&
-        ipc_version == SKS_IPC_VERSION_1 &&
-        variant == SKS_CHECK_CLASS_REQUEST_VARIANT &&
-        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ONE_OFF) == 1 &&
-        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ZERO0_OFF) == 0 &&
-        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_MAX_OFF) == UINT32_MAX &&
-        ldl_le_p(request + SKS_CHECK_CLASS_FIXED_ZERO1_OFF) == 0;
-    short_shape = request_size == SKS_CHECK_CLASS_SHORT_REQUEST_SIZE &&
-        protection_class == SKS_CHECK_CLASS_SHORT_CLASS &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) == 0 &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) == 0 &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF + 4) == 0;
-    /* The persistent-Data normal boot adds class 2 to the same long-form
-     * request already proven for classes 3 and 4.  It is the final request
-     * before the SKS timeout at /tmp/dvm/probe/
-     * PERSIST_NVME_ROLES_PREINIT_TZ1_BOOT1.stderr.log:1480.  A later
-     * 600-second positive control crosses that boundary repeatedly, then
-     * reaches the same 140-byte variant-2 request with class 17 at
-     * ROOT_SKS_CLASS2_POS1.stderr.log:15157; its rejection alone begins the
-     * timeout sequence at serial lines 912-917.  The next boot reaches the
-     * same long form with class 1 at ROOT_SKS_CLASS17_POS1.stderr.log:74829,
-     * distinct from the already accepted class-1 short availability query;
-     * it alone starts the serial timeout at lines 892-894.  Keep every
-     * remaining shape check intact so none of these observations broadens
-     * selector, object, or UUID semantics. */
-    long_shape = request_size == SKS_CHECK_CLASS_REQUEST_SIZE &&
-        (protection_class == SKS_CHECK_CLASS_SHORT_CLASS ||
-         protection_class == 2 || protection_class == 3 ||
-         protection_class == 4 ||
-         protection_class == SKS_CHECK_CLASS_SPECIAL_CLASS) &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) ==
-            SKS_CHECK_CLASS_LONG_TAG &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) ==
-            SKS_CHECK_CLASS_LONG_SIZE &&
-        ldl_le_p(request + SKS_CHECK_CLASS_LONG_ZERO_OFF) == 0 &&
-        lduw_le_p(request + SKS_CHECK_CLASS_LONG_UUID_VALID_OFF) == 1 &&
-        memcmp(request + SKS_CHECK_CLASS_LONG_UUID_OFF,
-               sks_check_class_zero_uuid,
-               sizeof(sks_check_class_zero_uuid)) != 0 &&
-        !memcmp(request + SKS_CHECK_CLASS_LONG_ZERO_TAIL_OFF,
-                sks_check_class_long_zero_tail,
-                sizeof(sks_check_class_long_zero_tail));
-
-    if (!common_shape || (!short_shape && !long_shape)) {
+    if (!darwin_sks_parse_check_class_request(request, request_size, &parsed)) {
         fprintf(stderr, "sep(%s): sks op10 rejected unsupported check-class "
                 "shape: request %u header 0x%x version %u variant %u class "
-                "%u; no reply\n", s->role, request_size, header_body_size,
-                ipc_version, variant, protection_class);
+                "%u; no reply\n", s->role, request_size, parsed.header_body_size,
+                parsed.ipc_version, parsed.variant, parsed.protection_class);
         return false;
     }
-
-    *requested_class = protection_class;
-    *echo_class = long_shape;
+    *requested_class = parsed.protection_class;
+    *echo_class = parsed.echo_class;
     fprintf(stderr, "sep(%s): sks op10 accepted %s request length %u "
             "variant %u class %u\n", s->role,
-            long_shape ? "protected-object" : "availability", request_size,
-            variant, protection_class);
+            parsed.echo_class ? "protected-object" : "availability",
+            request_size, parsed.variant, parsed.protection_class);
     return true;
 }
 
@@ -1687,20 +1584,12 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         break;
     }
     case SKS_GET_DEVICE_STATE:
-        stl_le_p(payload, SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR);
-        stl_le_p(payload + sizeof(uint32_t),
-                 SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE);
-        memcpy(payload + 2 * sizeof(uint32_t), sks_device_state,
-               sizeof(sks_device_state));
-        memset(payload + 2 * sizeof(uint32_t) + sizeof(sks_device_state), 0,
-               SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE -
-                   sizeof(sks_device_state));
+        g_assert(darwin_sks_build_unlocked_device_state(payload, payload_size)
+                 == payload_size);
         if (s->sks_log_current) {
-            fprintf(stderr, "sep(%s): sks op19 returns selector %u with a "
-                    "%u-byte DER device-state blob (bh=-6) in a %zu-byte "
+            fprintf(stderr, "sep(%s): sks op19 returns selector 0 with a "
+                    "20-byte DER device-state blob (bh=-6 ss=4) in a %u-byte "
                     "IPC v1 reply\n", s->role,
-                    SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR,
-                    SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE,
                     SKS_IPC_V1_HEADER_SIZE +
                         SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
         }

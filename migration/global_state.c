@@ -104,7 +104,14 @@ static int global_state_post_load(void *opaque, int version_id)
         }
         return -EINVAL;
     }
-    s->state = r;
+    /*
+     * A checkpoint taken at a gdbstub breakpoint records "debug". The
+     * source debugger is not migrated, and INMIGRATE -> DEBUG is not a
+     * valid runstate transition. Preserve the stopped CPU boundary as a
+     * normal pause so a destination debugger can attach before execution.
+     * In particular, do not silently turn this into RUNNING.
+     */
+    s->state = r == RUN_STATE_DEBUG ? RUN_STATE_PAUSED : r;
 
     /*
      * global_state is saved on the outgoing side before forcing a stopped

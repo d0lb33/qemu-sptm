@@ -11,6 +11,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE 28
+
+size_t darwin_sks_build_unlocked_device_state(uint8_t *payload,
+                                              size_t capacity);
+
 typedef enum DarwinSKSMigrateShape {
     DARWIN_SKS_MIGRATE_INVALID = 0,
     DARWIN_SKS_MIGRATE_WRAPPED_KEY,
@@ -53,5 +58,17 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
 bool darwin_sks_parse_unwrap_file_key_request(
     const uint8_t *request, size_t request_size,
     DarwinSKSUnwrapFileKeyRequest *parsed);
+
+typedef struct DarwinSKSCheckClassRequest {
+    uint32_t header_body_size;
+    uint32_t ipc_version;
+    uint32_t variant;
+    uint32_t protection_class;
+    bool echo_class;
+} DarwinSKSCheckClassRequest;
+
+bool darwin_sks_parse_check_class_request(const uint8_t *request,
+                                         size_t request_size,
+                                         DarwinSKSCheckClassRequest *parsed);
 
 #endif

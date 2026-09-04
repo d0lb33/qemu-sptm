@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "hw/arm/darwin_sks.h"
 
 /* Exact 164-byte Data-volume request captured at
@@ -51,6 +52,116 @@ static const uint8_t captured_unwrap_request[] = {
     0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
     0x02, 0x00, 0x00, 0x00,
 };
+
+/* Exact User-volume class-1 request from DISPLAY_NATIVE_R2's frozen
+ * endpoint-18 OOL buffer, recovered in DISPLAY_SKS_CLASS1_R1. */
+static const uint8_t captured_user_class1_request[] = {
+    0x48, 0x00, 0x00, 0x00, 0x9b, 0xb2, 0xce, 0x30,
+    0x12, 0xfa, 0xf5, 0x6f, 0xe8, 0x0d, 0x99, 0x1f,
+    0x50, 0xb8, 0xfe, 0xac, 0x01, 0x00, 0x00, 0x00,
+    0x0b, 0xb5, 0xa1, 0x14, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xca, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2a, 0xf7, 0xdf, 0xf3, 0x82, 0x3e, 0x1c, 0xa5,
+    0x37, 0xce, 0xdb, 0x02, 0xac, 0x2d, 0xeb, 0x2e,
+    0x51, 0xb4, 0xcf, 0xf5, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0xb8, 0x4a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x02, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x04, 0x00, 0x00,
+};
+
+static void parse_captured_user_class1(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, captured_user_class1_request,
+        sizeof(captured_user_class1_request));
+    g_assert_cmpstr(digest, ==, "ee5e8c660940ad2f63da2fc0d47b476d9a7aa070980192a36e80c3e48b28155b");
+    g_assert_true(darwin_sks_parse_migrate_request(
+        captured_user_class1_request, sizeof(captured_user_class1_request),
+        &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_USER);
+    g_assert_cmpuint(parsed.target_class, ==, 1);
+    g_assert_cmpuint(parsed.record_kind, ==, 3);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+}
+
+static void reject_corrupt_user_class1(void)
+{
+    static const size_t offsets[] = { 0x00, 0x14, 0x4c, 0x50, 0x68,
+                                      0x70, 0x84, 0x90, 0x9b, 0xa1 };
+    DarwinSKSMigrateRequest parsed;
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        uint8_t request[sizeof(captured_user_class1_request)];
+        memcpy(request, captured_user_class1_request, sizeof(request));
+        request[offsets[i]] ^= 1;
+        g_assert_false(darwin_sks_parse_migrate_request(request,
+                       sizeof(request), &parsed));
+    }
+    uint8_t request[sizeof(captured_user_class1_request)];
+    memcpy(request, captured_user_class1_request, sizeof(request));
+    request[0x6c] = 2;
+    g_assert_false(darwin_sks_parse_migrate_request(request,
+                   sizeof(request), &parsed));
+    g_assert_false(darwin_sks_parse_migrate_request(
+        captured_user_class1_request, sizeof(captured_user_class1_request)-1,
+        &parsed));
+}
+
+/* Exact reverse User-volume 1 -> 3 request, DISPLAY_NATIVE_R4. */
+static const uint8_t captured_user_reverse_request[] = {
+    0x48, 0x00, 0x00, 0x00, 0x35, 0x0b, 0x02, 0x76,
+    0xbd, 0x3e, 0xe6, 0x6f, 0x29, 0xa2, 0x60, 0x52,
+    0x59, 0x69, 0xa3, 0xb3, 0x01, 0x00, 0x00, 0x00,
+    0xfc, 0x8f, 0xbe, 0x14, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xcd, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2a, 0xf7, 0xdf, 0xf3, 0x82, 0x3e, 0x1c, 0xa5,
+    0x37, 0xce, 0xdb, 0x02, 0xac, 0x2d, 0xeb, 0x2e,
+    0x51, 0xb4, 0xcf, 0xf5, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0xe8, 0x4a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x02, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x04, 0x00, 0x00,
+};
+
+static void parse_captured_user_reverse(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, captured_user_reverse_request,
+        sizeof(captured_user_reverse_request));
+    g_assert_cmpstr(digest, ==, "99ab23ebcc515139ece21cfa832d7d3fc3ec3e1c5083fd1be00625365e3815ea");
+    g_assert_true(darwin_sks_parse_migrate_request(
+        captured_user_reverse_request, sizeof(captured_user_reverse_request),
+        &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_USER);
+    g_assert_cmpuint(parsed.target_class, ==, 3);
+    g_assert_cmpuint(parsed.record_kind, ==, 1);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+    uint8_t request[sizeof(captured_user_reverse_request)];
+    memcpy(request, captured_user_reverse_request, sizeof(request));
+    request[0x9b] = 0;
+    g_assert_false(darwin_sks_parse_migrate_request(request,
+                   sizeof(request), &parsed));
+}
 
 static void parse_captured_data(void)
 {
@@ -162,9 +273,179 @@ static void reject_unwrap_truncation(void)
         &parsed));
 }
 
+static void device_state_native_decoder_contract(void)
+{
+    /* DISPLAY_UNLOCK_R1: the real guest decoder returned 0, record+0 = 4,
+     * record+0x2a = -6. The old nine-byte blob returned an all-zero record. */
+    static const uint8_t guest_validated_der[] = {
+        0x31, 0x12,
+        0x30, 0x07, 0x0c, 0x02, 'b', 'h', 0x02, 0x01, 0xfa,
+        0x30, 0x07, 0x0c, 0x02, 's', 's', 0x02, 0x01, 0x04,
+    };
+    uint8_t reply[DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE + 1];
+
+    memset(reply, 0xa5, sizeof(reply));
+    g_assert_cmpuint(darwin_sks_build_unlocked_device_state(reply,
+                     sizeof(reply)), ==, 28);
+    g_assert_cmpuint(ldl_le_p(reply), ==, 0);
+    g_assert_cmpuint(ldl_le_p(reply + 4), ==, sizeof(guest_validated_der));
+    g_assert_cmpmem(reply + 8, sizeof(guest_validated_der),
+                    guest_validated_der, sizeof(guest_validated_der));
+    g_assert_cmpuint(reply[28], ==, 0xa5);
+}
+
+static void device_state_reject_small_buffer(void)
+{
+    uint8_t reply[DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE];
+
+    memset(reply, 0xa5, sizeof(reply));
+    g_assert_cmpuint(darwin_sks_build_unlocked_device_state(reply,
+                     sizeof(reply) - 1), ==, 0);
+    for (size_t i = 0; i < sizeof(reply); i++) {
+        g_assert_cmpuint(reply[i], ==, 0xa5);
+    }
+    g_assert_cmpuint(darwin_sks_build_unlocked_device_state(NULL,
+                     sizeof(reply)), ==, 0);
+}
+
+
+/* Exact pre-timeout DISPLAY_NATIVE_R5 op10 class-13 request. */
+static const uint8_t captured_check_class13[] = {
+    0x48, 0x00, 0x00, 0x00, 0x99, 0xac, 0x06, 0xfb,
+    0x35, 0xf7, 0x84, 0xbf, 0xb1, 0xac, 0x35, 0x08,
+    0x70, 0xfa, 0x17, 0x99, 0x01, 0x00, 0x00, 0x00,
+    0xcb, 0x63, 0xc1, 0x1e, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x22, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x71, 0xdc, 0xbe, 0xd8, 0x4c, 0x82, 0x16, 0x78,
+    0x11, 0x27, 0xdd, 0xbc, 0x00, 0x19, 0x9f, 0xd4,
+    0x08, 0xb1, 0x00, 0x36, 0x02, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x1c, 0x00, 0x00, 0x00, 0x2c, 0x4c, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x61, 0x70,
+    0x66, 0x73, 0x75, 0x75, 0x69, 0x64, 0x00, 0x02,
+    0x76, 0x6f, 0x6c, 0x75, 0x6d, 0x04, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
+static void check_class_captured_request(void)
+{
+    DarwinSKSCheckClassRequest parsed;
+    char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        captured_check_class13, sizeof(captured_check_class13));
+    g_assert_cmpstr(digest, ==,
+        "a5b8ab23539ecd0216892fdc86974cbc928896178d107b66df25129f409075b4");
+    g_free(digest);
+    g_assert_true(darwin_sks_parse_check_class_request(captured_check_class13,
+        sizeof(captured_check_class13), &parsed));
+    g_assert_cmpuint(parsed.protection_class, ==, 13);
+    g_assert_true(parsed.echo_class);
+}
+
+static void check_class_reject_malformed(void)
+{
+    static const size_t fixed_offsets[] = {
+        0, 0x14, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x64, 0x68, 0x70, 0x74, 0x86
+    };
+    uint8_t request[sizeof(captured_check_class13) + 1];
+    DarwinSKSCheckClassRequest parsed;
+    for (size_t i = 0; i < G_N_ELEMENTS(fixed_offsets); i++) {
+        memcpy(request, captured_check_class13, sizeof(captured_check_class13));
+        request[fixed_offsets[i]] ^= 0x80;
+        g_assert_false(darwin_sks_parse_check_class_request(request,
+            sizeof(captured_check_class13), &parsed));
+    }
+    memcpy(request, captured_check_class13, sizeof(captured_check_class13));
+    for (size_t n = 0; n < sizeof(request); n++) {
+        if (n != sizeof(captured_check_class13)) {
+            g_assert_false(darwin_sks_parse_check_class_request(request, n, &parsed));
+        }
+    }
+    g_assert_false(darwin_sks_parse_check_class_request(request, sizeof(request), &parsed));
+    stl_le_p(request + 0x60, 12);
+    g_assert_false(darwin_sks_parse_check_class_request(request,
+        sizeof(captured_check_class13), &parsed));
+    stl_le_p(request + 0x60, 13);
+    memset(request + 0x76, 0, 16);
+    g_assert_false(darwin_sks_parse_check_class_request(request,
+        sizeof(captured_check_class13), &parsed));
+    g_assert_false(darwin_sks_parse_check_class_request(NULL, 140, &parsed));
+}
+
+static void check_class_existing_forms(void)
+{
+    static const uint32_t classes[] = { 1, 2, 3, 4, 17 };
+    uint8_t request[sizeof(captured_check_class13)];
+    DarwinSKSCheckClassRequest parsed;
+    memcpy(request, captured_check_class13, sizeof(request));
+    for (size_t i = 0; i < G_N_ELEMENTS(classes); i++) {
+        stl_le_p(request + 0x60, classes[i]);
+        g_assert_true(darwin_sks_parse_check_class_request(request, sizeof(request), &parsed));
+        g_assert_true(parsed.echo_class);
+        g_assert_cmpuint(parsed.protection_class, ==, classes[i]);
+    }
+    stl_le_p(request + 0x60, 1);
+    memset(request + 0x64, 0, 12);
+    g_assert_true(darwin_sks_parse_check_class_request(request, 0x70, &parsed));
+    g_assert_false(parsed.echo_class);
+    stl_le_p(request + 0x60, 13);
+    g_assert_false(darwin_sks_parse_check_class_request(request, 0x70, &parsed));
+}
+
+
+/* Exact DISPLAY_NATIVE_R8 User-volume 4 -> 3 transfer. */
+static const uint8_t captured_user_4_to_3[] = {
+    0x48, 0x00, 0x00, 0x00, 0x9e, 0xcc, 0x1c, 0x04,
+    0x8f, 0x2e, 0x6e, 0x51, 0x78, 0x7d, 0x73, 0xc2,
+    0xe5, 0xb0, 0x67, 0x24, 0x01, 0x00, 0x00, 0x00,
+    0x23, 0xde, 0x4e, 0x24, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xf2, 0x30, 0x92, 0x93, 0x1c, 0xfd, 0x93, 0xe5,
+    0xbc, 0xcc, 0xae, 0x19, 0x47, 0x03, 0x72, 0x3f,
+    0x6e, 0xd1, 0x88, 0xd4, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0xd9, 0x4c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x02, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x04, 0x00, 0x00,
+};
+
+static void parse_captured_user_4_to_3(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        captured_user_4_to_3, sizeof(captured_user_4_to_3));
+    g_assert_cmpstr(digest, ==,
+        "b888d00d543ad02af54d71ffc28b2f288959a9b38d481ffc1bde5d5183a74334");
+    g_assert_true(darwin_sks_parse_migrate_request(captured_user_4_to_3,
+        sizeof(captured_user_4_to_3), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_USER);
+    g_assert_cmpuint(parsed.record_kind, ==, 4);
+    g_assert_cmpuint(parsed.target_class, ==, 3);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/migrate/user-4-to-3", parse_captured_user_4_to_3);
+    g_test_add_func("/darwin-sks/check-class/captured-class13", check_class_captured_request);
+    g_test_add_func("/darwin-sks/check-class/reject-malformed", check_class_reject_malformed);
+    g_test_add_func("/darwin-sks/check-class/existing-forms", check_class_existing_forms);
+    g_test_add_func("/darwin-sks/migrate/user-reverse", parse_captured_user_reverse);
+    g_test_add_func("/darwin-sks/migrate/user-class1", parse_captured_user_class1);
+    g_test_add_func("/darwin-sks/migrate/reject-user-class1", reject_corrupt_user_class1);
     g_test_add_func("/darwin-sks/migrate/captured-data", parse_captured_data);
     g_test_add_func("/darwin-sks/migrate/reject-old-kind3",
                     reject_old_kind_three_bug);
@@ -180,5 +461,9 @@ int main(int argc, char **argv)
                     reject_corrupt_unwrap_fields);
     g_test_add_func("/darwin-sks/unwrap/reject-truncation",
                     reject_unwrap_truncation);
+    g_test_add_func("/darwin-sks/device-state/native-decoder-contract",
+                    device_state_native_decoder_contract);
+    g_test_add_func("/darwin-sks/device-state/reject-small-buffer",
+                    device_state_reject_small_buffer);
     return g_test_run();
 }
