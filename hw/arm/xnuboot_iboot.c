@@ -7,10 +7,11 @@
  * mBoot-20457.2.37 on d47 that the unwrapped payload enters in place at
  * 0x1fc080000, begins with EL2 setup, names its own base at raw +0x380, and
  * carries image/BSS bounds in the adjacent startup literal pool.  The release
- * and RESEARCH_RELEASE BSS ends fit in the 16 KiB-rounded interval below.
- * No other RAM is justified by that evidence, so this loader maps no other
- * memory and supplies no boot inputs.  Its sole purpose is to make the first
- * missing runtime dependency observable.
+ * and RESEARCH_RELEASE BSS ends fit below IBOOT_IMAGE_MEMORY_END.  Runtime
+ * page-table evidence also maps both builds' statically declared root scratch
+ * region onto the immediately following physical pages.  No other RAM is
+ * justified, and this loader supplies no boot inputs.  Its sole purpose is to
+ * make the first missing runtime dependency observable.
  */
 
 #include "qemu/osdep.h"
@@ -23,12 +24,18 @@
 #include "xnu/boot/xnuboot.h"
 
 #define IBOOT_MEMORY_BASE       UINT64_C(0x1fc000000)
-#define IBOOT_MEMORY_END        UINT64_C(0x1fc480000)
+#define IBOOT_IMAGE_MEMORY_END  UINT64_C(0x1fc480000)
+#define IBOOT_ROOT_PHYS_BASE    UINT64_C(0x1fc470000)
+#define IBOOT_ROOT_SIZE         UINT64_C(0x58000)
+#define IBOOT_MEMORY_END        (IBOOT_ROOT_PHYS_BASE + IBOOT_ROOT_SIZE)
 #define IBOOT_LOAD_ADDR         UINT64_C(0x1fc080000)
 #define IBOOT_CANONICAL_BASE    UINT64_C(0xfffffc0000000000)
 #define IBOOT_CANONICAL_MASK    UINT64_C(0xfffffc0000000000)
+#define IBOOT_ROOT_VA_BASE      UINT64_C(0x3f000000000)
+#define IBOOT_ROOT_NAME_QWORD   UINT64_C(0x746f6f72)
 
 #define IBOOT_COPY_ALIGN        64
+#define IBOOT_PAGE_SIZE         0x4000
 #define IBOOT_STARTUP_SIZE      0x410
 #define IBOOT_COPY_END_OFFSET   0x388
 #define IBOOT_BSS_END_OFFSET    0x3c0
@@ -91,6 +98,30 @@ static uint64_t iboot_canonical_phys(uint64_t literal, const char *name)
     return literal - IBOOT_CANONICAL_BASE;
 }
 
+static bool iboot_has_root_descriptor(const mmap_file_t *image)
+{
+    const uint8_t *buf = image->buf;
+
+    for (size_t off = 0; off <= image->len - 3 * sizeof(uint64_t);
+         off += sizeof(uint64_t)) {
+        uint64_t end;
+
+        if (ldq_le_p(buf + off) != IBOOT_ROOT_NAME_QWORD ||
+            ldq_le_p(buf + off + sizeof(uint64_t)) != IBOOT_ROOT_VA_BASE) {
+            continue;
+        }
+
+        end = ldq_le_p(buf + off + 2 * sizeof(uint64_t));
+        if (end > IBOOT_ROOT_VA_BASE &&
+            ROUND_UP_POW2(end - IBOOT_ROOT_VA_BASE, IBOOT_PAGE_SIZE) ==
+            IBOOT_ROOT_SIZE) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void iboot_validate(const mmap_file_t *image)
 {
     const uint8_t *buf = image->buf;
@@ -99,7 +130,7 @@ static void iboot_validate(const mmap_file_t *image)
     if (!buf || image->len < IBOOT_STARTUP_SIZE) {
         iboot_reject("payload is too small for the startup code and literals");
     }
-    if (image->len > IBOOT_MEMORY_END - IBOOT_LOAD_ADDR) {
+    if (image->len > IBOOT_IMAGE_MEMORY_END - IBOOT_LOAD_ADDR) {
         iboot_reject("payload does not fit in the evidenced boot-memory range");
     }
 
@@ -138,9 +169,13 @@ static void iboot_validate(const mmap_file_t *image)
     if (copy_end != IBOOT_LOAD_ADDR + rounded_len) {
         iboot_reject("copy-end literal does not match the payload length");
     }
-    if (bss_end < copy_end || bss_end > IBOOT_MEMORY_END) {
+    if (bss_end < copy_end || bss_end > IBOOT_IMAGE_MEMORY_END) {
         iboot_reject("BSS-end literal is outside the evidenced boot-memory"
                      " range");
+    }
+    if (!iboot_has_root_descriptor(image)) {
+        iboot_reject("root descriptor does not match the evidenced virtual"
+                     " address and rounded size");
     }
 }
 
@@ -172,9 +207,10 @@ void arm_load_xnu_iboot(ARMCPU *cpu, MachineState *ms,
     info->init_x0 = 0;
 
     fprintf(stderr, "iBoot experiment: mapped [0x%" PRIx64 ",0x%" PRIx64
+            ") including root scratch [0x%" PRIx64 ",0x%" PRIx64
             "), loaded %zu bytes at 0x%" PRIx64 ", entry +0x0, x0=0\n",
-            IBOOT_MEMORY_BASE, IBOOT_MEMORY_END, info->iboot_f.len,
-            IBOOT_LOAD_ADDR);
+            IBOOT_MEMORY_BASE, IBOOT_MEMORY_END, IBOOT_ROOT_PHYS_BASE,
+            IBOOT_MEMORY_END, info->iboot_f.len, IBOOT_LOAD_ADDR);
 
     (void)cpu;
     (void)ms;
