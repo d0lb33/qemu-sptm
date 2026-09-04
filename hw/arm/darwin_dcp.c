@@ -56,6 +56,7 @@
 #include "migration/vmstate.h"
 #include "xnu/darwin_asc.h"
 #include "xnu/darwin_afk.h"
+#include "xnu/darwin_afk_state.h"
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_dcp.h"
 #include "xnu/darwin_epic.h"
@@ -349,6 +350,16 @@ static void dcp_afk_started(void *opaque, uint8_t ep) {
 static void dcp_afk_recv(void *opaque, uint8_t ep, uint32_t channel, uint32_t type,
                          const uint8_t *data, uint32_t len) {
     DarwinDCP *d = opaque;
+    uint8_t state_reply[DARWIN_AFK_STATE_SIZE];
+
+    if (darwin_afk_build_state_ack(channel, type, data, len, state_reply)) {
+        bool sent = darwin_afk_send_qe(d->afk, ep, channel, type, state_reply,
+                                      sizeof(state_reply), true);
+        fprintf(stderr, "dcp: state ep 0x%02x seq %u request %u ack %u sent=%u\n",
+                ep, lduw_le_p(data), ldl_le_p(data + 8),
+                ldl_le_p(state_reply + 8), sent);
+        return;
+    }
     g_autofree char *desc = darwin_epic_describe(data, len);
 
     const char *probe = getenv("DARWIN_DCP_REPLY");

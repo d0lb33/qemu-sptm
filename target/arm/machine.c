@@ -1217,6 +1217,7 @@ static int cpu_post_load(void *opaque, int version_id)
     }
 
     if (tcg_enabled()) {
+        arm_gt_rebuild_extra_timers(cpu);
         hw_breakpoint_update_all(cpu);
         hw_watchpoint_update_all(cpu);
     }

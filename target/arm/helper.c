@@ -1562,6 +1562,24 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
     gt_update_irq(cpu, timeridx);
 }
 
+void arm_gt_rebuild_extra_timers(ARMCPU *cpu)
+{
+    /*
+     * vmstate_arm_cpu carries only the EL1 QEMUTimers. The other timers'
+     * architectural CVAL/CTL registers arrive through the cpreg array, but
+     * raw cpreg loading does not schedule their host timers. Reconstruct
+     * those derived deadlines and IRQ levels without changing the stream.
+     * In DISPLAY_RESUME_R13, CNTHV_CTL=1 and CVAL=2056248248 survived, while
+     * gt_timer[GTIMER_HYPVIRT]->expire_time stayed -1 even at count
+     * 3113404105, leaving XNU's five-second sleep blocked after restore.
+     */
+    for (int i = GTIMER_HYP; i < NUM_GTIMERS; i++) {
+        if (cpu->gt_timer[i]) {
+            gt_recalc_timer(cpu, i);
+        }
+    }
+}
+
 static void gt_timer_reset(CPUARMState *env, const ARMCPRegInfo *ri,
                            int timeridx)
 {
