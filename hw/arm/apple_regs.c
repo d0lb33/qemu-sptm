@@ -77,6 +77,50 @@ static const ARMCPRegInfo apple_pmcregs[] = {
     },
 };
 
+static uint64_t apple_apiakey_el2_read(CPUARMState *env,
+                                       const ARMCPRegInfo *ri)
+{
+    uint64_t value = raw_read(env, ri);
+
+    fprintf(stderr, "iBoot experiment: %s read pc=0x%" PRIx64
+            " value=0x%" PRIx64 "\n", ri->name, env->pc, value);
+    return value;
+}
+
+static void apple_apiakey_el2_write(CPUARMState *env,
+                                    const ARMCPRegInfo *ri, uint64_t value)
+{
+    raw_write(env, ri, value);
+    fprintf(stderr, "iBoot experiment: %s write pc=0x%" PRIx64
+            " value=0x%" PRIx64 "\n", ri->name, env->pc, value);
+}
+
+/*
+ * Apple exposes the instruction-address pointer-authentication key at EL2
+ * through S3_6_c15_c13_{0,1}.  iBoot writes two independently generated
+ * 64-bit values here before it enables later authenticated control flow.
+ * Alias QEMU's architected APIA state so the existing TCG pauth helpers see
+ * the guest's keys; do not accept and discard these writes.
+ */
+static const ARMCPRegInfo apple_apiakey_el2_regs[] = {
+    {
+        .name = "APIAKEYLO_EL2", .state = ARM_CP_STATE_AA64,
+        .access = PL2_RW, .type = ARM_CP_ALIAS,
+        .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 13, .opc2 = 0,
+        .fieldoffset = offsetof(CPUARMState, keys.apia.lo),
+        .readfn = apple_apiakey_el2_read,
+        .writefn = apple_apiakey_el2_write,
+    },
+    {
+        .name = "APIAKEYHI_EL2", .state = ARM_CP_STATE_AA64,
+        .access = PL2_RW, .type = ARM_CP_ALIAS,
+        .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 13, .opc2 = 1,
+        .fieldoffset = offsetof(CPUARMState, keys.apia.hi),
+        .readfn = apple_apiakey_el2_read,
+        .writefn = apple_apiakey_el2_write,
+    },
+};
+
 static uint64_t llc_ram_config_read(CPUARMState *env,
                                     const ARMCPRegInfo *ri)
 {
@@ -260,6 +304,7 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);
     if (info->iboot) {
+        define_arm_cp_regs(cpu, apple_apiakey_el2_regs);
         apple_llc_ram_config_init(cpu, dt_root);
     }
     gxfstat_start();
