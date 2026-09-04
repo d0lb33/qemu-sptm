@@ -734,8 +734,37 @@ static int darwin_asc_post_load(void *opaque, int version_id)
         s->epmap_next_block < 0 || s->epmap_next_block > 8 ||
         (s->proto_version &&
          (s->proto_version < RTKIT_MIN_VERSION ||
-          s->proto_version > RTKIT_MAX_VERSION))) {
+          s->proto_version > RTKIT_MAX_VERSION)) ||
+        (version_id >= 2 &&
+         (s->firmware_status & ~ASC_FIRMWARE_STATUS_LOADED))) {
         return -EINVAL;
+    }
+    if (version_id < 2) {
+        /*
+         * Version 1 predates the separate core-status register.  RTKit state
+         * provides the authoritative witness that the model firmware booted;
+         * reconstruct the two hardware-facing status bits without inventing
+         * a loaded image for an ASC that was still at reset.
+         */
+        bool firmware_loaded = s->cpu_status != 0 || s->proto_version != 0 ||
+                               s->rtk_state != RTK_IDLE ||
+                               s->iop_pwr_state != 0 || s->ap_pwr_state != 0;
+
+        s->firmware_status = firmware_loaded ?
+                             ASC_FIRMWARE_STATUS_LOADED : 0;
+        if (ASC_AKF_RUNNING + sizeof(uint32_t) <= s->mmio_size) {
+            s->misc[ASC_AKF_RUNNING / sizeof(uint32_t)] =
+                firmware_loaded &&
+                (s->cpu_status & ASC_CPU_STATUS_RUNNING) ?
+                ASC_AKF_RUNNING_FIRMWARE : 0;
+        }
+        if (ASC_IDLE_STATUS + sizeof(uint32_t) <= s->mmio_size) {
+            uint32_t *status = &s->misc[ASC_IDLE_STATUS / sizeof(uint32_t)];
+
+            *status = (*status & ~ASC_IDLE_STATUS_MASK) |
+                      ((s->cpu_status & ASC_CPU_STATUS_IDLE) ?
+                       ASC_IDLE_STATUS_IDLE : 0);
+        }
     }
     asc_update_irqs(s);
     return 0;
@@ -754,7 +783,7 @@ static const VMStateDescription vmstate_asc_msg = {
 
 static const VMStateDescription vmstate_darwin_asc = {
     .name = TYPE_DARWIN_ASC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = darwin_asc_post_load,
     .fields = (const VMStateField[]) {
@@ -766,7 +795,7 @@ static const VMStateDescription vmstate_darwin_asc = {
          * before a post-restore RTKit restart.  Preserve it independently of
          * the wrapper's misc register array.
          */
-        VMSTATE_UINT32(firmware_status, DarwinASCState),
+        VMSTATE_UINT32_V(firmware_status, DarwinASCState, 2),
         VMSTATE_UINT32(cpu_control, DarwinASCState),
         VMSTATE_UINT32(cpu_status, DarwinASCState),
         VMSTATE_UINT32(a2i_ctrl_raw, DarwinASCState),
