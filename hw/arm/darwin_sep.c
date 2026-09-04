@@ -719,6 +719,7 @@ struct DarwinSEPState {
     uint32_t mmio_size;
     uint32_t mbox_off;
     uint32_t addr_shift;
+    bool require_sepi_boot_image;
     qemu_irq irq[4];
 
     // wrapper
@@ -896,6 +897,34 @@ static bool sep_dma(DarwinSEPState *s, uint64_t dva, void *buf, uint32_t len, bo
     return true;
 }
 
+/*
+ * Check only the small, unencrypted DER envelope needed to bind BOOT_IMG4 to
+ * the caller's mapped `sepi` object.  This deliberately does not claim to
+ * authenticate, decrypt, or execute the encrypted SEP payload.  The loader
+ * has already checked the complete host input and preserved it byte-for-byte;
+ * this ROM boundary check prevents the model from acknowledging an unrelated
+ * buffer merely because it was given a page number.
+ */
+static bool sep_boot_image_is_sepi(DarwinSEPState *s, uint64_t dva)
+{
+    uint8_t header[32];
+
+    if (!sep_dma(s, dva, header, sizeof(header), false)) {
+        return false;
+    }
+
+    /* DER SEQUENCE, finite length, IA5String("IM4P"), IA5String("sepi"). */
+    for (size_t i = 0; i + 12 <= sizeof(header); i++) {
+        if (header[i] == 0x16 && header[i + 1] == 4 &&
+            !memcmp(&header[i + 2], "IM4P", 4) &&
+            header[i + 6] == 0x16 && header[i + 7] == 4 &&
+            !memcmp(&header[i + 8], "sepi", 4)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ---------------- TXM secure channel ---------------- */
 
 #define TXM_SCRD_MAGIC_OFF   0x200
@@ -993,10 +1022,31 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         fprintf(stderr, "sep(%s): ROM: SEP ART at page 0x%x accepted\n", s->role, data);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         break;
-    case BOOT_IMG4:
-    case BOOT_RESUME:
+    case BOOT_IMG4: {
+        uint64_t firmware_dva = (uint64_t)data << s->addr_shift;
+
+        if (s->require_sepi_boot_image &&
+            !sep_boot_image_is_sepi(s, firmware_dva)) {
+            fprintf(stderr, "sep(%s): ROM: refusing BOOT_IMG4 page 0x%x: "
+                    "mapped buffer at dva 0x%" PRIx64
+                    " is unavailable or is not an IM4P/sepi container\n",
+                    s->role, data, firmware_dva);
+            break;
+        }
+        if (s->require_sepi_boot_image) {
+            fprintf(stderr, "sep(%s): ROM: verified mapped IM4P/sepi envelope "
+                    "at dva 0x%" PRIx64 "\n", s->role, firmware_dva);
+        }
         fprintf(stderr, "sep(%s): ROM: %s (firmware page 0x%x, param 0x%02x); sepOS \"running\"\n",
-                s->role, op == BOOT_IMG4 ? "IMG4 accepted" : "resumed", data, param);
+                s->role, "IMG4 accepted", data, param);
+        sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
+        sep_os_alive(s);
+        break;
+    }
+    case BOOT_RESUME:
+        fprintf(stderr, "sep(%s): ROM: resumed (firmware page 0x%x, "
+                "param 0x%02x); sepOS \"running\"\n",
+                s->role, data, param);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         sep_os_alive(s);
         break;
@@ -2291,6 +2341,8 @@ static const Property darwin_sep_properties[] = {
     DEFINE_PROP_UINT32("mbox-offset", DarwinSEPState, mbox_off, 0x8000),
     // page-number unit of every address the protocol carries (see header)
     DEFINE_PROP_UINT32("addr-shift", DarwinSEPState, addr_shift, 12),
+    DEFINE_PROP_BOOL("require-sepi-boot-image", DarwinSEPState,
+                     require_sepi_boot_image, false),
 };
 
 static void darwin_sep_class_init(ObjectClass *klass, const void *data) {
@@ -2333,7 +2385,8 @@ static struct dtree_node *sep_find_mapper(struct dtree_node *arm_io, uint32_t ph
 }
 
 DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
-                               DeviceState *aic, bool required_by_iboot) {
+                               DeviceState *aic, bool required_by_iboot,
+                               bool require_sepi_boot_image) {
     struct dtree_node *node = adt_find_node(dt_root, "arm-io/sep");
     if (!node ||
         (!required_by_iboot && !adt_get_prop_val(node, "compatible"))) {
@@ -2355,6 +2408,8 @@ DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
     DeviceState *dev = qdev_new(TYPE_DARWIN_SEP);
     qdev_prop_set_string(dev, "role", role ? role : name);
     qdev_prop_set_uint32(dev, "mmio-size", reg[0].len);
+    qdev_prop_set_bit(dev, "require-sepi-boot-image",
+                      require_sepi_boot_image);
     DarwinSEPState *s = DARWIN_SEP(dev);
 
     /*

@@ -3031,6 +3031,9 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_iboot:
                 qdict_put_str(machine_opts_dict, "iboot", optarg);
                 break;
+            case QEMU_OPTION_sepfw:
+                qdict_put_str(machine_opts_dict, "sepfw", optarg);
+                break;
             case QEMU_OPTION_args:
                 qdict_put_str(machine_opts_dict, "args", optarg);
                 break;

@@ -6673,6 +6673,9 @@ DEF("bootkc", HAS_ARG, QEMU_OPTION_bootkc, \
 DEF("iboot", HAS_ARG, QEMU_OPTION_iboot, \
            "-iboot file    execute a validated raw d47 iBoot payload\n", QEMU_ARCH_ALL)
 
+DEF("sepfw", HAS_ARG, QEMU_OPTION_sepfw, \
+           "-sepfw file    preload an encrypted SEP firmware IM4P for direct boot\n", QEMU_ARCH_ALL)
+
 DEF("args", HAS_ARG, QEMU_OPTION_args, \
            "-args    use 'args' as the XNU boot argument\n", QEMU_ARCH_ALL)
 

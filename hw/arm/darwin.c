@@ -60,6 +60,7 @@ struct DarwinState {
 
 MACHINE_CLASS_ARG(bootkc);
 MACHINE_CLASS_ARG(iboot);
+MACHINE_CLASS_ARG(sepfw);
 MACHINE_CLASS_ARG(args);
 MACHINE_CLASS_ARG(dtree);
 MACHINE_CLASS_ARG(sptm);
@@ -122,6 +123,70 @@ static mmap_file_t check_and_open(const char *path, const char *errmsg) {
     }
 
     return (mmap_file_t){
+        .buf = mapping,
+        .len = stats.st_size,
+    };
+
+fail:
+    fprintf(stderr, "%s\n", errmsg);
+    exit(1);
+}
+
+static bool im4p_has_type(const uint8_t *buf, size_t len, const char type[4])
+{
+    /*
+     * IM4P starts with a DER sequence followed by two IA5String values:
+     * "IM4P" and the four-byte payload type. The outer DER length can use a
+     * different width as the payload grows, so find the adjacent strings
+     * rather than assuming a fixed sequence-header size.
+     */
+    for (size_t off = 0; off + 12 <= MIN(len, (size_t)0x30); off++) {
+        if (buf[off] == 0x16 && buf[off + 1] == 4 &&
+            memcmp(buf + off + 2, "IM4P", 4) == 0 &&
+            buf[off + 6] == 0x16 && buf[off + 7] == 4 &&
+            memcmp(buf + off + 8, type, 4) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static mmap_file_t check_and_open_im4p(const char *path, const char *errmsg)
+{
+    int fd;
+    struct stat stats;
+    void *mapping;
+
+    if (!path) {
+        goto fail;
+    }
+
+    fd = open(path, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        goto fail;
+    }
+
+    if (fstat(fd, &stats) < 0 || stats.st_size < 4) {
+        close(fd);
+        goto fail;
+    }
+    mapping = mmap(NULL, stats.st_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (MAP_FAILED == mapping) {
+        goto fail;
+    }
+
+    if (!is_im4p(mapping) ||
+        !im4p_has_type(mapping, stats.st_size, "sepi")) {
+        munmap(mapping, stats.st_size);
+        fprintf(stderr,
+                "error: %s is not an IM4P container of payload type sepi\n",
+                path);
+        goto fail;
+    }
+
+    return (mmap_file_t) {
         .buf = mapping,
         .len = stats.st_size,
     };
@@ -260,7 +325,7 @@ static void darwin_init(MachineState *ms) {
 
     if (iboot_mode &&
         (info->bootkc || info->tc || info->ramdisk || info->sptm || info->txm ||
-         info->args || info->fb || info->fbmode)) {
+         info->sepfw || info->args || info->fb || info->fbmode)) {
         error_report("-iboot cannot be combined with direct-boot inputs");
         exit(1);
     }
@@ -276,6 +341,10 @@ static void darwin_init(MachineState *ms) {
         info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel");
         info->tc_f = check_and_open(info->tc, "error opening trust cache");
         info->ramdisk_f = check_and_open(info->ramdisk, "error opening ramdisk");
+        if (info->sepfw) {
+            info->sepfw_f = check_and_open_im4p(info->sepfw,
+                                                "error opening SEP firmware");
+        }
         if (info->sptm) {
             info->sptm_f = check_and_open(info->sptm, "error opening SPTM");
             info->txm_f = check_and_open(info->txm, "error opening TXM");
@@ -342,7 +411,8 @@ static void darwin_init(MachineState *ms) {
     // iBoot reaches SEP reg[0]+0x8114 before it receives any guest device
     // tree. In that mode the host-fixed tree's removed "compatible" is only a
     // direct-boot driver policy and must not hide hardware iBoot already used.
-    darwin_sep_create(dt_root, iobase, aic, iboot_mode);
+    darwin_sep_create(dt_root, iobase, aic, iboot_mode,
+                      info->sepfw != NULL);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
     // The ANS storage coprocessor owns its own /arm-io/ans mailbox as well as
@@ -401,6 +471,9 @@ static void darwin_init(MachineState *ms) {
         munmap(info->bootkc_f.buf, info->bootkc_f.len);
         munmap(info->tc_f.buf, info->tc_f.len);
         munmap(info->ramdisk_f.buf, info->ramdisk_f.len);
+        if (info->sepfw) {
+            munmap(info->sepfw_f.buf, info->sepfw_f.len);
+        }
         if (info->sptm) {
             munmap(info->sptm_f.buf, info->sptm_f.len);
             munmap(info->txm_f.buf, info->txm_f.len);
@@ -420,6 +493,8 @@ static void darwin_machine_class_init(ObjectClass *oc, const void *data) {
 
     object_class_property_add_str(oc, "bootkc", bootkc_darwin_class_get, bootkc_darwin_class_set);
     object_class_property_add_str(oc, "iboot", iboot_darwin_class_get, iboot_darwin_class_set);
+    object_class_property_add_str(oc, "sepfw", sepfw_darwin_class_get,
+                                  sepfw_darwin_class_set);
     object_class_property_add_str(oc, "args", args_darwin_class_get, args_darwin_class_set);
     object_class_property_add_str(oc, "dtree", dtree_darwin_class_get, dtree_darwin_class_set);
     object_class_property_add_str(oc, "sptm", sptm_darwin_class_get, sptm_darwin_class_set);

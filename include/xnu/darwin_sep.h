@@ -13,4 +13,5 @@
 // to the AIC; DMA goes through the DART named by the node's "iommu-parent".
 // Returns NULL when neither condition enables the SEP.
 DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
-                               DeviceState *aic, bool required_by_iboot);
+                               DeviceState *aic, bool required_by_iboot,
+                               bool require_sepi_boot_image);

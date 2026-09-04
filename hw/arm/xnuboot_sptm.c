@@ -29,8 +29,10 @@
 // TXM actual virt addr = sptm.virtlo + 1 * SPTM_EXPECTED_STRIDE
 // BKC actual virt addr = sptm.virtlo + 2 * SPTM_EXPECTED_STRIDE
 #define SPTM_EXPECTED_STRIDE    0x10000000
-// A real sep-firmware image is a few MiB; 2 MiB of zeros is plenty for an
-// emulated SEP that never reads it (see the SEPFW block below).
+/*
+ * Compatibility fallback for an emulated SEP that never reads its image.
+ * An explicit -sepfw input reserves its actual container length instead.
+ */
 #define SEPFW_RESERVED_SIZE     0x200000
 
 #define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT(36)-1)) ))
@@ -172,6 +174,7 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
     hwaddr dtree_base_phys = 0;
     hwaddr tc_base_phys = 0;
     hwaddr rd_base_phys = 0;
+    hwaddr sepfw_base_phys = 0;
 
     hwaddr tc_size_rounded = ROUND_NEXT_PAGE(sizeof(trust_cache_offsets_t) + info->tc_f.len);
     hwaddr dtree_size_rounded = ROUND_NEXT_PAGE(info->dtree_f.len);
@@ -410,17 +413,21 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
         END_ENTRY("RAMDisk");
     }
 
-    // SEPFW: where iBoot would have left the SEP firmware image. Only when the
-    // device tree carries the entry (dt_fixup -enable sep adds it), and
-    // deliberately zero-filled: AppleSEPFirmware::fromPreload wraps the range
-    // in a memory descriptor and maps it for the SEP without reading it
-    // (AppleSEPManager kext 0xfffffff009591df4..0x591eb4), and the emulated
-    // SEP in darwin_sep.c never looks at the image either. Placed below
-    // topOfKernelData so XNU treats it as reserved rather than free memory.
+    /*
+     * SEPFW: where iBoot would have left the encrypted SEP firmware IM4P.
+     * Without -sepfw retain the historical zero-filled compatibility region.
+     * With -sepfw preserve the exact container bytes and reserve its actual
+     * rounded length. AppleSEPFirmware::fromPreload wraps this whole range and
+     * maps it for SEP ROM; the AP does not decrypt the payload.
+     */
     if (adt_get_prop_val(map, "SEPFW")) {
-        blob_head += SEPFW_RESERVED_SIZE;
+        sepfw_base_phys = blob_head;
+        blob_head += info->sepfw ? info->sepfw_f.len : SEPFW_RESERVED_SIZE;
         blob_head = ROUND_NEXT_PAGE(blob_head);
         END_ENTRY("SEPFW");
+    } else if (info->sepfw) {
+        fprintf(stderr, "error: -sepfw requires /chosen/memory-map/SEPFW\n");
+        exit(1);
     }
 
 #undef PUSH_SEG
@@ -522,6 +529,19 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
         info->ramdisk_f.buf,
         info->ramdisk_f.len
     );
+
+    if (info->sepfw) {
+        address_space_write(
+            &address_space_memory,
+            sepfw_base_phys,
+            MEMTXATTRS_UNSPECIFIED,
+            info->sepfw_f.buf,
+            info->sepfw_f.len
+        );
+        fprintf(stderr, "darwin: preloaded encrypted SEP firmware IM4P "
+                "at 0x%" HWADDR_PRIx " (%zu bytes)\n",
+                sepfw_base_phys, info->sepfw_f.len);
+    }
 
     info->init_pc = vtop(&sptm_mi, sptm_mi.entrypoint);
     info->init_x0 = args_base_phys;
@@ -632,6 +652,13 @@ static void arm_load_xnu_nosptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_i
 }
 
 void arm_load_xnu(ARMCPU *cpu, MachineState *ms, struct xnu_boot_info *info) {
-    if (info->sptm) arm_load_xnu_sptm(cpu, ms, info);
-    else arm_load_xnu_nosptm(cpu, ms, info);
+    if (info->sptm) {
+        arm_load_xnu_sptm(cpu, ms, info);
+    } else {
+        if (info->sepfw) {
+            fprintf(stderr, "error: -sepfw currently requires -sptm/-txm\n");
+            exit(1);
+        }
+        arm_load_xnu_nosptm(cpu, ms, info);
+    }
 }
