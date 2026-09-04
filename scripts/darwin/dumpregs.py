@@ -48,6 +48,13 @@ rs_banked = [
     "AFSR1_GL",
 ]
 
+# Storage for registers whose behavior is implemented by hand in
+# hw/arm/apple_regs.c.  Keep these out of apple_sysregs[] so the generated
+# remember-the-last-write accessors cannot accidentally replace that model.
+rs_special = [
+    "LLC_RAM_CONFIG",
+]
+
 rs_opaque = [
     "TAG_OFFSET_EL2",
     "ACC_CTRR_A_LWR_EL2",
@@ -300,12 +307,14 @@ def main():
     inject_el2(rs_cpustate)
     # don't inject into banked regs, as we always fill in all known modes for them
 
-    for r in rs_opaque + rs_cpustate:
+    for r in rs_opaque + rs_cpustate + rs_special:
         if r not in all_regs:
             print(f"Unknown register: {r}")
             sys.exit(1)
     print("typedef struct {")
     for r in rs_opaque:
+        print(f"    uint64_t   {r.lower()};")
+    for r in rs_special:
         print(f"    uint64_t   {r.lower()};")
     print("} apple_state_t;\n")
     for r in rs_opaque:

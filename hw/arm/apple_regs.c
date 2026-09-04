@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/address-spaces.h"
@@ -24,6 +25,13 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 #define APPLE_STATE(env) ((apple_state_t*)env->apple_state)
 
 #define TAG_OFFSET_EL2_LOCK            BIT(63)
+
+#define LLC_RAM_CONFIG_ACTIVE          BIT(63)
+#define LLC_RAM_CONFIG_REQUEST_MASK    MAKE_64BIT_MASK(0, 6)
+#define LLC_RAM_CONFIG_UNIT_SHIFT_MASK MAKE_64BIT_MASK(8, 6)
+#define LLC_RAM_CONFIG_MAX_COUNT_MASK  MAKE_64BIT_MASK(16, 6)
+#define LLC_RAM_CONFIG_GEOMETRY_MASK \
+    (LLC_RAM_CONFIG_UNIT_SHIFT_MASK | LLC_RAM_CONFIG_MAX_COUNT_MASK)
 
 /* gxfstat: measurement counters, see include/xnu/gxfstat.h. The generated
  * accessors below reference gxfstat_sysreg_{rd,wr}. */
@@ -68,6 +76,96 @@ static const ARMCPRegInfo apple_pmcregs[] = {
         .readfn = pmc1_read, .writefn = pmc1_write,
     },
 };
+
+static uint64_t llc_ram_config_read(CPUARMState *env,
+                                    const ARMCPRegInfo *ri)
+{
+    uint64_t value = APPLE_STATE(env)->llc_ram_config;
+
+    fprintf(stderr, "iBoot experiment: LLC_RAM_CONFIG read pc=0x%" PRIx64
+            " value=0x%" PRIx64 "\n", env->pc, value);
+    return value;
+}
+
+static void llc_ram_config_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                 uint64_t value)
+{
+    uint64_t old = APPLE_STATE(env)->llc_ram_config;
+    uint64_t geometry = old & LLC_RAM_CONFIG_GEOMETRY_MASK;
+    uint64_t request = value & LLC_RAM_CONFIG_REQUEST_MASK;
+    uint64_t writable = LLC_RAM_CONFIG_ACTIVE | LLC_RAM_CONFIG_REQUEST_MASK;
+
+    if ((value & ~writable) != geometry) {
+        error_report("iBoot experiment: LLC_RAM_CONFIG write at pc=0x%"
+                     PRIx64 " changed inferred read-only geometry: old=0x%"
+                     PRIx64 " value=0x%" PRIx64, env->pc, old, value);
+        exit(EXIT_FAILURE);
+    }
+
+    APPLE_STATE(env)->llc_ram_config = geometry | request |
+        (request ? LLC_RAM_CONFIG_ACTIVE : 0);
+    fprintf(stderr, "iBoot experiment: LLC_RAM_CONFIG write pc=0x%" PRIx64
+            " request=%" PRIu64 " result=0x%" PRIx64 "\n", env->pc,
+            request, APPLE_STATE(env)->llc_ram_config);
+}
+
+static const ARMCPRegInfo apple_llc_ram_config_reg[] = {
+    {
+        .name = "LLC_RAM_CONFIG", .state = ARM_CP_STATE_AA64,
+        .access = PL1_RW,
+        .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 7, .opc2 = 0,
+        .readfn = llc_ram_config_read, .writefn = llc_ram_config_write,
+    },
+};
+
+static void apple_llc_ram_config_init(ARMCPU *cpu,
+                                      struct dtree_node *dt_root)
+{
+    CPUARMState *env = &cpu->env;
+    const char *ways = getenv("DARWIN_IBOOT_LLC_WAYS");
+    struct dtree_node *cpu0;
+    uint32_t *l2_size_prop;
+    uint64_t unit;
+    unsigned shift;
+
+    if (!ways) {
+        return;
+    }
+    if (strcmp(ways, "16") != 0) {
+        error_report("DARWIN_IBOOT_LLC_WAYS is an experimental hypothesis;"
+                     " this bounded probe supports only the 16-unit model");
+        exit(EXIT_FAILURE);
+    }
+
+    cpu0 = adt_find_node(dt_root, "cpus/cpu0");
+    l2_size_prop = cpu0 ? adt_get_prop_val(cpu0, "l2-cache-size") : NULL;
+    if (!l2_size_prop ||
+        adt_get_prop_len(cpu0, "l2-cache-size") != sizeof(*l2_size_prop) ||
+        *l2_size_prop == 0 || (*l2_size_prop % 16) != 0) {
+        error_report("DARWIN_IBOOT_LLC_WAYS=16 requires a valid cpu0"
+                     " l2-cache-size device-tree property");
+        exit(EXIT_FAILURE);
+    }
+
+    unit = *l2_size_prop / 16;
+    if (!is_power_of_2(unit)) {
+        error_report("cpu0 l2-cache-size/16 is not a power of two");
+        exit(EXIT_FAILURE);
+    }
+    shift = ctz64(unit);
+    if (shift > 63) {
+        error_report("cpu0 LLC allocation-unit shift does not fit its field");
+        exit(EXIT_FAILURE);
+    }
+
+    APPLE_STATE(env)->llc_ram_config =
+        deposit64(0, 8, 6, shift) | deposit64(0, 16, 6, 16);
+    define_arm_cp_regs(cpu, apple_llc_ram_config_reg);
+    fprintf(stderr, "iBoot experiment: enabled inferred LLC_RAM_CONFIG:"
+            " l2-size=0x%x ways=16 unit=0x%" PRIx64
+            " reset=0x%" PRIx64 "\n", *l2_size_prop, unit,
+            APPLE_STATE(env)->llc_ram_config);
+}
 
 static u64 *_adt_find_region(struct dtree_node *dt_root, const char *name) {
     struct dtree_node *mem_map = adt_find_node(dt_root, "chosen/memory-map");
@@ -161,5 +259,8 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
 
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);
+    if (info->iboot) {
+        apple_llc_ram_config_init(cpu, dt_root);
+    }
     gxfstat_start();
 }
