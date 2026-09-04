@@ -335,7 +335,10 @@ static void darwin_init(MachineState *ms) {
     darwin_dcp_create(dt_root, iobase, aic);
     // The SEP is an ASC wrapper too, but speaks its own protocol above the
     // mailbox rather than RTKit, so it gets its own model (darwin_sep.c).
-    darwin_sep_create(dt_root, iobase, aic);
+    // iBoot reaches SEP reg[0]+0x8114 before it receives any guest device
+    // tree. In that mode the host-fixed tree's removed "compatible" is only a
+    // direct-boot driver policy and must not hide hardware iBoot already used.
+    darwin_sep_create(dt_root, iobase, aic, iboot_mode);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
     // The ANS storage coprocessor owns its own /arm-io/ans mailbox as well as

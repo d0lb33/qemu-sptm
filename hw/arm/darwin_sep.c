@@ -272,6 +272,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define BOOT_IMG4              6
 #define BOOT_LOAD_SEP_ART      7
 #define BOOT_RESUME            8
+#define BOOT_GET_RANDOM_WORD  16
 #define BOOT_IBIC_QUERY        30
 #define BOOT_IBIC_WORD         31
 #define BOOT_TMM_MANIFEST      36
@@ -969,6 +970,19 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         // A nonce is only ever compared with itself later, so random is fine.
         qemu_guest_getrandom_nofail(&word, sizeof(word));
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, param, word);
+        break;
+    case BOOT_GET_RANDOM_WORD:
+        /*
+         * This iBoot build's bootstrap-command table maps request 0x10 to
+         * reply 0x74.  Its sole caller issues the request twice, combines the
+         * two 32-bit reply data fields, rejects zero, and uses the result as
+         * an xorshift PRNG seed.  Supply entropy rather than a fixed success
+         * value; the reply opcode is the table's evidenced request + 100.
+         */
+        qemu_guest_getrandom_nofail(&word, sizeof(word));
+        fprintf(stderr, "sep(%s): ROM: supplied 32-bit iBoot random seed word\n",
+                s->role);
+        sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, word);
         break;
     case BOOT_TZ0:
         s->status = SEP_STATUS_TZ0;
@@ -2318,9 +2332,18 @@ static struct dtree_node *sep_find_mapper(struct dtree_node *arm_io, uint32_t ph
     return NULL;
 }
 
-DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase, DeviceState *aic) {
+DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
+                               DeviceState *aic, bool required_by_iboot) {
     struct dtree_node *node = adt_find_node(dt_root, "arm-io/sep");
-    if (!node || !adt_get_prop_val(node, "compatible")) return NULL;
+    if (!node ||
+        (!required_by_iboot && !adt_get_prop_val(node, "compatible"))) {
+        return NULL;
+    }
+
+    if (required_by_iboot && !adt_get_prop_val(node, "compatible")) {
+        fprintf(stderr, "darwin-sep: enabling reg[0] for iBoot's evidenced"
+                " ASC mailbox access despite host-fixed compatible removal\n");
+    }
 
     struct adt_io_reg *reg = adt_get_prop_val(node, "reg");
     const char *role = adt_get_prop_val(node, "role");
