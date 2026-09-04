@@ -5,7 +5,10 @@
  * is an ARM core running Apple's RTKit RTOS, talking to the AP through a
  * small hardware mailbox. This models the AP-visible side of that:
  *
+ *   ASC core status (device tree "reg[1]"):
+ *     +0x0000  FIRMWARE_STATUS bit 0 = firmware image loaded
  *   ASC wrapper (device tree "reg[0]", compatible iop,ascwrap-v*):
+ *     +0x0040  AKF_RUNNING  bit 0 = firmware running
  *     +0x0044  CPU_CONTROL  bit 4 = RUN
  *     +0x0048  CPU_STATUS   bit 0 = running, bit 1 = stopped, bit 5 = idle
  *   Mailbox at +0x8000 (the "asc-mailbox-v4" layout):
@@ -44,12 +47,33 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(DarwinASCState, DARWIN_ASC)
 
+#define ASC_FIRMWARE_STATUS        0x00
+#define ASC_FIRMWARE_STATUS_LOADED BIT(0)
 #define ASC_CPU_CONTROL     0x44
 #define ASC_CPU_CONTROL_RUN BIT(4)
 #define ASC_CPU_STATUS      0x48
 #define ASC_CPU_STATUS_RUNNING BIT(0)
 #define ASC_CPU_STATUS_STOPPED BIT(1)
 #define ASC_CPU_STATUS_IDLE    BIT(5)
+
+/*
+ * Nodes with the `idle-ctrl-check` device-tree property first require bit 0
+ * of this register before consulting IDLE_STATUS.  AppleASCWrapV6::fn_0x720
+ * performs that gate at static 0xfffffff0085384cc..0xfffffff008538500, and
+ * the kext diagnostic string names the condition "AKF_RUNNING: False".
+ */
+#define ASC_AKF_RUNNING          0x40
+#define ASC_AKF_RUNNING_FIRMWARE BIT(0)
+
+/*
+ * AppleASCWrapV6::fn_0x720 reads this mailbox-block register and considers
+ * the IOP idle when either low bit is set (iOS 27 static 0xfffffff00853852c
+ * through 0xfffffff008538544).  AppleA7IOP's sleep path polls that method
+ * before it releases the power transition.
+ */
+#define ASC_IDLE_STATUS        0x8000
+#define ASC_IDLE_STATUS_IDLE   BIT(0)
+#define ASC_IDLE_STATUS_MASK   0x3
 
 #define MBOX_A2I_CTRL   0x110
 #define MBOX_I2A_CTRL   0x114
@@ -125,6 +149,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinASCState, DARWIN_ASC)
 #define MGMT_STARTEP_FLAG(m) ((m) & 3)
 
 #define MGMT_PWR_STATE(m)    ((m) & 0xffff)
+#define PWR_STATE_BASE(s)    ((s) & 0xff)
+#define PWR_STATE_SLEEP      0x01
+#define PWR_STATE_QUIESCED   0x10
 #define PWR_STATE_ON         0x20
 #define PWR_STATE_INIT       0x220
 
@@ -145,13 +172,14 @@ typedef struct {
 struct DarwinASCState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
+    MemoryRegion firmware_status_iomem;
     char *role;
     uint32_t mmio_size;
     uint32_t mbox_off;
     qemu_irq irq[4];
 
     // asc
-    uint32_t cpu_control, cpu_status;
+    uint32_t firmware_status, cpu_control, cpu_status;
     uint32_t *misc;
 
     // mailbox
@@ -275,9 +303,21 @@ static void rtk_send_epmap_block(DarwinASCState *s) {
     rtk_send_mgmt(s, msg);
 }
 
+static void asc_set_idle(DarwinASCState *s, bool idle);
+
 static void rtk_boot(DarwinASCState *s) {
     if (s->rtk_state != RTK_IDLE) return;
-    s->cpu_status = ASC_CPU_STATUS_RUNNING;
+    /*
+     * This model's RTKit implementation is the firmware image.  Once it has
+     * booted, retain the loaded-image witness across CPU power transitions.
+     * AppleASCWrapV6::fn_0x2ec reads bit 0 at wrapper offset 0 before a
+     * restart and otherwise panics "ASC firmware must be loaded by iBoot"
+     * (static 0xfffffff00853832c..0xfffffff00853834c).
+     */
+    s->firmware_status = ASC_FIRMWARE_STATUS_LOADED;
+    s->misc[ASC_AKF_RUNNING / sizeof(uint32_t)] =
+        ASC_AKF_RUNNING_FIRMWARE;
+    asc_set_idle(s, false);
     s->rtk_state = RTK_WAIT_HELLO_ACK;
     if (s->debug) fprintf(stderr, "asc(%s): booting, sending HELLO\n", s->role);
     rtk_send_mgmt(s, MGMT_MSG(MGMT_HELLO) | ((uint64_t)RTKIT_MAX_VERSION << 16) | RTKIT_MIN_VERSION);
@@ -292,6 +332,20 @@ static void rtk_booted(DarwinASCState *s) {
         rtk_send_mgmt(s, MGMT_MSG(MGMT_IOP_PWR_ACK) | PWR_STATE_ON);
     }
     if (s->ops && s->ops->started) s->ops->started(s->opaque);
+}
+
+static void asc_set_idle(DarwinASCState *s, bool idle)
+{
+    if (idle) {
+        s->cpu_status = ASC_CPU_STATUS_RUNNING | ASC_CPU_STATUS_IDLE;
+    } else {
+        s->cpu_status = ASC_CPU_STATUS_RUNNING;
+    }
+    if (ASC_IDLE_STATUS + sizeof(uint32_t) <= s->mmio_size) {
+        uint32_t *status = &s->misc[ASC_IDLE_STATUS / sizeof(uint32_t)];
+        *status = (*status & ~ASC_IDLE_STATUS_MASK) |
+                  (idle ? ASC_IDLE_STATUS_IDLE : 0);
+    }
 }
 
 static void rtk_handle_mgmt(DarwinASCState *s, uint64_t msg) {
@@ -331,6 +385,13 @@ static void rtk_handle_mgmt(DarwinASCState *s, uint64_t msg) {
         uint16_t st = MGMT_PWR_STATE(msg);
         fprintf(stderr, "asc(%s): AP requests IOP power state 0x%x\n", s->role, st);
         if (st == PWR_STATE_INIT || st == PWR_STATE_ON) {
+            /*
+             * INIT carries the ON state in its low byte.  AppleASCWrapV6
+             * separately polls CPU_STATUS.IDLE during the inverse transition,
+             * so a later wake must make that hardware status visible before
+             * acknowledging the RTKit request.
+             */
+            asc_set_idle(s, false);
             if (s->rtk_state == RTK_BOOTED) {
                 s->iop_pwr_state = PWR_STATE_ON;
                 rtk_send_mgmt(s, MGMT_MSG(MGMT_IOP_PWR_ACK) | PWR_STATE_ON);
@@ -339,8 +400,36 @@ static void rtk_handle_mgmt(DarwinASCState *s, uint64_t msg) {
                 rtk_boot(s);
             }
         } else {
+            /*
+             * iOS requests sleep as 0x201: the low byte is the RTKit power
+             * state and the upper bits are transition flags.  The management
+             * ACK retains the complete value, while the ASC wrapper exposes
+             * the corresponding hardware-idle bit.  Quiesced has the same
+             * AP-visible idle property.
+             */
+            uint16_t base = PWR_STATE_BASE(st);
+            if (base == PWR_STATE_SLEEP || base == PWR_STATE_QUIESCED) {
+                asc_set_idle(s, true);
+            }
             s->iop_pwr_state = st;
             rtk_send_mgmt(s, MGMT_MSG(MGMT_IOP_PWR_ACK) | st);
+            if (base == PWR_STATE_SLEEP || base == PWR_STATE_QUIESCED) {
+                /*
+                 * The ACK completes the old RTKit instance.  On iOS 27 DCP,
+                 * XNU then writes CPU_CONTROL from 0 to RUN and expects a new
+                * HELLO: ROOT_SM_FWREG1_UI1.stderr.log:4134-4147 shows the
+                * complete 0x201 ACK, idle/core-status checks, and that edge.
+                * Remaining RTK_BOOTED here suppresses rtk_boot() and leaves
+                * RTBuddy in _iopStatus 4 until its 20-second timeout.
+                *
+                * Endpoint state survives this firmware restart.  The AP's
+                * second EPMAP advertises the retained map and it does not
+                * replay START_EP messages (ROOT_SM_RESTART_ACK1_UI1).  Do not
+                * clear ep_started here or QEMU and the AP disagree about the
+                * live endpoint set after the new HELLO handshake.
+                 */
+                s->rtk_state = RTK_IDLE;
+            }
         }
         break;
     }
@@ -496,9 +585,19 @@ static void asc_write(void *opaque, hwaddr offset, uint64_t val, unsigned size) 
         bool was_run = s->cpu_control & ASC_CPU_CONTROL_RUN;
         s->cpu_control = val;
         if ((val & ASC_CPU_CONTROL_RUN) && !was_run) {
+            /*
+             * A CPU_CONTROL-driven restart has no preceding SET_IOP_PWR(ON),
+             * but RTBuddy still waits for IOP_PWR_ACK(ON) after the new
+             * HELLO/EPMAP handshake.  Use the same deferred-ACK path as the
+             * management-request-driven initial boot.
+             */
+            if (s->rtk_state == RTK_IDLE) {
+                s->iop_pwr_pending = true;
+            }
             rtk_boot(s);
         } else if (!(val & ASC_CPU_CONTROL_RUN) && was_run) {
             fprintf(stderr, "asc(%s): AP stopped the IOP\n", s->role);
+            s->misc[ASC_AKF_RUNNING / sizeof(uint32_t)] = 0;
             s->cpu_status = ASC_CPU_STATUS_STOPPED;
             s->rtk_state = RTK_IDLE;
             s->i2a_count = 0;
@@ -545,6 +644,43 @@ static const MemoryRegionOps asc_ops = {
     .valid.max_access_size = 8,
 };
 
+static uint64_t asc_firmware_status_read(void *opaque, hwaddr offset,
+                                         unsigned size)
+{
+    DarwinASCState *s = opaque;
+    uint64_t val = offset == ASC_FIRMWARE_STATUS ? s->firmware_status : 0;
+
+    if (s->debug) {
+        fprintf(stderr,
+                "asc(%s): core status read 0x%02" HWADDR_PRIx " -> 0x%" PRIx64 "\n",
+                s->role, offset, val);
+    }
+    return val;
+}
+
+static void asc_firmware_status_write(void *opaque, hwaddr offset,
+                                      uint64_t val, unsigned size)
+{
+    DarwinASCState *s = opaque;
+
+    if (s->debug) {
+        fprintf(stderr,
+                "asc(%s): ignored core status write 0x%02" HWADDR_PRIx
+                " <- 0x%" PRIx64 "\n",
+                s->role, offset, val);
+    }
+}
+
+static const MemoryRegionOps asc_firmware_status_ops = {
+    .read = asc_firmware_status_read,
+    .write = asc_firmware_status_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void asc_autostart_fire(void *opaque) {
     DarwinASCState *s = opaque;
     fprintf(stderr, "asc(%s): DARWIN_ASC_AUTOSTART firing, starting IOP without an AP request\n", s->role);
@@ -562,6 +698,10 @@ static void darwin_asc_realize(DeviceState *dev, Error **errp) {
     s->debug = getenv("DARWIN_ASC_DEBUG") != NULL;
     memory_region_init_io(&s->iomem, OBJECT(s), &asc_ops, s, "darwin-asc", s->mmio_size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    memory_region_init_io(&s->firmware_status_iomem, OBJECT(s),
+                          &asc_firmware_status_ops, s,
+                          "darwin-asc-firmware-status", sizeof(uint32_t));
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->firmware_status_iomem);
     for (int i = 0; i < 4; i++) sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
 
     const char *autostart = getenv("DARWIN_ASC_AUTOSTART");
@@ -635,6 +775,7 @@ DeviceState *darwin_asc_create(struct dtree_node *node, uint64_t iobase, DeviceS
                                const uint8_t *eps, int n_eps,
                                const DarwinASCOps *ops, void *opaque) {
     struct adt_io_reg *reg = adt_get_prop_val(node, "reg");
+    size_t n_regs = adt_get_prop_len(node, "reg") / sizeof(*reg);
     const char *role = adt_get_prop_val(node, "role");
     const char *name = adt_get_prop_val(node, "name");
     uint32_t *irqs = adt_get_prop_val(node, "interrupts");
@@ -655,6 +796,16 @@ DeviceState *darwin_asc_create(struct dtree_node *node, uint64_t iobase, DeviceS
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, reg[0].base + iobase);
+    if (n_regs > 1 && reg[1].len >= sizeof(uint32_t)) {
+        /*
+         * AppleASCWrapV6::initialize maps reg[1] as _coreMappedRegs, and its
+         * restart path reads bit 0 at reg[1]+0 (static
+         * 0xfffffff00853832c..0xfffffff00853834c).  Only that status word is
+         * claimed here; the remainder stays in the low-priority unimplemented
+         * backing region until its semantics are established.
+         */
+        sysbus_mmio_map(sbd, 1, reg[1].base + iobase);
+    }
     for (size_t i = 0; i < 4 && i < n_irqs; i++) {
         if (aic) sysbus_connect_irq(sbd, i, darwin_aic_get_irq(aic, irqs[i]));
     }
