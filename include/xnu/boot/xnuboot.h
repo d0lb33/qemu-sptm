@@ -41,8 +41,8 @@ typedef struct {
 
 struct xnu_boot_info {
     // Arguments to a -M darwin machine
-    char *bootkc, *args, *dtree, *sptm, *txm, *tc, *ramdisk;
-    mmap_file_t bootkc_f, dtree_f, sptm_f, txm_f, tc_f, ramdisk_f;
+    char *bootkc, *args, *dtree, *sptm, *txm, *tc, *ramdisk, *iboot;
+    mmap_file_t bootkc_f, dtree_f, sptm_f, txm_f, tc_f, ramdisk_f, iboot_f;
 
     uint64_t dram_base, dram_size;
     bool has_mte;
@@ -73,5 +73,7 @@ static void a##_darwin_class_set(Object *obj, const char *path, Error **errp) { 
 }
 
 void arm_load_xnu(ARMCPU *cpu, MachineState *ms, struct xnu_boot_info *info);
+void arm_load_xnu_iboot(ARMCPU *cpu, MachineState *ms,
+                        struct xnu_boot_info *info);
 
 #endif /* XNUBOOT_H */

@@ -11,8 +11,10 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "system/runstate.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "cpu.h"
 #include "xnu/boot/xnuboot.h"
 #include "xnu/apple_dtree.h"
 #include "xnu/darwin_unimp.h"
@@ -32,6 +34,8 @@ typedef struct {
 static UnimpNode *g_nodes;
 static int g_num_nodes;
 static bool g_debug;
+static bool g_stop_first;
+static int g_stop_requested;
 
 static const char *unimp_node_for(uint64_t pa, uint64_t *off) {
     for (int i = 0; i < g_num_nodes; i++) {
@@ -52,8 +56,29 @@ static void unimp_log(UnimpRegion *r, const char *op, uint64_t pa, uint64_t val,
     g_hash_table_insert(r->seen, key, GUINT_TO_POINTER(n + 1));
     uint64_t off;
     const char *node = unimp_node_for(pa, &off);
-    fprintf(stderr, "unimp: %s 0x%" PRIx64 " (%s+0x%" PRIx64 ") %s 0x%" PRIx64 " size %u\n",
-            op, pa, node, off, op[0] == 'r' ? "->" : "<-", val, size);
+    CPUState *cs = current_cpu;
+    CPUARMState *env = cs ? &ARM_CPU(cs)->env : NULL;
+    uint64_t pstate = env ? pstate_read(env) : 0;
+    unsigned int el = (pstate >> 2) & 3;
+
+    fprintf(stderr, "unimp: %s 0x%" PRIx64 " (%s+0x%" PRIx64
+            ") %s 0x%" PRIx64 " size %u pc=0x%" PRIx64
+            " el=%u pstate=0x%" PRIx64 " sp=0x%" PRIx64
+            " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
+            " x3=0x%" PRIx64 "%s\n",
+            op, pa, node, off, op[0] == 'r' ? "->" : "<-", val, size,
+            env ? env->pc : 0, el, pstate, env ? env->xregs[31] : 0,
+            env ? env->xregs[0] : 0, env ? env->xregs[1] : 0,
+            env ? env->xregs[2] : 0, env ? env->xregs[3] : 0,
+            cs ? "" : " (no current CPU)");
+
+    if (g_stop_first &&
+        qatomic_cmpxchg(&g_stop_requested, 0, 1) == 0) {
+        /* Keep the evidence ahead of the asynchronous pause request. */
+        fflush(stderr);
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(RUN_STATE_PAUSED);
+    }
 }
 
 static uint64_t unimp_read(void *opaque, hwaddr offset, unsigned size) {
@@ -139,7 +164,9 @@ void darwin_unimp_init(struct dtree_node *dt_root, uint64_t iobase) {
     struct dtree_node *arm_io = adt_find_node(dt_root, "arm-io");
     uint64_t *ranges = adt_get_prop_val(arm_io, "ranges");
     size_t n = adt_get_prop_len(arm_io, "ranges") / (3 * sizeof(uint64_t));
-    g_debug = getenv("DARWIN_UNIMP_DEBUG") != NULL;
+    g_stop_first = getenv("DARWIN_UNIMP_STOP_FIRST") != NULL;
+    g_stop_requested = 0;
+    g_debug = getenv("DARWIN_UNIMP_DEBUG") != NULL || g_stop_first;
     collect_nodes(arm_io, iobase);
 
     for (size_t i = 0; i < n; i++) {
