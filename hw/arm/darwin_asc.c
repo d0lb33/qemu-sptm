@@ -31,6 +31,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/core/sysbus.h"
@@ -574,6 +575,79 @@ static void darwin_asc_realize(DeviceState *dev, Error **errp) {
     }
 }
 
+static bool asc_autostart_timer_needed(void *opaque, int version_id)
+{
+    DarwinASCState *s = opaque;
+
+    return s->autostart_timer != NULL;
+}
+
+static int darwin_asc_post_load(void *opaque, int version_id)
+{
+    DarwinASCState *s = opaque;
+
+    if (s->i2a_head < 0 || s->i2a_head >= MBOX_FIFO_DEPTH ||
+        s->i2a_count < 0 || s->i2a_count > MBOX_FIFO_VISIBLE ||
+        s->pend_head < 0 || s->pend_head >= MBOX_PEND_DEPTH ||
+        s->pend_count < 0 || s->pend_count > MBOX_PEND_DEPTH ||
+        s->rtk_state < RTK_IDLE || s->rtk_state > RTK_BOOTED ||
+        s->epmap_next_block < 0 || s->epmap_next_block > 8 ||
+        (s->proto_version &&
+         (s->proto_version < RTKIT_MIN_VERSION ||
+          s->proto_version > RTKIT_MAX_VERSION))) {
+        return -EINVAL;
+    }
+    asc_update_irqs(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_asc_msg = {
+    .name = "darwin-asc/msg",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(msg0, ASCMsg),
+        VMSTATE_UINT64(msg1, ASCMsg),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_darwin_asc = {
+    .name = TYPE_DARWIN_ASC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_asc_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(mmio_size, DarwinASCState),
+        VMSTATE_UINT32_EQUAL(mbox_off, DarwinASCState),
+        VMSTATE_VBUFFER_UINT32(misc, DarwinASCState, 1, NULL, mmio_size),
+        VMSTATE_UINT32(cpu_control, DarwinASCState),
+        VMSTATE_UINT32(cpu_status, DarwinASCState),
+        VMSTATE_UINT32(a2i_ctrl_raw, DarwinASCState),
+        VMSTATE_UINT32(i2a_ctrl_raw, DarwinASCState),
+        VMSTATE_UINT64(a2i_send0, DarwinASCState),
+        VMSTATE_STRUCT_ARRAY(i2a_fifo, DarwinASCState, MBOX_FIFO_DEPTH, 1,
+                             vmstate_asc_msg, ASCMsg),
+        VMSTATE_INT32(i2a_head, DarwinASCState),
+        VMSTATE_INT32(i2a_count, DarwinASCState),
+        VMSTATE_STRUCT_ARRAY(pend_fifo, DarwinASCState, MBOX_PEND_DEPTH, 1,
+                             vmstate_asc_msg, ASCMsg),
+        VMSTATE_INT32(pend_head, DarwinASCState),
+        VMSTATE_INT32(pend_count, DarwinASCState),
+        VMSTATE_INT32(rtk_state, DarwinASCState),
+        VMSTATE_UINT16(proto_version, DarwinASCState),
+        VMSTATE_UINT64_ARRAY(ep_map, DarwinASCState, 8),
+        VMSTATE_INT32(epmap_next_block, DarwinASCState),
+        VMSTATE_BOOL(iop_pwr_pending, DarwinASCState),
+        VMSTATE_UINT16(iop_pwr_state, DarwinASCState),
+        VMSTATE_UINT16(ap_pwr_state, DarwinASCState),
+        VMSTATE_BOOL_ARRAY(ep_started, DarwinASCState, 256),
+        VMSTATE_TIMER_PTR_TEST(autostart_timer, DarwinASCState,
+                               asc_autostart_timer_needed),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_asc_properties[] = {
     DEFINE_PROP_STRING("role", DarwinASCState, role),
     DEFINE_PROP_UINT32("mmio-size", DarwinASCState, mmio_size, 0),
@@ -583,6 +657,7 @@ static const Property darwin_asc_properties[] = {
 static void darwin_asc_class_init(ObjectClass *klass, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_asc_realize;
+    dc->vmsd = &vmstate_darwin_asc;
     dc->desc = "Apple ASC coprocessor mailbox (RTKit)";
     device_class_set_props(dc, darwin_asc_properties);
     dc->user_creatable = false;

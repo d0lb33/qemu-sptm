@@ -33,6 +33,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
@@ -79,6 +80,8 @@ struct DarwinAICState {
     uint32_t *mask;          // [num_dies][words]
     uint32_t *misc;          // backing store for everything else
     qemu_irq *irqs_in;       // [num_dies * max_irq]
+    uint32_t irq_cfg_bytes;
+    uint32_t bitmap_bytes;
     bool line;
     bool debug;
 };
@@ -267,6 +270,8 @@ static void darwin_aic_realize(DeviceState *dev, Error **errp) {
     }
 
     s->words = s->max_irq / 32;
+    s->irq_cfg_bytes = s->num_dies * s->max_irq * sizeof(uint32_t);
+    s->bitmap_bytes = s->num_dies * s->words * sizeof(uint32_t);
     s->off_sw_set   = s->max_irq * 4;
     s->off_sw_clr   = s->off_sw_set + s->words * 4;
     s->off_mask_set = s->off_sw_clr + s->words * 4;
@@ -295,6 +300,46 @@ static void darwin_aic_realize(DeviceState *dev, Error **errp) {
     qdev_init_gpio_in(dev, aic_set_irq, s->num_dies * s->max_irq);
 }
 
+static int darwin_aic_post_load(void *opaque, int version_id)
+{
+    DarwinAICState *s = opaque;
+
+    if (s->irq_cfg_bytes != s->num_dies * s->max_irq * sizeof(uint32_t) ||
+        s->bitmap_bytes != s->num_dies * s->words * sizeof(uint32_t)) {
+        return -EINVAL;
+    }
+    /* irq_out is a destination-process qemu_irq.  Recompute its level from
+     * the restored hardware/software pending and mask arrays. */
+    s->line = false;
+    aic_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_aic = {
+    .name = TYPE_DARWIN_AIC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_aic_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(mmio_size, DarwinAICState),
+        VMSTATE_UINT32_EQUAL(max_irq, DarwinAICState),
+        VMSTATE_UINT32_EQUAL(num_dies, DarwinAICState),
+        VMSTATE_UINT32_EQUAL(irq_cfg_bytes, DarwinAICState),
+        VMSTATE_UINT32_EQUAL(bitmap_bytes, DarwinAICState),
+        VMSTATE_UINT32(config, DarwinAICState),
+        VMSTATE_VBUFFER_UINT32(irq_cfg, DarwinAICState, 1, NULL,
+                               irq_cfg_bytes),
+        VMSTATE_VBUFFER_UINT32(hw_state, DarwinAICState, 1, NULL,
+                               bitmap_bytes),
+        VMSTATE_VBUFFER_UINT32(sw_pending, DarwinAICState, 1, NULL,
+                               bitmap_bytes),
+        VMSTATE_VBUFFER_UINT32(mask, DarwinAICState, 1, NULL,
+                               bitmap_bytes),
+        VMSTATE_VBUFFER_UINT32(misc, DarwinAICState, 1, NULL, mmio_size),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_aic_properties[] = {
     DEFINE_PROP_UINT32("version", DarwinAICState, version, 3),
     DEFINE_PROP_UINT32("mmio-size", DarwinAICState, mmio_size, 0),
@@ -312,6 +357,7 @@ static const Property darwin_aic_properties[] = {
 static void darwin_aic_class_init(ObjectClass *klass, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_aic_realize;
+    dc->vmsd = &vmstate_darwin_aic;
     dc->desc = "Apple Interrupt Controller (AIC v2/v3)";
     device_class_set_props(dc, darwin_aic_properties);
     dc->user_creatable = false;
