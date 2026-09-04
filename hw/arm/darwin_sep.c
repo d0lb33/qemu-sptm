@@ -197,6 +197,9 @@
  * No code, struct or comment from either is reproduced in this file.
  *
  * Tracing: DARWIN_SEP_DEBUG=1 logs every register access and message.
+ * DARWIN_SKS_REQUEST_DEBUG=1 logs all AppleSEPKeyStore request bytes;
+ * DARWIN_SKS_REQUEST_DEBUG_CODE=N limits byte dumps to one wire opcode.
+ * Routine successful op19 traffic is sampled unless full debug is enabled.
  * Milestones (boot handshake, discovery, unknown opcodes) always log with
  * the "sep:" prefix.
  */
@@ -217,6 +220,7 @@
 #include "xnu/darwin_aic.h"
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_sep.h"
+#include "hw/arm/darwin_sks.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
@@ -454,29 +458,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
 /* fs_migrate_media_key_to_class request shape captured at
  * /tmp/dvm/probe/BOOTSTRAP_SEED_SKSDEBUG.stderr.log:579-595 and decoded in
- * docs/re/sks-op0f-media-key-migration.md.  The record itself stays opaque. */
-#define SKS_MIGRATE_REQUEST_SIZE       0xb0
-#define SKS_MIGRATE_VARIANT_OFF        0x4c
-#define SKS_MIGRATE_FIXED_ONE_OFF      0x50
-#define SKS_MIGRATE_FIXED_ZERO0_OFF    0x54
-#define SKS_MIGRATE_FIXED_ZERO1_OFF    0x58
-#define SKS_MIGRATE_FIXED_ZERO2_OFF    0x5c
-#define SKS_MIGRATE_FIXED_U64_OFF      0x60
-#define SKS_MIGRATE_FIXED_ZERO3_OFF    0x68
-#define SKS_MIGRATE_TARGET_CLASS_OFF   0x6c
-#define SKS_MIGRATE_FIXED_ZERO4_OFF    0x70
-#define SKS_MIGRATE_FIXED_ZERO5_OFF    0x74
-#define SKS_MIGRATE_RECORD_LEN_OFF     0x78
-#define SKS_MIGRATE_RECORD_OFF         0x7c
-#define SKS_MIGRATE_OUTPUT_CAP_OFF     0xa4
-#define SKS_MIGRATE_OUTPUT_AUX_OFF     0xa8
-#define SKS_MIGRATE_OUTPUT_SCALAR_OFF  0xac
-#define SKS_MIGRATE_REQUEST_VARIANT    3
+ * docs/re/sks-op0f-media-key-migration.md.  The pure request parser and its
+ * replayable constants live in darwin_sks.c; the record itself stays opaque. */
 #define SKS_MIGRATE_RESPONSE_VARIANT   3
-#define SKS_MIGRATE_TARGET_CLASS       0x0e
-#define SKS_MIGRATE_REQUEST_SCALAR     0
-#define SKS_MIGRATE_RESPONSE_CLASS     SKS_MIGRATE_TARGET_CLASS
 
+/* Later output-less calls use the same opcode and outer variant, but their
+ * input is a 28-byte tagged APFS volume identity rather than the 40-byte
+ * wrapped media-key record.  The exact class-4 User-volume request was
+ * recovered from the live SEP OOL page through dart-sep while
+ * ROOT_CCS_WAIT_TRACE3 was frozen before the strike-20 timeout.  Its first
+ * eight record bytes are opaque and vary with the filesystem; the remaining
+ * bytes are the User volume's stable qualified identity.  The class-3 call is
+ * the corresponding Data-volume operation: APFS identifies that volume as
+ * 61706673-7575-6964-0000-766F6C756D01 at
+ * /tmp/dvm/probe/ROOT_SKS_OP0F_DUMP1.serial.log:467-469, and the same 20-byte
+ * suffix is present in the live protected-object request captured at RAM
+ * 0x1a3c8074 in /tmp/dvm/lsd-scan.pCCjEq/ram2g.bin.  The full request at
+ * /tmp/dvm/probe/ROOT_SKS_OP0F_DATA_POS1.stderr.log:4117924-4117936 proves
+ * that the Data identity is record kind 4, target class 3.  It is the first
+ * unanswered request there and alone begins the selector 7/142 timeout at
+ * serial lines 1401-1418.
+ * Pair each observed class with its exact volume identity; do not accept an
+ * arbitrary tag or class/volume combination. */
 /* fs_check_class emits two live-captured selector-2 request shapes.  The
  * 0x70-byte class-1 query was already accepted on remount
  * (/tmp/dvm/probe/SKS_REMOUNT_V10.stderr.log:1912-1919).  The 0x8c-byte form
@@ -501,6 +504,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_CHECK_CLASS_LONG_ZERO_TAIL_SIZE 6
 #define SKS_CHECK_CLASS_REQUEST_VARIANT    2
 #define SKS_CHECK_CLASS_SHORT_CLASS        1
+#define SKS_CHECK_CLASS_SPECIAL_CLASS      17
 #define SKS_CHECK_CLASS_LONG_TAG           2
 #define SKS_CHECK_CLASS_LONG_SIZE          0x1c
 #define SKS_CHECK_CLASS_RESPONSE_SCALAR0_OFF 56
@@ -515,8 +519,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * SKS message after Early Boot Complete
  * (/tmp/dvm/probe/PERSIST_DCP_OP09_FIXED_3.stderr.log:698).  The same class-3
  * boundary is independently present in the storage-only cold boot at
- * /tmp/dvm/probe/SKS_OP09_COMPLETE_2.stderr.log:511.  Accept only these two
- * observed protection classes while keeping every other invariant strict.
+ * /tmp/dvm/probe/SKS_OP09_COMPLETE_2.stderr.log:511.  The crash-recovered
+ * persistent-Data control ROOT_SKS_TAGGED_POS1 then completed 714 qualified
+ * class-3/class-4 unwraps before the same exact request shape requested class
+ * 2 at stderr line 6183; its rejection is followed by the serial timeout
+ * sequence at lines 816-824.  After the display power-on path completed and
+ * userspace data migration reached dir-stats key 50987, the same exact shape
+ * requested class 17 at
+ * /tmp/dvm/probe/ROOT_DCP_WAKE_UI1.stderr.log:21307.  That unanswered request
+ * is immediately followed by PID 53's selector 17/35/7 timeout strikes at
+ * /tmp/dvm/probe/ROOT_DCP_WAKE_UI1.serial.log:1300-1318.  The positive-control
+ * reboot accepted class 17 and continued until this same exact request asked
+ * for class 1 at
+ * /tmp/dvm/probe/ROOT_SKS_OP09_CLASS17_UI2.stderr.log:138895; its rejection
+ * alone starts the selector 10/7 timeout sequence at serial lines 1330-1331.
+ * Accept only these five observed protection classes while keeping every
+ * other invariant strict.
  *
  * The selector-2 codec at 0xfffffff0095619e8..0x9561a4c calls the blob helper
  * at 0xfffffff00957f830 three times, then the scalar helper at
@@ -542,8 +560,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF     0x64
 #define SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF 0x68
 #define SKS_UNWRAP_FILE_KEY_VARIANT             1
+#define SKS_UNWRAP_FILE_KEY_CLASS_A             1
+#define SKS_UNWRAP_FILE_KEY_CLASS_B             2
 #define SKS_UNWRAP_FILE_KEY_CLASS_C             3
 #define SKS_UNWRAP_FILE_KEY_CLASS_D             4
+#define SKS_UNWRAP_FILE_KEY_CLASS_SPECIAL      17
 #define SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT    2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR   2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_THIRD_BLOB_SIZE 0
@@ -732,6 +753,11 @@ struct DarwinSEPState {
     const SEPEndpointDef *adv[ARRAY_SIZE(sep_all_eps)];
     int n_adv;
     bool debug;
+    bool sks_request_debug;
+    bool sks_request_debug_code_set;
+    uint8_t sks_request_debug_code;
+    uint64_t sks_op19_requests;
+    bool sks_log_current;
 };
 
 /* ---------------- frame helpers ---------------- */
@@ -1217,64 +1243,39 @@ static bool sep_sks_validate_change_lock_state_request(
 
 static bool sep_sks_validate_migrate_request(DarwinSEPState *s,
                                              const uint8_t *request,
-                                             uint32_t request_size)
+                                             uint32_t request_size,
+                                             uint32_t *response_class)
 {
-    uint32_t header_body_size = 0;
-    uint32_t ipc_version = 0;
-    uint32_t variant = 0;
-    uint32_t target_class = 0;
-    uint32_t record_len = 0;
-    uint32_t output_cap = 0;
-    uint32_t output_scalar = 0;
+    DarwinSKSMigrateRequest parsed;
 
-    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
-        header_body_size = ldl_le_p(request);
-        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
-    }
-    if (request_size >= SKS_MIGRATE_OUTPUT_SCALAR_OFF + sizeof(uint32_t)) {
-        variant = ldl_le_p(request + SKS_MIGRATE_VARIANT_OFF);
-        target_class = ldl_le_p(request + SKS_MIGRATE_TARGET_CLASS_OFF);
-        record_len = ldl_le_p(request + SKS_MIGRATE_RECORD_LEN_OFF);
-        output_cap = ldl_le_p(request + SKS_MIGRATE_OUTPUT_CAP_OFF);
-        output_scalar = ldl_le_p(request + SKS_MIGRATE_OUTPUT_SCALAR_OFF);
-    }
-
-    /* This accepts only the one statically decoded and live-captured variant.
-     * In particular, do not turn another union variant or record shape into a
-     * fake success: its response decoder and SEP side effects are unknown. */
-    if (request_size != SKS_MIGRATE_REQUEST_SIZE ||
-        header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
-        ipc_version != SKS_IPC_VERSION_1 ||
-        variant != SKS_MIGRATE_REQUEST_VARIANT ||
-        target_class != SKS_MIGRATE_TARGET_CLASS ||
-        record_len != SKS_WRAPPED_KEY_SIZE ||
-        output_cap != SKS_MEDIA_KEY_SIZE ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ONE_OFF) != 1 ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO0_OFF) != 0 ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO1_OFF) != 0 ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO2_OFF) != 0 ||
-        ldq_le_p(request + SKS_MIGRATE_FIXED_U64_OFF) != UINT64_MAX ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO3_OFF) != 0 ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO4_OFF) != 0 ||
-        ldl_le_p(request + SKS_MIGRATE_FIXED_ZERO5_OFF) != 0 ||
-        ldl_le_p(request + SKS_MIGRATE_OUTPUT_AUX_OFF) != 0 ||
-        output_scalar != SKS_MIGRATE_REQUEST_SCALAR ||
-        SKS_MIGRATE_RECORD_OFF + record_len !=
-            SKS_MIGRATE_OUTPUT_CAP_OFF) {
+    /* Do not turn another union variant or record shape into fake success.
+     * Both accepted forms are exact live captures; the opaque record bytes
+     * are deliberately neither interpreted nor persisted. */
+    if (!darwin_sks_parse_migrate_request(request, request_size, &parsed)) {
         fprintf(stderr, "sep(%s): sks op0f rejected unsupported migration "
                 "shape: request %u header 0x%x version %u variant %u "
                 "class %u record length %u output capacity %u output "
                 "scalar %u; no reply\n",
-                s->role, request_size, header_body_size, ipc_version, variant,
-                target_class, record_len, output_cap, output_scalar);
+                s->role, request_size, parsed.header_body_size,
+                parsed.ipc_version, parsed.variant, parsed.target_class,
+                parsed.record_len, parsed.output_cap, parsed.output_scalar);
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks op0f accepted request length %u variant %u "
-            "class %u, opaque record length %u, output capacity %u, output "
-            "scalar %u\n",
-            s->role, request_size, variant, target_class, record_len,
-            output_cap, output_scalar);
+    *response_class = parsed.target_class;
+    if (parsed.shape == DARWIN_SKS_MIGRATE_WRAPPED_KEY) {
+        fprintf(stderr, "sep(%s): sks op0f accepted wrapped-key request "
+                "length %u variant %u class %u, opaque record length %u, "
+                "output capacity %u, output scalar %u\n",
+                s->role, request_size, parsed.variant, parsed.target_class,
+                parsed.record_len, parsed.output_cap, parsed.output_scalar);
+    } else {
+        fprintf(stderr, "sep(%s): sks op0f accepted tagged-volume request "
+                "length %u variant %u record-kind %u class %u, opaque "
+                "record length %u, no output tail\n",
+                s->role, request_size, parsed.variant, parsed.record_kind,
+                parsed.target_class, parsed.record_len);
+    }
     return true;
 }
 
@@ -1320,12 +1321,21 @@ static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
     /* The persistent-Data normal boot adds class 2 to the same long-form
      * request already proven for classes 3 and 4.  It is the final request
      * before the SKS timeout at /tmp/dvm/probe/
-     * PERSIST_NVME_ROLES_PREINIT_TZ1_BOOT1.stderr.log:1480.  Keep the other
-     * shape checks intact so this does not broaden any selector, object, or
-     * UUID semantics. */
+     * PERSIST_NVME_ROLES_PREINIT_TZ1_BOOT1.stderr.log:1480.  A later
+     * 600-second positive control crosses that boundary repeatedly, then
+     * reaches the same 140-byte variant-2 request with class 17 at
+     * ROOT_SKS_CLASS2_POS1.stderr.log:15157; its rejection alone begins the
+     * timeout sequence at serial lines 912-917.  The next boot reaches the
+     * same long form with class 1 at ROOT_SKS_CLASS17_POS1.stderr.log:74829,
+     * distinct from the already accepted class-1 short availability query;
+     * it alone starts the serial timeout at lines 892-894.  Keep every
+     * remaining shape check intact so none of these observations broadens
+     * selector, object, or UUID semantics. */
     long_shape = request_size == SKS_CHECK_CLASS_REQUEST_SIZE &&
-        (protection_class == 2 || protection_class == 3 ||
-         protection_class == 4) &&
+        (protection_class == SKS_CHECK_CLASS_SHORT_CLASS ||
+         protection_class == 2 || protection_class == 3 ||
+         protection_class == 4 ||
+         protection_class == SKS_CHECK_CLASS_SPECIAL_CLASS) &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_TAG_OFF) ==
             SKS_CHECK_CLASS_LONG_TAG &&
         ldl_le_p(request + SKS_CHECK_CLASS_LONG_SIZE_OFF) ==
@@ -1385,8 +1395,11 @@ static bool sep_sks_validate_unwrap_file_key_request(
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF) != 0 ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF) != UINT32_MAX ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF) != 0 ||
-        (protection_class != SKS_UNWRAP_FILE_KEY_CLASS_C &&
-         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_D) ||
+        (protection_class != SKS_UNWRAP_FILE_KEY_CLASS_A &&
+         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_B &&
+         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_C &&
+         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_D &&
+         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_SPECIAL) ||
         ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF) != 0 ||
         output_selector != SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT) {
         fprintf(stderr, "sep(%s): sks op09 rejected unsupported filesystem "
@@ -1442,9 +1455,13 @@ static bool sep_sks_validate_get_device_state_request(
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks op19 accepted request length %u selector "
-            "%u opaque context 0x%016" PRIx64 " state %" PRId32 "\n",
-            s->role, request_size, selector, context, state);
+    if (s->sks_log_current) {
+        fprintf(stderr, "sep(%s): sks op19 request #%" PRIu64
+                " accepted length %u selector %u opaque context "
+                "0x%016" PRIx64 " state %" PRId32 "\n",
+                s->role, s->sks_op19_requests, request_size, selector,
+                context, state);
+    }
     return true;
 }
 
@@ -1464,9 +1481,11 @@ static bool sep_sks_send_response(DarwinSEPState *s, uint64_t m,
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks code 0x%02x id %u replied with %u-byte "
-            "SHA-256-authenticated IPC v1 message\n", s->role, sks_code(m),
-            frame_op(m), response_size);
+    if (s->sks_log_current) {
+        fprintf(stderr, "sep(%s): sks code 0x%02x id %u replied with %u-byte "
+                "SHA-256-authenticated IPC v1 message\n", s->role,
+                sks_code(m), frame_op(m), response_size);
+    }
     sep_send(s, SEP_EP_KEYSTORE, frame_tag(m) | SKS_MSG_REPLY, frame_op(m),
              0, response_size << 16);
     return true;
@@ -1481,7 +1500,9 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
     uint8_t *payload;
     uint32_t payload_size;
     uint32_t check_class = 0;
+    uint32_t migrate_class = 0;
     bool check_class_echo = false;
+    bool request_debug;
     const char *name;
 
     if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
@@ -1495,7 +1516,28 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         return;
     }
 
-    if (s->debug) {
+    request_debug = s->debug || s->sks_request_debug ||
+                    (s->sks_request_debug_code_set &&
+                     s->sks_request_debug_code == sks_code(m));
+
+    /*
+     * A normal boot can issue hundreds of thousands of successful op19
+     * device-state queries.  Logging every accepted request and reply once
+     * produced a 280 MB stderr transcript and materially slowed the run.
+     * Keep every malformed/error report, every non-op19 operation, and every
+     * explicitly requested debug dump.  For routine successful op19 traffic,
+     * log enough samples to prove continued progress without turning stderr
+     * into part of the workload.
+     */
+    s->sks_log_current = true;
+    if (sks_code(m) == SKS_GET_DEVICE_STATE) {
+        uint64_t n = ++s->sks_op19_requests;
+
+        s->sks_log_current = request_debug || n <= 8 ||
+                             (n & (n - 1)) == 0 || n % 10000 == 0;
+    }
+
+    if (request_debug) {
         uint32_t n = MIN(request_size, SKS_IPC_V1_HEADER_SIZE + 96);
         fprintf(stderr, "sep(%s): sks code 0x%02x id %u request bytes:",
                 s->role, sks_code(m), frame_op(m));
@@ -1554,7 +1596,8 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         /* The request's variant-3 decoder publishes one pointer/length output
          * pair (AppleSEPKeyStore 0xfffffff00957bbcc..0x957bc60).  Reject any
          * unobserved input shape rather than returning a misleading success. */
-        if (!sep_sks_validate_migrate_request(s, request, request_size)) {
+        if (!sep_sks_validate_migrate_request(s, request, request_size,
+                                              &migrate_class)) {
             return;
         }
         name = "migrate media key to class (fake-key mode)";
@@ -1685,13 +1728,15 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         memset(payload + 2 * sizeof(uint32_t) + sizeof(sks_device_state), 0,
                SKS_GET_DEVICE_STATE_RESPONSE_BLOB_PADDED_SIZE -
                    sizeof(sks_device_state));
-        fprintf(stderr, "sep(%s): sks op19 returns selector %u with a "
-                "%u-byte DER device-state blob (bh=-6) in a %zu-byte "
-                "IPC v1 reply\n", s->role,
-                SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR,
-                SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE,
-                SKS_IPC_V1_HEADER_SIZE +
-                    SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
+        if (s->sks_log_current) {
+            fprintf(stderr, "sep(%s): sks op19 returns selector %u with a "
+                    "%u-byte DER device-state blob (bh=-6) in a %zu-byte "
+                    "IPC v1 reply\n", s->role,
+                    SKS_GET_DEVICE_STATE_RESPONSE_SELECTOR,
+                    SKS_GET_DEVICE_STATE_RESPONSE_BLOB_SIZE,
+                    SKS_IPC_V1_HEADER_SIZE +
+                        SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
+        }
         break;
     case SKS_NEGOTIATE:
         stl_le_p(payload, 0);
@@ -1708,15 +1753,15 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         stl_le_p(payload + 4, SKS_WRAPPED_KEY_SIZE);
         memcpy(payload + 8, sks_wrapped_key, SKS_WRAPPED_KEY_SIZE);
         /* The generated bridge copies a trailing scalar back through its
-         * optional output pointer at 0xfffffff00957bbf4..0x957bc60.  APFS
-         * requires it to match the requested class 14 at
-         * 0xfffffff00a875598..0xa8755a4; zero is the distinct request-side
-         * field captured at +0xac. */
-        stl_le_p(payload + 8 + SKS_WRAPPED_KEY_SIZE,
-                 SKS_MIGRATE_RESPONSE_CLASS);
+         * optional output pointer at 0xfffffff00957bbf4..0x957bc60.  The
+         * established APFS path requires it to match requested class 14 at
+         * 0xfffffff00a875598..0xa8755a4.  The later tagged-volume caller has
+         * no output pointer, but receives the same valid union with its
+         * captured class 4 rather than a fabricated fixed class. */
+        stl_le_p(payload + 8 + SKS_WRAPPED_KEY_SIZE, migrate_class);
         fprintf(stderr, "sep(%s): sks op0f supplies migrated record length %u "
                 "and output class %u for variant %u\n", s->role,
-                SKS_WRAPPED_KEY_SIZE, SKS_MIGRATE_RESPONSE_CLASS,
+                SKS_WRAPPED_KEY_SIZE, migrate_class,
                 SKS_MIGRATE_RESPONSE_VARIANT);
         break;
     }
@@ -1810,8 +1855,11 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
         break;
     }
 
-    fprintf(stderr, "sep(%s): sks code 0x%02x id %u (%s), request %u bytes\n",
-            s->role, sks_code(m), frame_op(m), name, request_size);
+    if (s->sks_log_current) {
+        fprintf(stderr,
+                "sep(%s): sks code 0x%02x id %u (%s), request %u bytes\n",
+                s->role, sks_code(m), frame_op(m), name, request_size);
+    }
     sep_sks_send_response(s, m, response,
                           SKS_IPC_V1_HEADER_SIZE + payload_size);
 }
@@ -2199,6 +2247,24 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     s->cpu_status = ASC_CPU_STATUS_STOPPED;
     s->status = SEP_STATUS_ROM;
     s->debug = getenv("DARWIN_SEP_DEBUG") != NULL;
+    const char *sks_request_debug = getenv("DARWIN_SKS_REQUEST_DEBUG");
+    s->sks_request_debug = sks_request_debug && sks_request_debug[0] &&
+                           sks_request_debug[0] != '0';
+    const char *sks_request_debug_code =
+        getenv("DARWIN_SKS_REQUEST_DEBUG_CODE");
+    if (sks_request_debug_code && sks_request_debug_code[0]) {
+        char *end = NULL;
+        unsigned long code = strtoul(sks_request_debug_code, &end, 0);
+
+        if (end != sks_request_debug_code && *end == '\0' && code <= 0x7f) {
+            s->sks_request_debug_code_set = true;
+            s->sks_request_debug_code = code;
+        } else {
+            fprintf(stderr, "sep(%s): ignoring invalid "
+                    "DARWIN_SKS_REQUEST_DEBUG_CODE=%s (expected 0..0x7f)\n",
+                    s->role, sks_request_debug_code);
+        }
+    }
     sep_pick_endpoints(s);
     memory_region_init_io(&s->iomem, OBJECT(s), &sep_ops, s, "darwin-sep", s->mmio_size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);

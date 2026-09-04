@@ -127,6 +127,7 @@ endif
 
 if have_system
   tests += {
+    'test-darwin-sks-migrate': [meson.project_source_root() / 'hw/arm/darwin_sks.c'],
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
     'test-iov': [],
     'test-opts-visitor': [testqapi],
