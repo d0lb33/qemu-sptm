@@ -166,8 +166,32 @@
  * A third contiguous sequence covers range 2 +0x400c4..+0x4013c.  Its 31
  * descriptor/value pairs are research raw +0x274898..+0x274aa0 and release
  * raw +0x272448..+0x272650.  Both bounded traces produce the same writes.
- * Three table candidates name +0x40140; the evidenced bin/revision path in
- * both builds selects the first, (mask,value)=(0x30000000,0), exactly once.
+ * Three table candidates name +0x40140.  The evidenced bin/revision path in
+ * both builds first selects (mask,value)=(0x30000000,0), then revisits the
+ * same cold-zero RMW after the post-sparse +0x58010/+0x5c008 pair.
+ * The immediately following +0x40144 record has the same selected
+ * (mask,value) pair in both images and both diagnostic continuations.
+ * The selected list then revisits range-2 selector words 4..7 at
+ * +0x40158..+0x40164.  Their first-pass value is 0x80000001; the common
+ * (mask,value)=(0x0300003f,0x03000001) records at research raw
+ * +0x274b08..+0x274b38 and release raw +0x2726b8..+0x2726e8 yield the exact
+ * second request 0x83000001 while leaving the polled bit 30 clear.
+ * The next selected records are a sparse range-2 group at +0x68000,
+ * +0x68004, +0x68924, +0x69248, +0x69b6c, +0x6a490, +0x6adb4, and
+ * +0x6b6d8.  Research raw +0x278b88..+0x278cb8 and release raw
+ * +0x276738..+0x276868 contain the cross-build-identical masks and values;
+ * both diagnostic continuations produce the same cold-zero results.
+ * After exact second requests 0x84000002/0x85000002 to selector words 0/1,
+ * the selected path applies two more cold-zero RMWs at +0x58010 and
+ * +0x5c008.  The selected descriptor pairs are research raw
+ * +0x274c10/+0x276010 and release raw +0x2727c0/+0x273bc0; their
+ * cross-build-identical masks are 0x1 and 0x10000 and both values are zero.
+ * Bounded diagnostic continuations write zero at both addresses.
+ * That repeat is followed by the exact selector-word-8 request 0x82000024.
+ * Its selected (mask,value)=(0x070003ff,0x02000024) tuple is at research raw
+ * +0x2f06b8 and release raw +0x2ed948; the corresponding descriptors are
+ * research +0x274b70 and release +0x272720.  The next first unsupported
+ * access in both images is range 2 +0x6f000.
  */
 
 #include "qemu/osdep.h"
@@ -214,7 +238,10 @@
 #define D47_PMGR_RANGE2_SIGNED_TAIL_COUNT 31
 #define D47_PMGR_RANGE2_SIGNED_MAX_COUNT 31
 #define D47_PMGR_RANGE2_SIGNED_140_OFFSET UINT64_C(0x40140)
-#define D47_PMGR_RANGE2_SIGNED_140_COUNT 1
+#define D47_PMGR_RANGE2_SIGNED_140_COUNT 2
+#define D47_PMGR_RANGE2_SPARSE_OFFSET UINT64_C(0x68000)
+#define D47_PMGR_RANGE2_SPARSE_COUNT 8
+#define D47_PMGR_RANGE2_POST_SPARSE_COUNT 2
 #define D47_PMGR_DOMAIN_STATE_OFFSET UINT64_C(0x20)
 #define D47_PMGR_DOMAIN_STATE_COUNT 2
 #define D47_PMGR_MASKED_TUNABLE_COUNT 26
@@ -300,11 +327,18 @@ typedef struct DarwinPMGRRange2SignedContinuation {
     uint32_t words[D47_PMGR_RANGE2_SIGNED_MAX_COUNT];
     const uint32_t *masks;
     const uint32_t *values;
+    const uint32_t *offsets;
     uint64_t pmgr_offset;
     unsigned count;
     unsigned step;
     bool *ready;
+    unsigned *ready_phase;
+    unsigned required_phase;
     bool complete;
+    bool *repeat_ready;
+    uint32_t repeat_mask;
+    uint32_t repeat_value;
+    unsigned repeat_step;
 } DarwinPMGRRange2SignedContinuation;
 
 typedef struct DarwinPMGRTopologyBlock {
@@ -410,6 +444,9 @@ typedef struct DarwinPMGRIboot {
     DarwinPMGRRange2SignedContinuation range2_signed_continuation;
     DarwinPMGRRange2SignedContinuation range2_signed_tail;
     DarwinPMGRRange2SignedContinuation range2_signed_140;
+    DarwinPMGRRange2SignedContinuation range2_sparse;
+    DarwinPMGRRange2SignedContinuation range2_post_sparse[
+        D47_PMGR_RANGE2_POST_SPARSE_COUNT];
     DarwinPMGRTopologyBlock topology_blocks[D47_PMGR_TOPOLOGY_BLOCK_COUNT];
     DarwinPMGRConfigSelector config_selectors[
         D47_PMGR_CONFIG_SELECTOR_COUNT];
@@ -493,11 +530,38 @@ static const uint32_t d47_range2_signed_tail_values[
 };
 
 static const uint32_t d47_range2_signed_140_masks[] = {
-    0x30000000,
+    0x30000000, 0x30000000,
 };
 
 static const uint32_t d47_range2_signed_140_values[] = {
-    0x00000000,
+    0x00000000, 0x00000000,
+};
+
+static const uint32_t d47_range2_sparse_offsets[] = {
+    0x0000, 0x0004, 0x0924, 0x1248,
+    0x1b6c, 0x2490, 0x2db4, 0x36d8,
+};
+
+static const uint32_t d47_range2_sparse_masks[] = {
+    0x00000005, 0x00000001, 0x00000001, 0x00000005,
+    0x00000001, 0x00000005, 0x00000005, 0x00000005,
+};
+
+static const uint32_t d47_range2_sparse_values[] = {
+    0x00000001, 0x00000001, 0x00000000, 0x00000000,
+    0x00000001, 0x00000004, 0x00000005, 0x00000000,
+};
+
+static const uint64_t d47_range2_post_sparse_offsets[] = {
+    0x58010, 0x5c008,
+};
+
+static const uint32_t d47_range2_post_sparse_masks[] = {
+    0x00000001, 0x00010000,
+};
+
+static const uint32_t d47_range2_post_sparse_values[] = {
+    0x00000000, 0x00000000,
 };
 
 static uint64_t darwin_pmgr_mcc_tunable_read(void *opaque, hwaddr offset,
@@ -646,25 +710,56 @@ invalid_write:
     exit(EXIT_FAILURE);
 }
 
+static bool darwin_pmgr_range2_sequence_ready(
+    const DarwinPMGRRange2SignedContinuation *tuning)
+{
+    if (tuning->ready) {
+        return *tuning->ready;
+    }
+    if (tuning->ready_phase) {
+        return *tuning->ready_phase == tuning->required_phase;
+    }
+    return false;
+}
+
 static uint64_t darwin_pmgr_range2_signed_cont_read(void *opaque,
                                                      hwaddr offset,
                                                      unsigned size)
 {
     DarwinPMGRRange2SignedContinuation *tuning = opaque;
     unsigned record = tuning->step / 2;
+    hwaddr expected_offset;
 
-    if (!tuning->ready || !*tuning->ready || !tuning->masks ||
+    if (tuning->complete && tuning->repeat_ready &&
+        *tuning->repeat_ready && tuning->repeat_step == 0 &&
+        offset == 0 && size == 4) {
+        tuning->repeat_step++;
+        return tuning->words[0];
+    }
+
+    if (!darwin_pmgr_range2_sequence_ready(tuning) || !tuning->masks ||
         !tuning->values || !tuning->count || size != 4 ||
         tuning->step >= 2 * tuning->count ||
-        (tuning->step & 1) || offset != record * 4) {
-        error_report("darwin-pmgr: invalid range2 signed continuation read"
-                     " offset=0x%" HWADDR_PRIx " size=%u step=%u ready=%u",
-                     offset, size, tuning->step,
-                     tuning->ready ? *tuning->ready : 0);
-        exit(EXIT_FAILURE);
+        (tuning->step & 1)) {
+        goto invalid_read;
+    }
+    expected_offset = tuning->offsets ? tuning->offsets[record] : record * 4;
+    if (offset != expected_offset) {
+        goto invalid_read;
     }
     tuning->step++;
     return tuning->words[record];
+
+invalid_read:
+    error_report("darwin-pmgr: invalid range2 signed continuation read"
+                 " table=+0x%" PRIx64 " offset=0x%" HWADDR_PRIx
+                 " size=%u step=%u ready=%u"
+                 " ready-phase=%u required-phase=%u",
+                 tuning->pmgr_offset, offset, size, tuning->step,
+                 darwin_pmgr_range2_sequence_ready(tuning),
+                 tuning->ready_phase ? *tuning->ready_phase : 0,
+                 tuning->required_phase);
+    exit(EXIT_FAILURE);
 }
 
 static void darwin_pmgr_range2_signed_cont_write(void *opaque,
@@ -674,12 +769,35 @@ static void darwin_pmgr_range2_signed_cont_write(void *opaque,
 {
     DarwinPMGRRange2SignedContinuation *tuning = opaque;
     unsigned record = tuning->step / 2;
+    hwaddr expected_offset;
     uint32_t expected;
 
-    if (!tuning->ready || !*tuning->ready || !tuning->masks ||
+    if (tuning->complete && tuning->repeat_ready &&
+        *tuning->repeat_ready && tuning->repeat_step == 1 &&
+        offset == 0 && size == 4 && value <= UINT32_MAX) {
+        expected = (tuning->words[0] & ~tuning->repeat_mask) |
+                   (tuning->repeat_value & tuning->repeat_mask);
+        if (value != expected) {
+            goto invalid_write;
+        }
+        tuning->words[0] = expected;
+        tuning->repeat_step++;
+        fprintf(stderr,
+                "darwin-pmgr: range2 signed-table repeat +0x%" PRIx64
+                " complete mask=0x%08x value=0x%08x result=0x%08x\n",
+                tuning->pmgr_offset, tuning->repeat_mask,
+                tuning->repeat_value, tuning->words[0]);
+        return;
+    }
+
+    if (!darwin_pmgr_range2_sequence_ready(tuning) || !tuning->masks ||
         !tuning->values || !tuning->count || size != 4 ||
         value > UINT32_MAX || tuning->step >= 2 * tuning->count ||
-        !(tuning->step & 1) || offset != record * 4) {
+        !(tuning->step & 1)) {
+        goto invalid_write;
+    }
+    expected_offset = tuning->offsets ? tuning->offsets[record] : record * 4;
+    if (offset != expected_offset) {
         goto invalid_write;
     }
     expected = (tuning->words[record] &
@@ -691,22 +809,30 @@ static void darwin_pmgr_range2_signed_cont_write(void *opaque,
     tuning->words[record] = expected;
     tuning->step++;
     if (tuning->step == 2 * tuning->count) {
+        uint64_t final_offset = tuning->offsets ?
+            tuning->offsets[tuning->count - 1] : (tuning->count - 1) * 4;
+
         tuning->complete = true;
         fprintf(stderr,
                 "darwin-pmgr: range2 signed-table sequence"
                 " +0x%" PRIx64 "..+0x%" PRIx64
                 " complete (%u RMW records)\n",
                 tuning->pmgr_offset,
-                tuning->pmgr_offset + (tuning->count - 1) * 4,
+                tuning->pmgr_offset + final_offset,
                 tuning->count);
     }
     return;
 
 invalid_write:
     error_report("darwin-pmgr: invalid range2 signed continuation write"
-                 " offset=0x%" HWADDR_PRIx " value=0x%" PRIx64
-                 " size=%u step=%u ready=%u", offset, value, size,
-                 tuning->step, tuning->ready ? *tuning->ready : 0);
+                 " table=+0x%" PRIx64 " offset=0x%" HWADDR_PRIx
+                 " value=0x%" PRIx64
+                 " size=%u step=%u ready=%u ready-phase=%u"
+                 " required-phase=%u", tuning->pmgr_offset, offset, value,
+                 size, tuning->step,
+                 darwin_pmgr_range2_sequence_ready(tuning),
+                 tuning->ready_phase ? *tuning->ready_phase : 0,
+                 tuning->required_phase);
     exit(EXIT_FAILURE);
 }
 
@@ -2167,6 +2293,22 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         [39] = 0x10000000,
         [40] = 0x01000000,
     };
+    static const uint32_t range2_second_requests[
+        D47_PMGR_CONFIG_SELECTOR_COUNT] = {
+        [0] = 0x84000002,
+        [1] = 0x85000002,
+        [4] = 0x83000001,
+        [5] = 0x83000001,
+        [6] = 0x83000001,
+        [7] = 0x83000001,
+        [8] = 0x82000024,
+    };
+    const uint16_t range2_second_valid =
+        (UINT16_C(1) << 0) | (UINT16_C(1) << 1) |
+        (UINT16_C(1) << 4) |
+        (UINT16_C(1) << 5) |
+        (UINT16_C(1) << 6) | (UINT16_C(1) << 7) |
+        (UINT16_C(1) << 8);
     const uint64_t range3_second_valid =
         (UINT64_C(1) << 0) | (UINT64_C(1) << 1) |
         (UINT64_C(1) << 2) | (UINT64_C(1) << 3) |
@@ -2205,9 +2347,25 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                     D47_PMGR_RANGE2_SIGNED_140_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_signed_140_values) ==
                     D47_PMGR_RANGE2_SIGNED_140_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_sparse_offsets) ==
+                    D47_PMGR_RANGE2_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_sparse_masks) ==
+                    D47_PMGR_RANGE2_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_sparse_values) ==
+                    D47_PMGR_RANGE2_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_post_sparse_offsets) ==
+                    D47_PMGR_RANGE2_POST_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_post_sparse_masks) ==
+                    D47_PMGR_RANGE2_POST_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_post_sparse_values) ==
+                    D47_PMGR_RANGE2_POST_SPARSE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(range2_second_requests) ==
+                    D47_PMGR_CONFIG_SELECTOR_COUNT);
     G_STATIC_ASSERT(D47_PMGR_RANGE2_SIGNED_CONT_COUNT <=
                     D47_PMGR_RANGE2_SIGNED_MAX_COUNT);
     G_STATIC_ASSERT(D47_PMGR_RANGE2_SIGNED_TAIL_COUNT <=
+                    D47_PMGR_RANGE2_SIGNED_MAX_COUNT);
+    G_STATIC_ASSERT(D47_PMGR_RANGE2_SPARSE_COUNT <=
                     D47_PMGR_RANGE2_SIGNED_MAX_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(domain_state_reg_indices) ==
                     D47_PMGR_DOMAIN_STATE_COUNT);
@@ -2250,7 +2408,11 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                       D47_PMGR_RANGE2_SIGNED_CONT_COUNT * 4 ||
         regs[2].len < D47_PMGR_RANGE2_SIGNED_TAIL_OFFSET +
                       D47_PMGR_RANGE2_SIGNED_TAIL_COUNT * 4 ||
-        regs[2].len < D47_PMGR_RANGE2_SIGNED_140_OFFSET + 4 ||
+        regs[2].len < D47_PMGR_RANGE2_SIGNED_140_OFFSET +
+                      D47_PMGR_RANGE2_SIGNED_140_COUNT * 4 ||
+        regs[2].len < D47_PMGR_RANGE2_SPARSE_OFFSET +
+                      d47_range2_sparse_offsets[
+                          D47_PMGR_RANGE2_SPARSE_COUNT - 1] + 4 ||
         regs[2].len < D47_PMGR_CONFIG_SELECTOR_OFFSET +
                       D47_PMGR_CONFIG_SELECTOR_COUNT * 4 ||
         regs[2].len < soc_tunable_offsets[
@@ -2528,7 +2690,7 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         memory_region_init_io(&s->range2_signed_140.mr, NULL,
                               &darwin_pmgr_range2_signed_cont_ops,
                               &s->range2_signed_140,
-                              "darwin-pmgr-iboot-range2-signed-140", 4);
+                              "darwin-pmgr-iboot-range2-signed-140", 8);
         memory_region_add_subregion_overlap(get_system_memory(), pa,
                                             &s->range2_signed_140.mr, 10);
         for (i = 0; i < D47_PMGR_TOPOLOGY_BLOCK_COUNT; i++) {
@@ -2548,6 +2710,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
 
             slot->index = i;
             slot->kind = "range2 selector";
+            slot->second_valid = range2_second_valid & (UINT16_C(1) << i);
+            slot->second_value = range2_second_requests[i];
             pa = iobase + regs[2].base + D47_PMGR_CONFIG_SELECTOR_OFFSET +
                  i * 4;
             memory_region_init_io(&slot->mr, NULL,
@@ -2556,6 +2720,51 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
             memory_region_add_subregion_overlap(get_system_memory(), pa,
                                                 &slot->mr, 10);
         }
+        s->range2_sparse.offsets = d47_range2_sparse_offsets;
+        s->range2_sparse.masks = d47_range2_sparse_masks;
+        s->range2_sparse.values = d47_range2_sparse_values;
+        s->range2_sparse.pmgr_offset = D47_PMGR_RANGE2_SPARSE_OFFSET;
+        s->range2_sparse.count = D47_PMGR_RANGE2_SPARSE_COUNT;
+        s->range2_sparse.ready_phase = &s->config_selectors[7].phase;
+        /*
+         * The last selected config word enters this group immediately after
+         * its exact second write (phase 5), without the optional final poll
+         * read that would advance the selector to phase 6.  Requiring this
+         * exact phase keeps the sparse table ordered behind that request.
+         */
+        s->range2_sparse.required_phase = 5;
+        pa = iobase + regs[2].base + D47_PMGR_RANGE2_SPARSE_OFFSET;
+        memory_region_init_io(&s->range2_sparse.mr, NULL,
+                              &darwin_pmgr_range2_signed_cont_ops,
+                              &s->range2_sparse,
+                              "darwin-pmgr-iboot-range2-sparse", 0x36dc);
+        memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                            &s->range2_sparse.mr, 10);
+        for (i = 0; i < D47_PMGR_RANGE2_POST_SPARSE_COUNT; i++) {
+            DarwinPMGRRange2SignedContinuation *slot =
+                &s->range2_post_sparse[i];
+
+            slot->masks = &d47_range2_post_sparse_masks[i];
+            slot->values = &d47_range2_post_sparse_values[i];
+            slot->pmgr_offset = d47_range2_post_sparse_offsets[i];
+            slot->count = 1;
+            if (i == 0) {
+                slot->ready_phase = &s->config_selectors[1].phase;
+                slot->required_phase = 5;
+            } else {
+                slot->ready = &s->range2_post_sparse[i - 1].complete;
+            }
+            pa = iobase + regs[2].base + slot->pmgr_offset;
+            memory_region_init_io(&slot->mr, NULL,
+                                  &darwin_pmgr_range2_signed_cont_ops, slot,
+                                  "darwin-pmgr-iboot-range2-post-sparse", 4);
+            memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                                &slot->mr, 10);
+        }
+        s->range2_signed_140.repeat_ready =
+            &s->range2_post_sparse[1].complete;
+        s->range2_signed_140.repeat_mask = UINT32_C(0x30000000);
+        s->range2_signed_140.repeat_value = 0;
         fprintf(stderr,
                 "darwin-pmgr: virtual no-harvest topology enabled for"
                 " descriptor IDs 0x64/0x82/0x83, blocks 1..6, and eleven"
