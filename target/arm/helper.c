@@ -9426,7 +9426,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 
     /* gxfstat: count every guest exception by EXCP_* index. See
      * include/xnu/gxfstat.h. Slow path already; the increment is free. */
-    if ((unsigned)cs->exception_index < GXFSTAT_NEXC) {
+    if (gxfstat_enabled && (unsigned)cs->exception_index < GXFSTAT_NEXC) {
         gxfstat_exc[cs->exception_index]++;
     }
 
@@ -9579,8 +9579,10 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
         }
         break;
     case EXCP_GENTER:
-        gxfstat_genter++;       /* gxfstat: one VM exit each under the HVF scheme */
-        gxfstat_genter_el[cur_el & 3]++;
+        if (gxfstat_enabled) {
+            gxfstat_genter++;
+            gxfstat_genter_el[cur_el & 3]++;
+        }
         assert(0 == env->currentg);
         assert(env->aarch64);
         env->aspsr_gl[new_el] = env->currentg;

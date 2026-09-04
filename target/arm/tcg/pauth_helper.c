@@ -330,16 +330,17 @@ static uint64_t pauth_computepac(CPUARMState *env, uint64_t data,
 static uint64_t pauth_addpac(CPUARMState *env, uint64_t ptr, uint64_t modifier,
                              ARMPACKey *key, bool data)
 {
+#ifdef QEMU_SPTM_DISABLE_PAC
+    /* The caller has already performed the key-enable and trap checks.
+     * This fork returns ptr unchanged; do not compute unused VA parameters. */
+    return ptr;
+#endif
     ARMCPU *cpu = env_archcpu(env);
     ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
     ARMPauthFeature pauth_feature = cpu_isar_feature(pauth_feature, cpu);
     uint64_t pac, ext_ptr, ext, test;
     int bot_bit, top_bit;
-
-#ifdef QEMU_SPTM_DISABLE_PAC
-    return ptr;
-#endif // QEMU_SPTM_DISABLE_PAC
 
     /* If tagged pointers are in use, use ptr<55>, otherwise ptr<63>.  */
     if (param.tbi) {
@@ -416,6 +417,50 @@ static uint64_t pauth_original_ptr(uint64_t ptr, ARMVAParameters param)
     }
 }
 
+static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
+    uint64_t tcr, mask, result;
+
+    if (!cpu->pauth_mask_cache.mode) {
+        return pauth_original_ptr(ptr,
+                                 aa64_va_parameters(env, ptr, mmu_idx, data, false));
+    }
+    tcr = regime_tcr(env, mmu_idx);
+    if (!cpu->pauth_mask_cache.valid || cpu->pauth_mask_cache.tcr != tcr ||
+        cpu->pauth_mask_cache.mmu_idx != mmu_idx) {
+        /* Only tsz, tbi and mtx affect pauth_ptr_mask. In aa64_va_parameters
+         * those depend on the live TCR, regime, address bit 55, access kind
+         * and immutable CPU features. Other returned fields (SPRR, PIE, etc.)
+         * are deliberately not cached. Comparing live TCR also covers guest
+         * writes, GXF banking, reset and restore without invalidation hooks. */
+        for (int d = 0; d < 2; d++) {
+            for (int upper = 0; upper < 2; upper++) {
+                ARMVAParameters param = aa64_va_parameters(
+                    env, (uint64_t)upper << 55, mmu_idx, d, false);
+                cpu->pauth_mask_cache.mask[d][upper] = pauth_ptr_mask(param);
+            }
+        }
+        cpu->pauth_mask_cache.tcr = tcr;
+        cpu->pauth_mask_cache.mmu_idx = mmu_idx;
+        cpu->pauth_mask_cache.valid = true;
+    }
+    mask = cpu->pauth_mask_cache.mask[data][extract64(ptr, 55, 1)];
+    result = extract64(ptr, 55, 1) ? ptr | mask : ptr & ~mask;
+    if (unlikely(cpu->pauth_mask_cache.mode == 2)) {
+        uint64_t reference = pauth_original_ptr(
+            ptr, aa64_va_parameters(env, ptr, mmu_idx, data, false));
+        g_assert(result == reference);
+        if (++cpu->pauth_mask_cache.verified == 1 ||
+            cpu->pauth_mask_cache.verified % 1000000 == 0) {
+            fprintf(stderr, "pauth-cache: cpu=%d verified=%" PRIu64 "\n",
+                    CPU(cpu)->cpu_index, cpu->pauth_mask_cache.verified);
+        }
+    }
+    return result;
+}
+
 static G_NORETURN
 void pauth_fail_exception(CPUARMState *env, bool data,
                           int keynumber, uintptr_t ra)
@@ -428,6 +473,11 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
                            ARMPACKey *key, bool data, int keynumber,
                            uintptr_t ra, bool is_combined)
 {
+#ifdef QEMU_SPTM_DISABLE_PAC
+    /* Preserve this fork's existing strip-only behavior, including the
+     * caller's key-enable/trap checks, without calculating an unused PAC. */
+    return pauth_strip(env, ptr, data);
+#endif
     ARMCPU *cpu = env_archcpu(env);
     ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
@@ -442,10 +492,6 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
 
     cmp_mask = MAKE_64BIT_MASK(bot_bit, top_bit - bot_bit);
     cmp_mask &= ~MAKE_64BIT_MASK(55, 1);
-
-#ifdef QEMU_SPTM_DISABLE_PAC
-    return orig_ptr;
-#endif // QEMU_SPTM_DISABLE_PAC
 
     if (param.mtx) {
         cmp_mask &= ~MAKE_64BIT_MASK(56, 4);
@@ -472,14 +518,6 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
         }
     }
     return orig_ptr;
-}
-
-static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)
-{
-    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
-    ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
-
-    return pauth_original_ptr(ptr, param);
 }
 
 static G_NORETURN

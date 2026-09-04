@@ -1978,7 +1978,9 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     hwaddr mr_offset;
 
     tcg_debug_assert(size > 0 && size <= 8);
-    gxfstat_mmio_rd++;      /* gxfstat: one VM exit each under HVF too */
+    if (gxfstat_enabled) {
+        gxfstat_mmio_rd++;
+    }
 
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
@@ -2493,7 +2495,9 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     MemoryRegion *mr;
 
     tcg_debug_assert(size > 0 && size <= 8);
-    gxfstat_mmio_wr++;      /* gxfstat: one VM exit each under HVF too */
+    if (gxfstat_enabled) {
+        gxfstat_mmio_wr++;
+    }
 
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;

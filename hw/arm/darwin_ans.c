@@ -147,9 +147,9 @@
  *   error, which is far harder to read than a log line.
  *
  * Block I/O is synchronous (blk_pread/blk_pwrite straight from the doorbell
- * write). The guest is single-vCPU under TCG and NVMe drivers must tolerate a
- * completion that is already posted when the doorbell store retires, so the
- * simplicity is worth more than the accuracy here.
+ * write). NVMe drivers must tolerate a completion that is already posted when
+ * the doorbell store retires. This also serializes storage requests with SMP;
+ * DARWIN_ANS_PROFILE measures its cost without per-register tracing.
  *
  * Tracing: DARWIN_ANS_DEBUG=1 logs every register access with the register
  * decoded and every command with its arguments; DARWIN_ANS_DEBUG=2 adds
@@ -162,6 +162,7 @@
 #include "qemu/error-report.h"
 #include "migration/vmstate.h"
 #include "qemu/units.h"
+#include "qemu/timer.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -340,6 +341,11 @@ struct DarwinANSState {
     char    *serial;
     char    *model;
     bool     boot_ready_at_reset;
+
+    /* Host-only optional diagnostics, intentionally absent from VMState. */
+    bool     profile;
+    int64_t  profile_start_ns, profile_last_ns;
+    uint64_t profile_count[4], profile_ns[4], profile_max_ns[4];
 
     /* unknown-offset backing storage, one array per window */
     uint32_t *nvmmu_store, *nvme_store;
@@ -906,7 +912,7 @@ static uint16_t ans_admin(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
     }
 }
 
-static uint16_t ans_io(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
+static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
 {
     *result = 0;
 
@@ -1002,6 +1008,42 @@ static uint16_t ans_io(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
                 c->prp1, c->prp2);
     }
     return NVME_SC_SUCCESS;
+}
+
+static uint16_t ans_io(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
+{
+    if (!s->profile) {
+        return ans_io_command(s, c, result);
+    }
+    int kind = c->opcode == NVME_IO_READ ? 0 :
+               c->opcode == NVME_IO_WRITE || c->opcode == NVME_IO_WRITE_ZERO ? 1 :
+               c->opcode == NVME_IO_FLUSH ? 2 : 3;
+    int64_t start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint16_t status = ans_io_command(s, c, result);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t elapsed = now - start;
+    s->profile_count[kind]++;
+    s->profile_ns[kind] += elapsed;
+    s->profile_max_ns[kind] = MAX(s->profile_max_ns[kind], elapsed);
+    if (now - s->profile_last_ns >= NANOSECONDS_PER_SECOND) {
+        static const char *const names[] = {"read", "write", "flush", "other"};
+        /* Cumulative wall time includes allocation, DMA and the complete
+         * synchronous block call, not just physical host disk latency. */
+        ans_log(s, "PROFILE elapsed_ns=%" PRId64
+                " read_bytes=%" PRIu64 " write_bytes=%" PRIu64,
+                now - s->profile_start_ns,
+                s->n_read_blocks * s->lba_size,
+                s->n_write_blocks * s->lba_size);
+        for (int i = 0; i < 4; i++) {
+            fprintf(stderr, " %s_count=%" PRIu64 " %s_ns=%" PRIu64
+                    " %s_max_ns=%" PRIu64,
+                    names[i], s->profile_count[i], names[i], s->profile_ns[i],
+                    names[i], s->profile_max_ns[i]);
+        }
+        fputc('\n', stderr);
+        s->profile_last_ns = now;
+    }
+    return status;
 }
 
 /*
@@ -1674,6 +1716,9 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
 
     const char *d = getenv("DARWIN_ANS_DEBUG");
     s->debug = d ? (atoi(d) ? atoi(d) : 1) : 0;
+    s->profile = getenv("DARWIN_ANS_PROFILE") != NULL;
+    s->profile_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->profile_last_ns = s->profile_start_ns;
     const char *env = getenv("DARWIN_ANS_SQE_STRIDE");
     if (env) {
         s->sqe_stride = strtoul(env, NULL, 0);

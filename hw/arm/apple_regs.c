@@ -21,7 +21,7 @@ typedef uint8_t  u8;
 void log_read(const char *, CPUARMState *, const ARMCPRegInfo *);
 void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 
-#define APPLE_STATE(env) ((apple_state_t*)env->apple_state)
+#define APPLE_STATE(env) ((apple_state_t *)(env)->apple_state)
 
 #define TAG_OFFSET_EL2_LOCK            BIT(63)
 
@@ -30,6 +30,68 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 #include "xnu/gxfstat.h"
 
 #include "apple_regs_autogen.h"
+
+/* XNU machine_routines.c:_enable_timebase_event_stream writes EVNTEN,
+ * EVENTDIR and EVENTI to KERNEL_CNTKCTL_EL1 (AGTCNTKCTL on this SoC),
+ * while leaving the architectural CNTKCTL event stream disabled.
+ * This is a separate event source, not an alias of the ARM access controls.
+ * Without it, a masked WFE in stackshot_aux_cpu_entry can sleep forever
+ * after another CPU publishes SS_RUNNING. WFI is deliberately unaffected.
+ * The generated Apple register backing remains the migration authority.
+ */
+static int64_t apple_event_stream_deadline_ns(ARMCPU *cpu)
+{
+    uint64_t control = APPLE_STATE(&cpu->env)->agtcntkctl_el1;
+    uint64_t offset = APPLE_STATE(&cpu->env)->agtcntvoff_el2;
+    uint64_t tick_ns = gt_cntfrq_period_ns(cpu);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    unsigned bit = (control >> 4) & 0xf;
+    uint64_t cycle = 1ull << (bit + 1);
+    uint64_t count, phase, edge, ticks, base;
+
+    if (!(control & BIT(2))) {
+        return -1;
+    }
+    count = now / tick_ns - offset;
+    phase = count & (cycle - 1);
+    edge = control & BIT(3) ? 0 : 1ull << bit;
+    ticks = (edge - phase) & (cycle - 1);
+    if (!ticks) {
+        ticks = cycle;
+    }
+    base = now - now % tick_ns;
+    if (ticks > (INT64_MAX - base) / tick_ns) {
+        return INT64_MAX;
+    }
+    return base + ticks * tick_ns;
+}
+
+void apple_regs_pv_cpu_handoff(CPUARMState *dst, CPUARMState *src)
+{
+    /* The virtual platform supplies the already-established protection map
+     * to a powered-off CPU. SPTM secondary bring-up validates these registers
+     * in ctrr_ctxr_check_region (24A5430a: 0xfffffff0270b3f5c onwards).
+     * Copy only the protection map, never execution state or authentication
+     * keys. The caller owns src and holds BQL; dst must still be powered off.
+     */
+#define COPY_REGION(r) do { \
+    APPLE_STATE(dst)->r##_ctl_el2 = APPLE_STATE(src)->r##_ctl_el2; \
+    APPLE_STATE(dst)->r##_lwr_el2 = APPLE_STATE(src)->r##_lwr_el2; \
+    APPLE_STATE(dst)->r##_upr_el2 = APPLE_STATE(src)->r##_upr_el2 & ~0xfffull; \
+} while (0)
+    COPY_REGION(ctrr_a);
+    COPY_REGION(ctrr_b);
+    COPY_REGION(ctrr_c);
+    COPY_REGION(ctrr_d);
+    COPY_REGION(ctxr_a);
+    COPY_REGION(ctxr_b);
+    COPY_REGION(ctxr_c);
+    COPY_REGION(ctxr_d);
+#undef COPY_REGION
+    /* Upper bounds read back as page addresses: SPTM+0xb42d0 masks its
+     * stored inclusive upper bound before comparing with CTRR_C_UPR_EL1;
+     * the CTXR checks at +0xb4334 etc use the same 4 KiB mask. */
+}
 
 static uint64_t pmc0_read(CPUARMState *env, const ARMCPRegInfo *ri) {
     if (0 == env->pc) return 0;
@@ -156,8 +218,12 @@ static hwaddr adt_find_region_last_page(struct dtree_node *dt_root, const char *
 }
 
 void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, struct xnu_boot_info *info) {
+    const char *pauth_cache = getenv("DARWIN_PAUTH_CACHE");
+    cpu->pauth_mask_cache.mode = pauth_cache && !strcmp(pauth_cache, "off") ? 0 :
+                                pauth_cache && !strcmp(pauth_cache, "verify") ? 2 : 1;
     CPUARMState *env = &cpu->env;
     env->currentg = 0;
+    cpu->vendor_event_stream_deadline_ns = apple_event_stream_deadline_ns;
     env->apple_state = malloc(sizeof(apple_state_t));
     memset(env->apple_state, '\x00', sizeof(apple_state_t));
 

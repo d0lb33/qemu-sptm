@@ -18,8 +18,10 @@ void HELPER(genter)(CPUARMState *env, uint32_t imm) {
 
 void HELPER(gexit)(CPUARMState *env) {
     int cur_el = arm_current_el(env);
-    gxfstat_gexit++;            /* gxfstat: one VM exit each under the HVF scheme */
-    gxfstat_gexit_el[cur_el & 3]++;
+    if (gxfstat_enabled) {
+        gxfstat_gexit++;
+        gxfstat_gexit_el[cur_el & 3]++;
+    }
     uint64_t spsr = env->spsr_gl[cur_el];
     uint64_t old_pc;
     assert(1 == env->currentg);

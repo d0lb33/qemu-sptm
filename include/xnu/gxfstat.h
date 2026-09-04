@@ -35,6 +35,10 @@
 #define XNU_GXFSTAT_H
 
 #include <stdint.h>
+#include <stdbool.h>
+
+/* Set at machine construction, before any vCPU executes. */
+extern bool gxfstat_enabled;
 
 #define GXFSTAT_NEXC 64
 
