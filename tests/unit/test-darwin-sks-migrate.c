@@ -436,9 +436,81 @@ static void parse_captured_user_4_to_3(void)
     g_assert_cmpuint(parsed.record_len, ==, 28);
 }
 
+/* Exact Data-volume 2 -> 3 request from SMP_SKS_CAPTURE6/stderr.log,
+ * captured during a six-CPU cold boot of display-warm1.qcow2. */
+static const uint8_t captured_data_2_to_3[] = {
+    0x48, 0x00, 0x00, 0x00, 0xfe, 0xd1, 0x0e, 0x52,
+    0x1c, 0x26, 0x6d, 0xb5, 0xcf, 0xf2, 0x13, 0x73,
+    0xf5, 0x6a, 0x09, 0x51, 0x01, 0x00, 0x00, 0x00,
+    0x05, 0x9a, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x5c, 0xa1, 0x6b, 0x10, 0x83, 0xba, 0x65, 0x25,
+    0x01, 0x78, 0xd9, 0x90, 0x43, 0x5e, 0xb4, 0xad,
+    0xee, 0xba, 0x3b, 0xff, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0xff, 0x61, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x00, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x01, 0x00, 0x00,
+};
+
+static void parse_captured_data_2_to_3(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, captured_data_2_to_3, sizeof(captured_data_2_to_3));
+    g_assert_cmpstr(digest, ==, "014e378d1667d4ae1dd7e99e049a5db32d0c34d88f5ee9d2683e99b6aa8c6eb3");
+    g_assert_true(darwin_sks_parse_migrate_request(captured_data_2_to_3,
+        sizeof(captured_data_2_to_3), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_DATA);
+    g_assert_cmpuint(parsed.record_kind, ==, 2);
+    g_assert_cmpuint(parsed.target_class, ==, 3);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+}
+
+static void reject_corrupt_data_2_to_3(void)
+{
+    static const size_t offsets[] = {
+        0x00, 0x14, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60,
+        0x68, 0x6c, 0x70, 0x84, 0x90, 0x9b, 0xa1,
+    };
+    DarwinSKSMigrateRequest parsed;
+    uint8_t request[sizeof(captured_data_2_to_3) + 1];
+
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        memcpy(request, captured_data_2_to_3, sizeof(captured_data_2_to_3));
+        request[offsets[i]] ^= 1;
+        g_assert_false(darwin_sks_parse_migrate_request(request,
+            sizeof(captured_data_2_to_3), &parsed));
+    }
+    memcpy(request, captured_data_2_to_3, sizeof(captured_data_2_to_3));
+    request[sizeof(captured_data_2_to_3)] = 0;
+    for (size_t size = 0; size <= sizeof(request); size++) {
+        if (size != sizeof(captured_data_2_to_3)) {
+            g_assert_false(darwin_sks_parse_migrate_request(request, size,
+                &parsed));
+        }
+    }
+    /* The same class pair on User has not been observed. */
+    request[0x9b] = 2;
+    request[0xa1] = 4;
+    g_assert_false(darwin_sks_parse_migrate_request(request,
+        sizeof(captured_data_2_to_3), &parsed));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/migrate/data-2-to-3", parse_captured_data_2_to_3);
+    g_test_add_func("/darwin-sks/migrate/reject-data-2-to-3", reject_corrupt_data_2_to_3);
     g_test_add_func("/darwin-sks/migrate/user-4-to-3", parse_captured_user_4_to_3);
     g_test_add_func("/darwin-sks/check-class/captured-class13", check_class_captured_request);
     g_test_add_func("/darwin-sks/check-class/reject-malformed", check_class_reject_malformed);
