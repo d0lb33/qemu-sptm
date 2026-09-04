@@ -34,6 +34,21 @@
 #define SKS_WRAPPED_KEY_SIZE                 40
 #define SKS_MEDIA_KEY_SIZE                   64
 
+#define SKS_UNWRAP_SHORT_REQUEST_SIZE        0x6c
+#define SKS_UNWRAP_LONG_REQUEST_SIZE         0x94
+#define SKS_UNWRAP_VARIANT_OFF               0x4c
+#define SKS_UNWRAP_FIXED_ONE_OFF             0x50
+#define SKS_UNWRAP_FIXED_ZERO0_OFF           0x54
+#define SKS_UNWRAP_FIXED_MAX_OFF             0x58
+#define SKS_UNWRAP_FIXED_ZERO1_OFF           0x5c
+#define SKS_UNWRAP_CLASS_OFF                 0x60
+#define SKS_UNWRAP_RECORD_LEN_OFF            0x64
+#define SKS_UNWRAP_RECORD_OFF                0x68
+#define SKS_UNWRAP_SHORT_OUTPUT_SELECTOR_OFF 0x68
+#define SKS_UNWRAP_LONG_OUTPUT_SELECTOR_OFF  0x90
+#define SKS_UNWRAP_VARIANT                   1
+#define SKS_UNWRAP_OUTPUT_SELECTOR           2
+
 #define SKS_MIGRATE_TAGGED_REQUEST_SIZE      0xa4
 #define SKS_MIGRATE_TAGGED_RECORD_KIND_OFF   0x68
 #define SKS_MIGRATE_TAGGED_DATA_RECORD_KIND  4
@@ -160,6 +175,66 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
                                      DARWIN_SKS_MIGRATE_TAGGED_USER;
         *parsed = result;
         return true;
+    }
+
+    *parsed = result;
+    return false;
+}
+
+bool darwin_sks_parse_unwrap_file_key_request(
+    const uint8_t *request, size_t request_size,
+    DarwinSKSUnwrapFileKeyRequest *parsed)
+{
+    DarwinSKSUnwrapFileKeyRequest result = { 0 };
+    bool common;
+
+    if (!request || !parsed) {
+        return false;
+    }
+    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
+        result.header_body_size = sks_ldl_le(request);
+        result.ipc_version = sks_ldl_le(request + SKS_IPC_VERSION_OFF);
+    }
+    if (request_size >= SKS_UNWRAP_CLASS_OFF + sizeof(uint32_t)) {
+        result.variant = sks_ldl_le(request + SKS_UNWRAP_VARIANT_OFF);
+        result.protection_class = sks_ldl_le(request + SKS_UNWRAP_CLASS_OFF);
+    }
+
+    common = request_size >= SKS_UNWRAP_CLASS_OFF + sizeof(uint32_t) &&
+        result.header_body_size == SKS_IPC_V1_HEADER_BODY_SIZE &&
+        result.ipc_version == SKS_IPC_VERSION_1 &&
+        result.variant == SKS_UNWRAP_VARIANT &&
+        sks_ldl_le(request + SKS_UNWRAP_FIXED_ONE_OFF) == 1 &&
+        sks_ldl_le(request + SKS_UNWRAP_FIXED_ZERO0_OFF) == 0 &&
+        sks_ldl_le(request + SKS_UNWRAP_FIXED_MAX_OFF) == UINT32_MAX &&
+        sks_ldl_le(request + SKS_UNWRAP_FIXED_ZERO1_OFF) == 0 &&
+        (result.protection_class == 1 || result.protection_class == 2 ||
+         result.protection_class == 3 || result.protection_class == 4 ||
+         result.protection_class == 17);
+
+    if (common && request_size == SKS_UNWRAP_SHORT_REQUEST_SIZE &&
+        sks_ldl_le(request + SKS_UNWRAP_RECORD_LEN_OFF) == 0) {
+        result.output_selector = sks_ldl_le(
+            request + SKS_UNWRAP_SHORT_OUTPUT_SELECTOR_OFF);
+        if (result.output_selector == SKS_UNWRAP_OUTPUT_SELECTOR) {
+            result.shape = DARWIN_SKS_UNWRAP_FILE_KEY_EMPTY_RECORD;
+            *parsed = result;
+            return true;
+        }
+    }
+
+    if (common && request_size == SKS_UNWRAP_LONG_REQUEST_SIZE) {
+        result.record_len = sks_ldl_le(request + SKS_UNWRAP_RECORD_LEN_OFF);
+        result.output_selector = sks_ldl_le(
+            request + SKS_UNWRAP_LONG_OUTPUT_SELECTOR_OFF);
+        if (result.record_len == SKS_WRAPPED_KEY_SIZE &&
+            SKS_UNWRAP_RECORD_OFF + result.record_len ==
+                SKS_UNWRAP_LONG_OUTPUT_SELECTOR_OFF &&
+            result.output_selector == SKS_UNWRAP_OUTPUT_SELECTOR) {
+            result.shape = DARWIN_SKS_UNWRAP_FILE_KEY_WRAPPED_RECORD;
+            *parsed = result;
+            return true;
+        }
     }
 
     *parsed = result;

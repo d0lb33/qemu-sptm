@@ -534,7 +534,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * /tmp/dvm/probe/ROOT_SKS_OP09_CLASS17_UI2.stderr.log:138895; its rejection
  * alone starts the selector 10/7 timeout sequence at serial lines 1330-1331.
  * Accept only these five observed protection classes while keeping every
- * other invariant strict.
+ * other invariant strict.  ROOT_SKS_LATE_HOST2 later emitted a 0x94-byte
+ * form after two successful tagged User-volume migrations.  Its live OOL
+ * page contains the same fields followed by a 40-byte wrapped record and
+ * selector 2; rejecting it without a reply caused the sole first panic at
+ * serial line 2054.  The request was recovered from DART-translated DVA
+ * 0x1000004c000 at PA 0x1001a478000 after the panic, rather than inferred
+ * from an absent breakpoint.
  *
  * The selector-2 codec at 0xfffffff0095619e8..0x9561a4c calls the blob helper
  * at 0xfffffff00957f830 three times, then the scalar helper at
@@ -550,22 +556,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * reaching EOF at the scalar helper and returning -13
  * (/tmp/dvm/SKS_OP09_DECODE_1.lldb.log:876..924,982..1060).
  */
-#define SKS_UNWRAP_FILE_KEY_REQUEST_SIZE       0x6c
-#define SKS_UNWRAP_FILE_KEY_VARIANT_OFF         0x4c
-#define SKS_UNWRAP_FILE_KEY_FIXED_ONE_OFF       0x50
-#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF     0x54
-#define SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF       0x58
-#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF     0x5c
-#define SKS_UNWRAP_FILE_KEY_CLASS_OFF           0x60
-#define SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF     0x64
-#define SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF 0x68
-#define SKS_UNWRAP_FILE_KEY_VARIANT             1
-#define SKS_UNWRAP_FILE_KEY_CLASS_A             1
-#define SKS_UNWRAP_FILE_KEY_CLASS_B             2
-#define SKS_UNWRAP_FILE_KEY_CLASS_C             3
-#define SKS_UNWRAP_FILE_KEY_CLASS_D             4
-#define SKS_UNWRAP_FILE_KEY_CLASS_SPECIAL      17
-#define SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT    2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_SELECTOR   2
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_THIRD_BLOB_SIZE 0
 #define SKS_UNWRAP_FILE_KEY_RESPONSE_SCALAR     0
@@ -1369,50 +1359,26 @@ static bool sep_sks_validate_check_class_request(DarwinSEPState *s,
 static bool sep_sks_validate_unwrap_file_key_request(
     DarwinSEPState *s, const uint8_t *request, uint32_t request_size)
 {
-    uint32_t header_body_size = 0;
-    uint32_t ipc_version = 0;
-    uint32_t variant = UINT32_MAX;
-    uint32_t protection_class = UINT32_MAX;
-    uint32_t output_selector = UINT32_MAX;
+    DarwinSKSUnwrapFileKeyRequest parsed;
 
-    if (request_size >= SKS_IPC_V1_HEADER_SIZE) {
-        header_body_size = ldl_le_p(request);
-        ipc_version = ldl_le_p(request + SKS_IPC_VERSION_OFF);
-    }
-    if (request_size == SKS_UNWRAP_FILE_KEY_REQUEST_SIZE) {
-        variant = ldl_le_p(request + SKS_UNWRAP_FILE_KEY_VARIANT_OFF);
-        protection_class =
-            ldl_le_p(request + SKS_UNWRAP_FILE_KEY_CLASS_OFF);
-        output_selector =
-            ldl_le_p(request + SKS_UNWRAP_FILE_KEY_OUTPUT_SELECTOR_OFF);
-    }
-
-    if (request_size != SKS_UNWRAP_FILE_KEY_REQUEST_SIZE ||
-        header_body_size != SKS_IPC_V1_HEADER_BODY_SIZE ||
-        ipc_version != SKS_IPC_VERSION_1 ||
-        variant != SKS_UNWRAP_FILE_KEY_VARIANT ||
-        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ONE_OFF) != 1 ||
-        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO0_OFF) != 0 ||
-        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_MAX_OFF) != UINT32_MAX ||
-        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO1_OFF) != 0 ||
-        (protection_class != SKS_UNWRAP_FILE_KEY_CLASS_A &&
-         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_B &&
-         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_C &&
-         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_D &&
-         protection_class != SKS_UNWRAP_FILE_KEY_CLASS_SPECIAL) ||
-        ldl_le_p(request + SKS_UNWRAP_FILE_KEY_FIXED_ZERO2_OFF) != 0 ||
-        output_selector != SKS_UNWRAP_FILE_KEY_REQUESTED_OUTPUT) {
+    if (!darwin_sks_parse_unwrap_file_key_request(request, request_size,
+                                                   &parsed)) {
         fprintf(stderr, "sep(%s): sks op09 rejected unsupported filesystem "
                 "unwrap shape: request %u header 0x%x version %u variant %u "
                 "class %u output selector %u; no reply\n", s->role,
-                request_size, header_body_size, ipc_version, variant,
-                protection_class, output_selector);
+                request_size, parsed.header_body_size, parsed.ipc_version,
+                parsed.variant, parsed.protection_class,
+                parsed.output_selector);
         return false;
     }
 
-    fprintf(stderr, "sep(%s): sks op09 accepted filesystem unwrap request "
-            "length %u variant %u class %u output selector %u\n", s->role,
-            request_size, variant, protection_class, output_selector);
+    fprintf(stderr, "sep(%s): sks op09 accepted %s filesystem unwrap request "
+            "length %u variant %u class %u record length %u output selector "
+            "%u\n", s->role,
+            parsed.shape == DARWIN_SKS_UNWRAP_FILE_KEY_WRAPPED_RECORD ?
+                "wrapped-record" : "empty-record",
+            request_size, parsed.variant, parsed.protection_class,
+            parsed.record_len, parsed.output_selector);
     return true;
 }
 

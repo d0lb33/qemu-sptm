@@ -30,8 +30,28 @@ typedef struct DarwinSKSMigrateRequest {
     uint32_t output_scalar;
 } DarwinSKSMigrateRequest;
 
+typedef enum DarwinSKSUnwrapFileKeyShape {
+    DARWIN_SKS_UNWRAP_FILE_KEY_INVALID = 0,
+    DARWIN_SKS_UNWRAP_FILE_KEY_EMPTY_RECORD,
+    DARWIN_SKS_UNWRAP_FILE_KEY_WRAPPED_RECORD,
+} DarwinSKSUnwrapFileKeyShape;
+
+typedef struct DarwinSKSUnwrapFileKeyRequest {
+    DarwinSKSUnwrapFileKeyShape shape;
+    uint32_t header_body_size;
+    uint32_t ipc_version;
+    uint32_t variant;
+    uint32_t protection_class;
+    uint32_t record_len;
+    uint32_t output_selector;
+} DarwinSKSUnwrapFileKeyRequest;
+
 bool darwin_sks_parse_migrate_request(const uint8_t *request,
                                       size_t request_size,
                                       DarwinSKSMigrateRequest *parsed);
+
+bool darwin_sks_parse_unwrap_file_key_request(
+    const uint8_t *request, size_t request_size,
+    DarwinSKSUnwrapFileKeyRequest *parsed);
 
 #endif
