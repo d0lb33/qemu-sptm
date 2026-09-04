@@ -218,6 +218,9 @@ static hwaddr adt_find_region_last_page(struct dtree_node *dt_root, const char *
 }
 
 void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, struct xnu_boot_info *info) {
+    const char *pauth_cache = getenv("DARWIN_PAUTH_CACHE");
+    cpu->pauth_mask_cache.mode = pauth_cache && !strcmp(pauth_cache, "off") ? 0 :
+                                pauth_cache && !strcmp(pauth_cache, "verify") ? 2 : 1;
     CPUARMState *env = &cpu->env;
     env->currentg = 0;
     cpu->vendor_event_stream_deadline_ns = apple_event_stream_deadline_ns;
