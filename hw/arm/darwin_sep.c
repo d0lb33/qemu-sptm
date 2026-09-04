@@ -289,6 +289,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SEP_STATUS_ROM      1
 #define SEP_STATUS_TZ0      2
 
+/*
+ * AppleSEPBooter::bootSEP at unslid 0xfffffff00959bc6c requires status 1,
+ * sends TZ0, requires status 2, then sends IMG4.  The exact d47 wire sequence
+ * is /tmp/dvm/iboot-main/probe/SEP_BOOTSEQ_TRACE1.stderr.log:59-99.
+ */
+typedef enum SEPBootState {
+    SEP_BOOT_EXPECT_STATUS_ROM,
+    SEP_BOOT_EXPECT_TZ0,
+    SEP_BOOT_EXPECT_STATUS_TZ0,
+    SEP_BOOT_EXPECT_IMG4,
+    SEP_BOOT_RUNNING,
+} SEPBootState;
+
 // control endpoint requests (AP -> SEP)
 #define CTRL_NOP              0
 #define CTRL_ACK              1
@@ -719,7 +732,9 @@ struct DarwinSEPState {
     uint32_t mmio_size;
     uint32_t mbox_off;
     uint32_t addr_shift;
-    bool require_sepi_boot_image;
+    size_t expected_sepfw_len;
+    uint8_t expected_sepfw_sha256[QCRYPTO_HASH_DIGEST_LEN_SHA256];
+    SEPBootState boot_state;
     qemu_irq irq[4];
 
     // wrapper
@@ -897,31 +912,128 @@ static bool sep_dma(DarwinSEPState *s, uint64_t dva, void *buf, uint32_t len, bo
     return true;
 }
 
+static bool sep_im4p_total_len(const uint8_t *header, size_t header_len,
+                               size_t *total_len)
+{
+    size_t content_len = 0;
+    size_t length_len;
+
+    if (header_len < 2 || header[0] != 0x30) {
+        return false;
+    }
+    if (!(header[1] & 0x80)) {
+        *total_len = 2 + header[1];
+        return true;
+    }
+    length_len = header[1] & 0x7f;
+    if (!length_len || length_len > sizeof(size_t) ||
+        2 + length_len > header_len || header[2] == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < length_len; i++) {
+        if (content_len > (SIZE_MAX >> 8)) {
+            return false;
+        }
+        content_len = (content_len << 8) | header[2 + i];
+    }
+    if (content_len > SIZE_MAX - 2 - length_len) {
+        return false;
+    }
+    *total_len = 2 + length_len + content_len;
+    return true;
+}
+
+static void sep_sha256_hex(const uint8_t *digest, char *hex)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < QCRYPTO_HASH_DIGEST_LEN_SHA256; i++) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 0xf];
+    }
+    hex[2 * QCRYPTO_HASH_DIGEST_LEN_SHA256] = '\0';
+}
+
 /*
- * Check only the small, unencrypted DER envelope needed to bind BOOT_IMG4 to
- * the caller's mapped `sepi` object.  This deliberately does not claim to
- * authenticate, decrypt, or execute the encrypted SEP payload.  The loader
- * has already checked the complete host input and preserved it byte-for-byte;
- * this ROM boundary check prevents the model from acknowledging an unrelated
- * buffer merely because it was given a page number.
+ * Bind BOOT_IMG4 to every byte loaded by -sepfw.  A real SEPROM also checks
+ * Image4 policy and decrypts the payload; this only verifies the complete
+ * encrypted container supplied to the VM and therefore makes no execution or
+ * cryptographic-authentication claim.
  */
-static bool sep_boot_image_is_sepi(DarwinSEPState *s, uint64_t dva)
+static bool sep_boot_image_matches(DarwinSEPState *s, uint64_t dva)
 {
     uint8_t header[32];
+    uint8_t chunk[64 * 1024];
+    uint8_t digest[QCRYPTO_HASH_DIGEST_LEN_SHA256];
+    uint8_t *digest_ptr = digest;
+    size_t digest_len = sizeof(digest);
+    size_t der_len = 0;
+    size_t remaining = s->expected_sepfw_len;
+    uint64_t cursor = dva;
+    Error *local_err = NULL;
+    g_autoptr(QCryptoHash) hash = NULL;
 
     if (!sep_dma(s, dva, header, sizeof(header), false)) {
         return false;
     }
-
-    /* DER SEQUENCE, finite length, IA5String("IM4P"), IA5String("sepi"). */
+    if (!sep_im4p_total_len(header, sizeof(header), &der_len) ||
+        der_len != s->expected_sepfw_len) {
+        fprintf(stderr, "sep(%s): ROM: BOOT_IMG4 DER length %zu does not "
+                "match preloaded container length %zu\n", s->role,
+                der_len, s->expected_sepfw_len);
+        return false;
+    }
     for (size_t i = 0; i + 12 <= sizeof(header); i++) {
         if (header[i] == 0x16 && header[i + 1] == 4 &&
             !memcmp(&header[i + 2], "IM4P", 4) &&
             header[i + 6] == 0x16 && header[i + 7] == 4 &&
             !memcmp(&header[i + 8], "sepi", 4)) {
-            return true;
+            goto identified;
         }
     }
+    fprintf(stderr, "sep(%s): ROM: BOOT_IMG4 is not an IM4P/sepi container\n",
+            s->role);
+    return false;
+
+identified:
+    hash = qcrypto_hash_new(QCRYPTO_HASH_ALGO_SHA256, &local_err);
+    if (!hash) {
+        goto hash_error;
+    }
+    while (remaining) {
+        uint32_t n = MIN(remaining, sizeof(chunk));
+
+        if (!sep_dma(s, cursor, chunk, n, false)) {
+            return false;
+        }
+        if (qcrypto_hash_update(hash, chunk, n, &local_err) < 0) {
+            goto hash_error;
+        }
+        cursor += n;
+        remaining -= n;
+    }
+    if (qcrypto_hash_finalize_bytes(hash, &digest_ptr, &digest_len,
+                                    &local_err) < 0) {
+        goto hash_error;
+    }
+    if (digest_len != sizeof(digest) ||
+        memcmp(digest, s->expected_sepfw_sha256, sizeof(digest))) {
+        char actual_hex[2 * QCRYPTO_HASH_DIGEST_LEN_SHA256 + 1];
+        char expected_hex[2 * QCRYPTO_HASH_DIGEST_LEN_SHA256 + 1];
+
+        sep_sha256_hex(digest, actual_hex);
+        sep_sha256_hex(s->expected_sepfw_sha256, expected_hex);
+        fprintf(stderr, "sep(%s): ROM: BOOT_IMG4 SHA-256 mismatch: "
+                "mapped=%s preloaded=%s\n", s->role, actual_hex,
+                expected_hex);
+        return false;
+    }
+    return true;
+
+hash_error:
+    fprintf(stderr, "sep(%s): ROM: BOOT_IMG4 SHA-256 failed: %s\n", s->role,
+            local_err ? error_get_pretty(local_err) : "unknown error");
+    error_free(local_err);
     return false;
 }
 
@@ -989,6 +1101,25 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         break;
     case BOOT_GET_STATUS:
+        if (s->expected_sepfw_len) {
+            if (tag != 1 || param || data) {
+                fprintf(stderr, "sep(%s): ROM: refusing malformed strict "
+                        "GET_STATUS (tag %u param 0x%02x data 0x%08x); "
+                        "no reply\n", s->role, tag, param, data);
+                return;
+            } else if (s->boot_state == SEP_BOOT_EXPECT_STATUS_ROM &&
+                s->status == SEP_STATUS_ROM) {
+                s->boot_state = SEP_BOOT_EXPECT_TZ0;
+            } else if (s->boot_state == SEP_BOOT_EXPECT_STATUS_TZ0 &&
+                       s->status == SEP_STATUS_TZ0) {
+                s->boot_state = SEP_BOOT_EXPECT_IMG4;
+            } else {
+                fprintf(stderr, "sep(%s): ROM: refusing GET_STATUS in strict "
+                        "boot state %u with status %u; no reply\n", s->role,
+                        s->boot_state, s->status);
+                return;
+            }
+        }
         fprintf(stderr, "sep(%s): ROM: status queried -> %u\n", s->role, s->status);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, s->status);
         break;
@@ -1014,28 +1145,60 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, word);
         break;
     case BOOT_TZ0:
+        if (s->expected_sepfw_len &&
+            (s->boot_state != SEP_BOOT_EXPECT_TZ0 || tag != 1 || param ||
+             data)) {
+            fprintf(stderr, "sep(%s): ROM: refusing TZ0 outside strict "
+                    "status-ROM -> TZ0 transition (state %u tag %u param "
+                    "0x%02x data 0x%08x); no reply\n", s->role,
+                    s->boot_state, tag, param, data);
+            return;
+        }
         s->status = SEP_STATUS_TZ0;
+        if (s->expected_sepfw_len) {
+            s->boot_state = SEP_BOOT_EXPECT_STATUS_TZ0;
+        }
         fprintf(stderr, "sep(%s): ROM: TZ0 accepted (param 0x%02x), status -> %u\n", s->role, param, s->status);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         break;
     case BOOT_LOAD_SEP_ART:
+        if (s->expected_sepfw_len) {
+            fprintf(stderr, "sep(%s): ROM: refusing unimplemented strict "
+                    "SEP ART load at page 0x%x; no reply\n", s->role, data);
+            return;
+        }
         fprintf(stderr, "sep(%s): ROM: SEP ART at page 0x%x accepted\n", s->role, data);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         break;
     case BOOT_IMG4: {
         uint64_t firmware_dva = (uint64_t)data << s->addr_shift;
 
-        if (s->require_sepi_boot_image &&
-            !sep_boot_image_is_sepi(s, firmware_dva)) {
-            fprintf(stderr, "sep(%s): ROM: refusing BOOT_IMG4 page 0x%x: "
-                    "mapped buffer at dva 0x%" PRIx64
-                    " is unavailable or is not an IM4P/sepi container\n",
-                    s->role, data, firmware_dva);
-            break;
+        if (s->expected_sepfw_len &&
+            (s->boot_state != SEP_BOOT_EXPECT_IMG4 || tag != 1 ||
+             param != 0x20 || !data)) {
+            fprintf(stderr, "sep(%s): ROM: refusing BOOT_IMG4 outside strict "
+                    "post-TZ0 transition (state %u tag %u param 0x%02x "
+                    "page 0x%x); no reply\n", s->role, s->boot_state, tag,
+                    param, data);
+            return;
         }
-        if (s->require_sepi_boot_image) {
-            fprintf(stderr, "sep(%s): ROM: verified mapped IM4P/sepi envelope "
-                    "at dva 0x%" PRIx64 "\n", s->role, firmware_dva);
+        if (s->expected_sepfw_len &&
+            !sep_boot_image_matches(s, firmware_dva)) {
+            fprintf(stderr, "sep(%s): ROM: refusing BOOT_IMG4 page 0x%x: "
+                    "mapped container at dva 0x%" PRIx64
+                    " did not match -sepfw; no reply\n",
+                    s->role, data, firmware_dva);
+            return;
+        }
+        if (s->expected_sepfw_len) {
+            char expected_hex[2 * QCRYPTO_HASH_DIGEST_LEN_SHA256 + 1];
+
+            sep_sha256_hex(s->expected_sepfw_sha256, expected_hex);
+            fprintf(stderr, "sep(%s): ROM: verified complete mapped "
+                    "IM4P/sepi at dva 0x%" PRIx64 " (%zu bytes, SHA-256 "
+                    "%s)\n", s->role, firmware_dva,
+                    s->expected_sepfw_len, expected_hex);
+            s->boot_state = SEP_BOOT_RUNNING;
         }
         fprintf(stderr, "sep(%s): ROM: %s (firmware page 0x%x, param 0x%02x); sepOS \"running\"\n",
                 s->role, "IMG4 accepted", data, param);
@@ -1044,6 +1207,11 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         break;
     }
     case BOOT_RESUME:
+        if (s->expected_sepfw_len) {
+            fprintf(stderr, "sep(%s): ROM: refusing RESUME while -sepfw "
+                    "requires BOOT_IMG4; no reply\n", s->role);
+            return;
+        }
         fprintf(stderr, "sep(%s): ROM: resumed (firmware page 0x%x, "
                 "param 0x%02x); sepOS \"running\"\n",
                 s->role, data, param);
@@ -1052,6 +1220,12 @@ static void sep_handle_bootstrap(DarwinSEPState *s, uint64_t m) {
         break;
     case BOOT_TMM_MANIFEST:
     case BOOT_PATCH:
+        if (s->expected_sepfw_len) {
+            fprintf(stderr, "sep(%s): ROM: refusing unimplemented strict "
+                    "bootstrap op %u at page 0x%x; no reply\n", s->role, op,
+                    data);
+            return;
+        }
         fprintf(stderr, "sep(%s): ROM: op %u (page 0x%x) accepted\n", s->role, op, data);
         sep_send(s, SEP_EP_BOOTSTRAP, tag, BOOT_REPLY_ACK_BASE + op, 0, 0);
         break;
@@ -2310,6 +2484,7 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     s->misc = g_new0(uint32_t, s->mmio_size / 4);
     s->cpu_status = ASC_CPU_STATUS_STOPPED;
     s->status = SEP_STATUS_ROM;
+    s->boot_state = SEP_BOOT_EXPECT_STATUS_ROM;
     s->debug = getenv("DARWIN_SEP_DEBUG") != NULL;
     const char *sks_request_debug = getenv("DARWIN_SKS_REQUEST_DEBUG");
     s->sks_request_debug = sks_request_debug && sks_request_debug[0] &&
@@ -2341,8 +2516,6 @@ static const Property darwin_sep_properties[] = {
     DEFINE_PROP_UINT32("mbox-offset", DarwinSEPState, mbox_off, 0x8000),
     // page-number unit of every address the protocol carries (see header)
     DEFINE_PROP_UINT32("addr-shift", DarwinSEPState, addr_shift, 12),
-    DEFINE_PROP_BOOL("require-sepi-boot-image", DarwinSEPState,
-                     require_sepi_boot_image, false),
 };
 
 static void darwin_sep_class_init(ObjectClass *klass, const void *data) {
@@ -2386,7 +2559,8 @@ static struct dtree_node *sep_find_mapper(struct dtree_node *arm_io, uint32_t ph
 
 DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
                                DeviceState *aic, bool required_by_iboot,
-                               bool require_sepi_boot_image) {
+                               const uint8_t *sepfw, size_t sepfw_len)
+{
     struct dtree_node *node = adt_find_node(dt_root, "arm-io/sep");
     if (!node ||
         (!required_by_iboot && !adt_get_prop_val(node, "compatible"))) {
@@ -2408,9 +2582,25 @@ DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
     DeviceState *dev = qdev_new(TYPE_DARWIN_SEP);
     qdev_prop_set_string(dev, "role", role ? role : name);
     qdev_prop_set_uint32(dev, "mmio-size", reg[0].len);
-    qdev_prop_set_bit(dev, "require-sepi-boot-image",
-                      require_sepi_boot_image);
     DarwinSEPState *s = DARWIN_SEP(dev);
+
+    if (sepfw) {
+        uint8_t *digest = s->expected_sepfw_sha256;
+        size_t digest_len = sizeof(s->expected_sepfw_sha256);
+        Error *local_err = NULL;
+
+        if (!sepfw_len || sepfw_len > UINT32_MAX ||
+            qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, sepfw, sepfw_len,
+                               &digest, &digest_len, &local_err) < 0 ||
+            digest_len != sizeof(s->expected_sepfw_sha256)) {
+            fprintf(stderr, "darwin-sep: cannot establish expected -sepfw "
+                    "identity: %s\n", local_err ? error_get_pretty(local_err) :
+                    "invalid length or digest");
+            error_free(local_err);
+            exit(1);
+        }
+        s->expected_sepfw_len = sepfw_len;
+    }
 
     /*
      * DMA geometry from the tree: "iommu-parent" lists one phandle per mapper

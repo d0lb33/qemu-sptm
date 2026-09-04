@@ -11,7 +11,11 @@
 // already proven that the physical SEP ASC exists by touching its reg[0]
 // mailbox. reg[0] is mapped at iobase; the node's four "interrupts" are wired
 // to the AIC; DMA goes through the DART named by the node's "iommu-parent".
+/*
+ * When sepfw is non-NULL, its complete container identity and length are the
+ * fail-closed contract for the BOOT_IMG4 DMA transaction.
+ */
 // Returns NULL when neither condition enables the SEP.
 DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase,
                                DeviceState *aic, bool required_by_iboot,
-                               bool require_sepi_boot_image);
+                               const uint8_t *sepfw, size_t sepfw_len);

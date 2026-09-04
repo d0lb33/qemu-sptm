@@ -412,7 +412,8 @@ static void darwin_init(MachineState *ms) {
     // tree. In that mode the host-fixed tree's removed "compatible" is only a
     // direct-boot driver policy and must not hide hardware iBoot already used.
     darwin_sep_create(dt_root, iobase, aic, iboot_mode,
-                      info->sepfw != NULL);
+                      info->sepfw ? info->sepfw_f.buf : NULL,
+                      info->sepfw ? info->sepfw_f.len : 0);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
     // The ANS storage coprocessor owns its own /arm-io/ans mailbox as well as
