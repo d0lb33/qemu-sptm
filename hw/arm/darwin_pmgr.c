@@ -153,6 +153,12 @@
  * writes with no completion poll.  Admit only the observed order and values;
  * descriptor 0x64 remains read-only until the preceding sixteen records have
  * completed.
+ * The immediately following eight records at range 2 +0x40048..+0x40064
+ * are the same one-shot form.  Research raw +0x2746c8..+0x274740 and
+ * release raw +0x272278..+0x2722f0 contain identical descriptor/mask/value
+ * pairs; both builds produced the same writes in the bounded continuation
+ * traces.  This second block is unavailable until descriptor 0x64's final
+ * RMW has completed.
  */
 
 #include "qemu/osdep.h"
@@ -193,6 +199,8 @@
 #define D47_PMGR_RANGE3_CONFIG_COUNT 64
 #define D47_PMGR_RANGE2_SIGNED_OFFSET UINT64_C(0x40000)
 #define D47_PMGR_RANGE2_SIGNED_COUNT 16
+#define D47_PMGR_RANGE2_SIGNED_CONT_OFFSET UINT64_C(0x40048)
+#define D47_PMGR_RANGE2_SIGNED_CONT_COUNT 8
 #define D47_PMGR_DOMAIN_STATE_OFFSET UINT64_C(0x20)
 #define D47_PMGR_DOMAIN_STATE_COUNT 2
 #define D47_PMGR_MASKED_TUNABLE_COUNT 26
@@ -271,6 +279,14 @@ typedef struct DarwinPMGRRange2SignedTuning {
     unsigned step;
     bool complete;
 } DarwinPMGRRange2SignedTuning;
+
+typedef struct DarwinPMGRRange2SignedContinuation {
+    MemoryRegion mr;
+    uint32_t words[D47_PMGR_RANGE2_SIGNED_CONT_COUNT];
+    unsigned step;
+    bool *ready;
+    bool complete;
+} DarwinPMGRRange2SignedContinuation;
 
 typedef struct DarwinPMGRTopologyBlock {
     MemoryRegion mr;
@@ -372,6 +388,7 @@ typedef struct DarwinPMGRIboot {
     DarwinPMGRTopologySelector topology_selectors[
         D47_PMGR_TOPOLOGY_SELECTOR_COUNT];
     DarwinPMGRRange2SignedTuning range2_signed_tuning;
+    DarwinPMGRRange2SignedContinuation range2_signed_continuation;
     DarwinPMGRTopologyBlock topology_blocks[D47_PMGR_TOPOLOGY_BLOCK_COUNT];
     DarwinPMGRConfigSelector config_selectors[
         D47_PMGR_CONFIG_SELECTOR_COUNT];
@@ -406,6 +423,18 @@ static const uint32_t d47_range2_signed_values[
     0x00000000, 0x05000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x07000000, 0x05000000, 0x00000000,
+};
+
+static const uint32_t d47_range2_signed_cont_masks[
+    D47_PMGR_RANGE2_SIGNED_CONT_COUNT] = {
+    0x30000000, 0x30000000, 0x30000000, 0x30000000,
+    0x30000000, 0x30000000, 0x3f000000, 0x3f000000,
+};
+
+static const uint32_t d47_range2_signed_cont_values[
+    D47_PMGR_RANGE2_SIGNED_CONT_COUNT] = {
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x05000000, 0x05000000,
 };
 
 static uint64_t darwin_pmgr_mcc_tunable_read(void *opaque, hwaddr offset,
@@ -551,6 +580,66 @@ invalid_write:
                  " size=%u config-step=%u cleanup-step=%u power-step=%u",
                  block->index, offset, value, size, block->config_step,
                  block->cleanup_step, block->power_step);
+    exit(EXIT_FAILURE);
+}
+
+static uint64_t darwin_pmgr_range2_signed_cont_read(void *opaque,
+                                                     hwaddr offset,
+                                                     unsigned size)
+{
+    DarwinPMGRRange2SignedContinuation *tuning = opaque;
+    unsigned record = tuning->step / 2;
+
+    if (!tuning->ready || !*tuning->ready || size != 4 ||
+        tuning->step >= 2 * D47_PMGR_RANGE2_SIGNED_CONT_COUNT ||
+        (tuning->step & 1) || offset != record * 4) {
+        error_report("darwin-pmgr: invalid range2 signed continuation read"
+                     " offset=0x%" HWADDR_PRIx " size=%u step=%u ready=%u",
+                     offset, size, tuning->step,
+                     tuning->ready ? *tuning->ready : 0);
+        exit(EXIT_FAILURE);
+    }
+    tuning->step++;
+    return tuning->words[record];
+}
+
+static void darwin_pmgr_range2_signed_cont_write(void *opaque,
+                                                  hwaddr offset,
+                                                  uint64_t value,
+                                                  unsigned size)
+{
+    DarwinPMGRRange2SignedContinuation *tuning = opaque;
+    unsigned record = tuning->step / 2;
+    uint32_t expected;
+
+    if (!tuning->ready || !*tuning->ready || size != 4 ||
+        value > UINT32_MAX ||
+        tuning->step >= 2 * D47_PMGR_RANGE2_SIGNED_CONT_COUNT ||
+        !(tuning->step & 1) || offset != record * 4) {
+        goto invalid_write;
+    }
+    expected = (tuning->words[record] &
+                ~d47_range2_signed_cont_masks[record]) |
+               (d47_range2_signed_cont_values[record] &
+                d47_range2_signed_cont_masks[record]);
+    if (value != expected) {
+        goto invalid_write;
+    }
+    tuning->words[record] = expected;
+    tuning->step++;
+    if (tuning->step == 2 * D47_PMGR_RANGE2_SIGNED_CONT_COUNT) {
+        tuning->complete = true;
+        fprintf(stderr,
+                "darwin-pmgr: eight range2 signed-table continuation RMW"
+                " records complete through +0x40064\n");
+    }
+    return;
+
+invalid_write:
+    error_report("darwin-pmgr: invalid range2 signed continuation write"
+                 " offset=0x%" HWADDR_PRIx " value=0x%" PRIx64
+                 " size=%u step=%u ready=%u", offset, value, size,
+                 tuning->step, tuning->ready ? *tuning->ready : 0);
     exit(EXIT_FAILURE);
 }
 
@@ -1735,6 +1824,17 @@ static const MemoryRegionOps darwin_pmgr_range2_signed_ops = {
     .valid.unaligned = false,
 };
 
+static const MemoryRegionOps darwin_pmgr_range2_signed_cont_ops = {
+    .read = darwin_pmgr_range2_signed_cont_read,
+    .write = darwin_pmgr_range2_signed_cont_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .valid.unaligned = false,
+};
+
 static const MemoryRegionOps darwin_pmgr_topology_block_ops = {
     .read = darwin_pmgr_topology_block_read,
     .write = darwin_pmgr_topology_block_write,
@@ -2026,6 +2126,10 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                     D47_PMGR_RANGE2_SIGNED_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_signed_values) ==
                     D47_PMGR_RANGE2_SIGNED_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_signed_cont_masks) ==
+                    D47_PMGR_RANGE2_SIGNED_CONT_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_range2_signed_cont_values) ==
+                    D47_PMGR_RANGE2_SIGNED_CONT_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(domain_state_reg_indices) ==
                     D47_PMGR_DOMAIN_STATE_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(masked_tunable_offsets) ==
@@ -2063,6 +2167,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         regs[2].len < D47_PMGR_RANGE2_SIGNED_OFFSET +
                       d47_range2_signed_offsets[
                           D47_PMGR_RANGE2_SIGNED_COUNT - 1] + 4 ||
+        regs[2].len < D47_PMGR_RANGE2_SIGNED_CONT_OFFSET +
+                      D47_PMGR_RANGE2_SIGNED_CONT_COUNT * 4 ||
         regs[2].len < D47_PMGR_CONFIG_SELECTOR_OFFSET +
                       D47_PMGR_CONFIG_SELECTOR_COUNT * 4 ||
         regs[2].len < soc_tunable_offsets[
@@ -2295,6 +2401,16 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                               "darwin-pmgr-iboot-range2-signed", 0x44);
         memory_region_add_subregion_overlap(get_system_memory(), pa,
                                             &s->range2_signed_tuning.mr, 10);
+        s->range2_signed_continuation.ready =
+            &s->topology_selectors[0].tuned;
+        pa = iobase + regs[2].base + D47_PMGR_RANGE2_SIGNED_CONT_OFFSET;
+        memory_region_init_io(&s->range2_signed_continuation.mr, NULL,
+                              &darwin_pmgr_range2_signed_cont_ops,
+                              &s->range2_signed_continuation,
+                              "darwin-pmgr-iboot-range2-signed-cont", 0x20);
+        memory_region_add_subregion_overlap(
+            get_system_memory(), pa,
+            &s->range2_signed_continuation.mr, 10);
         for (i = 0; i < D47_PMGR_TOPOLOGY_BLOCK_COUNT; i++) {
             DarwinPMGRTopologyBlock *block = &s->topology_blocks[i];
 
