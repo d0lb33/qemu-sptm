@@ -236,6 +236,23 @@
  * first of three records for that address has the cross-build-identical
  * tuple (mask,value)=(0xffffffff,0x1c); accepting only that first transaction
  * deliberately leaves later reprogramming behind a new protocol boundary.
+ * The same active list then performs five device-specific state-control
+ * operations: set bit 13 on AOP_CPU, AOP2_CPU, and SMC_FABRIC; issue an
+ * already-clear bit-13 write to SMC_PTD; and set bit 13 on SMC_CPU.  Runtime
+ * identifies the five adjacent records at research raw +0x265cf8..+0x265d38
+ * and release raw +0x2638a8..+0x2638e8.  The set and clear tuples are
+ * cross-build identical at research raw +0x2ee7c8/+0x2ee7b8 and release raw
+ * +0x2eba58/+0x2eba48.  Admit bit 13 only for those named words and exact
+ * ordered values; the ordinary target/actual state behavior remains intact.
+ * In particular, the SMC_PTD no-op write must still consume its transaction.
+ *
+ * The immediately selected post-state record applies
+ * (mask,value)=(0x80ffff00,0x80040300) to range 1 +0x1c000.  At the read,
+ * x20 points to research raw +0x265db0 and release raw +0x263960; their tuple
+ * pointers resolve to research raw +0x2ee7f8 and release raw +0x2eba88.
+ * It is another non-polling, cold-storage RMW and is accepted only after all
+ * five state-control operations.  The next unmodeled record is range 1
+ * +0x1c010 with cross-build-identical (mask,value)=(0x00ffffff,0x00001001).
  */
 
 #include "qemu/osdep.h"
@@ -305,6 +322,10 @@
 #define D47_PMGR_RANGE43_MAX_OFFSET       UINT64_C(0x8ac028)
 #define D47_PMGR_POST_RANGE43_COUNT        2
 #define D47_PMGR_POST_RANGE43_BLOCK_COUNT  9
+#define D47_PMGR_ORDERED_STATE_CONTROL_COUNT 5
+#define D47_PMGR_POST_STATE_FIRST_OFFSET UINT64_C(0x1c000)
+#define D47_PMGR_POST_STATE_FIRST_MASK   UINT32_C(0x80ffff00)
+#define D47_PMGR_POST_STATE_FIRST_VALUE  UINT32_C(0x80040300)
 #define D47_PMGR_STATE_TARGET_MASK   UINT32_C(0x0000000f)
 #define D47_PMGR_STATE_ACTUAL_MASK   UINT32_C(0x000000f0)
 #define D47_PMGR_STATE_CONTROL_MASK  UINT32_C(0x9000000f)
@@ -328,6 +349,11 @@ typedef struct QEMU_PACKED DarwinPMGRDevice {
 typedef struct DarwinPMGRStateSlot {
     MemoryRegion mr;
     uint32_t state;
+    uint32_t ordered_control_mask;
+    uint32_t ordered_control_value;
+    unsigned *ready_phase;
+    unsigned required_phase;
+    bool ordered_control_done;
     unsigned reg_index;
     uint64_t offset;
     char name[D47_PMGR_DEVICE_NAME_LEN + 1];
@@ -340,6 +366,14 @@ typedef struct DarwinPMGRInitialTarget {
     uint8_t flags;
     const char *name;
 } DarwinPMGRInitialTarget;
+
+typedef struct DarwinPMGROrderedStateControl {
+    uint32_t reg_index;
+    uint64_t offset;
+    uint32_t mask;
+    uint32_t value;
+    const char *name;
+} DarwinPMGROrderedStateControl;
 
 static const DarwinPMGRInitialTarget d47_initial_targets[] = {
     { 0x2c, 0, 0x218, 0x09, "AFISOCNI0" },
@@ -355,6 +389,14 @@ static const DarwinPMGRInitialTarget d47_initial_targets[] = {
     { 0x35, 0, 0x260, 0x01, "SIO" },
     { 0x8e, 1, 0x070, 0x09, "NUB_AON" },
     { 0x96, 1, 0x0b0, 0x09, "DEBUG_SWITCH" },
+};
+
+static const DarwinPMGROrderedStateControl d47_ordered_state_controls[] = {
+    { 1, 0x4098, 0x00002000, 0x00002000, "AOP_CPU" },
+    { 1, 0x40a0, 0x00002000, 0x00002000, "AOP2_CPU" },
+    { 1, 0x8000, 0x00002000, 0x00002000, "SMC_FABRIC" },
+    { 1, 0x8060, 0x00002000, 0x00000000, "SMC_PTD" },
+    { 1, 0x8068, 0x00002000, 0x00002000, "SMC_CPU" },
 };
 
 static const uint64_t d47_range43_single_offsets[] = {
@@ -561,6 +603,7 @@ typedef struct DarwinPMGRIboot {
     DarwinPMGRMaskedTunable post_range43_block[
         D47_PMGR_POST_RANGE43_BLOCK_COUNT];
     DarwinPMGRMaskedTunable post_range43_38060;
+    DarwinPMGRMaskedTunable post_state_first;
     unsigned range43_phase;
     DarwinPMGRRootZero root_zero;
     DarwinPMGRMCCConfig mcc_configs[D47_MCC_CONFIG_COUNT];
@@ -1952,6 +1995,16 @@ static void darwin_pmgr_state_write(void *opaque, hwaddr offset,
 {
     DarwinPMGRStateSlot *slot = opaque;
     uint32_t word = value;
+    uint32_t changed = word ^ slot->state;
+    uint32_t ordered_changed = changed & slot->ordered_control_mask;
+    uint32_t ordered_expected =
+        (slot->state & ~slot->ordered_control_mask) |
+        (slot->ordered_control_value & slot->ordered_control_mask);
+    bool ordered_write = slot->ordered_control_mask &&
+                         !slot->ordered_control_done &&
+                         slot->ready_phase &&
+                         *slot->ready_phase == slot->required_phase &&
+                         word == ordered_expected;
     uint32_t target;
 
     if (size != 4 || offset != 0) {
@@ -1963,18 +2016,37 @@ static void darwin_pmgr_state_write(void *opaque, hwaddr offset,
     if (value != word ||
         (word & D47_PMGR_STATE_ACTUAL_MASK) !=
         (slot->state & D47_PMGR_STATE_ACTUAL_MASK) ||
-        ((word ^ slot->state) &
-         ~(D47_PMGR_STATE_CONTROL_MASK | D47_PMGR_STATE_ACTUAL_MASK))) {
+        (changed & ~(D47_PMGR_STATE_CONTROL_MASK |
+                     D47_PMGR_STATE_ACTUAL_MASK |
+                     slot->ordered_control_mask)) ||
+        (ordered_changed && !ordered_write)) {
         error_report("darwin-pmgr: invalid %s state write range%u+0x%" PRIx64
                      " value=0x%" PRIx64 " current=0x%08x"
-                     " changed-outside-model=0x%08x pc=0x%" PRIx64,
+                     " changed-outside-model=0x%08x"
+                     " ordered-mask=0x%08x ready-phase=%u required=%u"
+                     " pc=0x%" PRIx64,
                      slot->name, slot->reg_index, slot->offset, value,
                      slot->state,
-                     (word ^ slot->state) &
+                     changed &
                      ~(D47_PMGR_STATE_CONTROL_MASK |
-                       D47_PMGR_STATE_ACTUAL_MASK),
+                       D47_PMGR_STATE_ACTUAL_MASK |
+                       slot->ordered_control_mask),
+                     slot->ordered_control_mask,
+                     slot->ready_phase ? *slot->ready_phase : 0,
+                     slot->required_phase,
                      current_cpu ? ARM_CPU(current_cpu)->env.pc : 0);
         exit(EXIT_FAILURE);
+    }
+    if (ordered_write) {
+        slot->ordered_control_done = true;
+        (*slot->ready_phase)++;
+        fprintf(stderr,
+                "darwin-pmgr: %s range%u+0x%" PRIx64
+                " exact ordered control mask=0x%08x value=0x%08x"
+                " phase=%u\n",
+                slot->name, slot->reg_index, slot->offset,
+                slot->ordered_control_mask, slot->ordered_control_value,
+                *slot->ready_phase);
     }
     target = word & D47_PMGR_STATE_TARGET_MASK;
     slot->state = (word & ~D47_PMGR_STATE_ACTUAL_MASK) | (target << 4);
@@ -2414,6 +2486,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
     size_t i;
     size_t j;
     bool initial_targets_found[ARRAY_SIZE(d47_initial_targets)] = { false };
+    bool ordered_state_controls_found[
+        ARRAY_SIZE(d47_ordered_state_controls)] = { false };
     DarwinPMGRIboot *s;
     uint64_t pa;
     const char *revision_env = getenv("DARWIN_IBOOT_CHIP_REVISION");
@@ -2639,6 +2713,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                     D47_PMGR_POST_RANGE43_BLOCK_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_block_values) ==
                     D47_PMGR_POST_RANGE43_BLOCK_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_ordered_state_controls) ==
+                    D47_PMGR_ORDERED_STATE_CONTROL_COUNT);
 
     if (!pmgr) {
         error_report("darwin-pmgr: PMGR node is absent");
@@ -2693,6 +2769,7 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                       D47_PMGR_HANDSHAKE_STATUS + 4 ||
         regs[1].len < D47_PMGR_CPFM_OFFSET + 8 ||
         regs[1].len < D47_PMGR_TUNING_FUSE_OFFSET + 4 ||
+        regs[1].len < D47_PMGR_POST_STATE_FIRST_OFFSET + 4 ||
         regs[1].len < d47_post_range43_offsets[
                       D47_PMGR_POST_RANGE43_COUNT - 1] + 4 ||
         regs[1].len < D47_PMGR_IDENTITY_OFFSET + 4 ||
@@ -2892,6 +2969,23 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                           "darwin-pmgr-iboot-post-range43-38060", 4);
     memory_region_add_subregion_overlap(get_system_memory(), pa,
                                         &s->post_range43_38060.mr, 10);
+
+    s->post_state_first.offset = D47_PMGR_POST_STATE_FIRST_OFFSET;
+    s->post_state_first.reg_index = 1;
+    s->post_state_first.mask = D47_PMGR_POST_STATE_FIRST_MASK;
+    s->post_state_first.value = D47_PMGR_POST_STATE_FIRST_VALUE;
+    s->post_state_first.ready_phase = &s->range43_phase;
+    s->post_state_first.required_phase =
+        D47_PMGR_RANGE43_SINGLE_COUNT + 1 +
+        D47_PMGR_POST_RANGE43_COUNT + D47_PMGR_POST_RANGE43_BLOCK_COUNT + 1 +
+        D47_PMGR_ORDERED_STATE_CONTROL_COUNT;
+    pa = iobase + regs[1].base + s->post_state_first.offset;
+    memory_region_init_io(&s->post_state_first.mr, NULL,
+                          &darwin_pmgr_masked_tunable_ops,
+                          &s->post_state_first,
+                          "darwin-pmgr-iboot-post-state-first", 4);
+    memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                        &s->post_state_first.mr, 10);
 
     pa = iobase + regs[2].base;
     memory_region_init_io(&s->root_zero.mr, NULL,
@@ -3276,6 +3370,29 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         slot->offset = offset;
         memcpy(slot->name, devices[i].name, D47_PMGR_DEVICE_NAME_LEN);
         slot->name[D47_PMGR_DEVICE_NAME_LEN] = '\0';
+        for (k = 0; k < ARRAY_SIZE(d47_ordered_state_controls); k++) {
+            const DarwinPMGROrderedStateControl *control =
+                &d47_ordered_state_controls[k];
+
+            if (reg_index != control->reg_index ||
+                offset != control->offset ||
+                strcmp(slot->name, control->name)) {
+                continue;
+            }
+            if (ordered_state_controls_found[k]) {
+                error_report("darwin-pmgr: duplicate d47 %s ordered control"
+                             " mapping", control->name);
+                exit(EXIT_FAILURE);
+            }
+            slot->ordered_control_mask = control->mask;
+            slot->ordered_control_value = control->value;
+            slot->ready_phase = &s->range43_phase;
+            slot->required_phase = D47_PMGR_RANGE43_SINGLE_COUNT + 1 +
+                                   D47_PMGR_POST_RANGE43_COUNT +
+                                   D47_PMGR_POST_RANGE43_BLOCK_COUNT + 1 + k;
+            ordered_state_controls_found[k] = true;
+            break;
+        }
         for (k = 0; k < ARRAY_SIZE(d47_initial_targets); k++) {
             const DarwinPMGRInitialTarget *initial = &d47_initial_targets[k];
 
@@ -3305,6 +3422,13 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         if (!initial_targets_found[i]) {
             error_report("darwin-pmgr: d47 initial-target device 0x%x is"
                          " absent", d47_initial_targets[i].device_id);
+            exit(EXIT_FAILURE);
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(d47_ordered_state_controls); i++) {
+        if (!ordered_state_controls_found[i]) {
+            error_report("darwin-pmgr: d47 %s ordered control mapping is"
+                         " absent", d47_ordered_state_controls[i].name);
             exit(EXIT_FAILURE);
         }
     }
