@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -30,6 +31,8 @@
 #include "xnu/darwin_sep.h"
 #include "xnu/darwin_ans.h"
 #include "xnu/darwin_unimp.h"
+#include "xnu/darwin_smp.h"
+#include "xnu/gxfstat.h"
 
 // See device tree specification section 2.3.8: ranges
 #define IO_RANGE_BASE_OFFSET     1
@@ -50,6 +53,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinState, DARWIN_MACHINE)
 struct DarwinState {
     MachineState parent_obj;
     ARMCPU *cpu;
+    ARMCPU *cpus[DARWIN_MAX_CPUS];
     struct xnu_boot_info bootinfo;
 };
 
@@ -91,6 +95,13 @@ static void do_darwin_reset(void *state) {
     env->cp15.cpacr_el1 |= CPACR_ENABLE_FPU;
     env->cp15.cptr_el[2] |= CPTR_ENABLE_FPU;
     arm_rebuild_hflags(env);
+
+    for (unsigned i = 1; i < s->parent_obj.smp.cpus; i++) {
+        cpu_reset(CPU(s->cpus[i]));
+    }
+    if (s->parent_obj.smp.cpus > 1) {
+        darwin_smp_reset();
+    }
 }
 
 static mmap_file_t check_and_open(const char *path, const char *errmsg) {
@@ -261,6 +272,56 @@ static void darwin_init(MachineState *ms) {
 
     check_dtree(dt_root);
 
+    struct dtree_node *cpu_nodes = adt_find_node(dt_root, "cpus");
+    if (!cpu_nodes || ms->smp.cpus > cpu_nodes->nChildren) {
+        error_report("darwin: requested CPUs exceed the device tree CPU count");
+        exit(1);
+    }
+    if (ms->smp.cpus > 1) {
+        struct dtree_node *n = adt_first_child(cpu_nodes);
+        if (n != adt_find_node(dt_root, "cpus/cpu0")) {
+            error_report("darwin: SMP requires cpu0 first in the device tree");
+            exit(1);
+        }
+        for (unsigned i = 0; i < ms->smp.cpus; i++) {
+            uint32_t *affinity = adt_get_prop_val(n, "reg");
+            if (!affinity || adt_get_prop_len(n, "reg") != sizeof(*affinity) ||
+                (i == 0 && *affinity != 0)) {
+                error_report("darwin: unsupported SMP CPU affinity layout");
+                exit(1);
+            }
+            n = adt_next_sibling(cpu_nodes, n);
+        }
+        /* XNU's ml_parse_cpu_topology uses cpus=N to bound the EDT list. */
+        g_auto(GStrv) words = g_strsplit_set(info->args, " \t", -1);
+        g_autofree char *expected = g_strdup_printf("cpus=%u", ms->smp.cpus);
+        GString *args = g_string_new(expected);
+        for (unsigned i = 0; words[i]; i++) {
+            if (g_str_has_prefix(words[i], "cpumask=")) {
+                error_report("darwin: SMP does not support cpumask; use -smp N");
+                exit(1);
+            }
+            if (g_str_has_prefix(words[i], "cpus=")) {
+                if (info->args != g_default_args && strcmp(words[i], expected)) {
+                    error_report("darwin: boot argument %s conflicts with -smp %u",
+                                 words[i], ms->smp.cpus);
+                    exit(1);
+                }
+                continue;
+            }
+            if (*words[i]) {
+                g_string_append_c(args, ' ');
+                g_string_append(args, words[i]);
+            }
+        }
+        info->args = g_string_free(args, false);
+        /* The historical counters and histogram are single-vCPU scaffolding. */
+        gxfstat_enabled = false;
+        warn_report("darwin: experimental SMP; %s", getenv("DARWIN_SMP_PV") ?
+                    "virtual CPU power management enabled; suspend/hotplug unsupported" :
+                    "XNU secondary startup requires the virtual platform adapter");
+    }
+
     info->has_mte = kc_uses_mte(info->bootkc_f.buf);
 
     Object *cpuobj = object_new(ms->cpu_type);
@@ -288,6 +349,11 @@ static void darwin_init(MachineState *ms) {
     info->dram_size = *(u64*)adt_get_prop_val(chosen_node, "dram-size");
 
     s->cpu = ARM_CPU(cpuobj);
+    s->cpus[0] = s->cpu;
+    if (ms->smp.cpus > 1) {
+        cpu->mp_affinity = *(uint32_t *)adt_get_prop_val(cpu_node, "reg");
+        cpu->core_count = ms->smp.cpus;
+    }
     arm_load_xnu(s->cpu, ms, info);
     if (info->has_mte) setup_mte(cpuobj, MACHINE(s), info);
 
@@ -297,6 +363,34 @@ static void darwin_init(MachineState *ms) {
         amcc_dev = (AMCCState*)amcc_create(amcc_node);
     }
     apple_regs_init(cpu, amcc_dev, dt_root, info);
+
+    struct dtree_node *next_cpu = adt_next_sibling(cpu_nodes, cpu_node);
+    for (unsigned i = 1; i < ms->smp.cpus; i++) {
+        ARMCPU *other = ARM_CPU(object_new(ms->cpu_type));
+        s->cpus[i] = other;
+        other->has_el2 = true;
+        other->has_el3 = false;
+        unset_feature(&other->env, ARM_FEATURE_CBAR);
+        unset_feature(&other->env, ARM_FEATURE_CBAR_RO);
+        unset_feature(&other->env, ARM_FEATURE_EL3);
+        unset_feature(&other->env, ARM_FEATURE_PMU);
+        set_feature(&other->env, ARM_FEATURE_EL2);
+        other->gt_cntfrq_hz = dtree_frq;
+        other->mp_affinity = *(uint32_t *)adt_get_prop_val(next_cpu, "reg");
+        other->core_count = ms->smp.cpus;
+        CPU(other)->start_powered_off = true;
+        if (info->has_mte) {
+            Object *tags = object_property_get_link(cpuobj, "tag-memory", &error_abort);
+            object_property_set_link(OBJECT(other), "tag-memory", tags, &error_abort);
+        }
+        apple_regs_init(other, NULL, dt_root, info);
+        next_cpu = adt_next_sibling(cpu_nodes, next_cpu);
+    }
+    if (ms->smp.cpus > 1) {
+        for (unsigned i = 0; i < ms->smp.cpus; i++) {
+            darwin_smp_register_cpu(s->cpus[i]);
+        }
+    }
 
     struct dtree_node *arm_io = adt_find_node(dt_root, "arm-io");
     uint64_t *arm_io_ranges = adt_get_prop_val(arm_io, "ranges");
@@ -334,16 +428,25 @@ static void darwin_init(MachineState *ms) {
     }
     darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, n_claimed);
     init_sep(dt_root);
-    init_cpu_impl(dt_root);
+    if (ms->smp.cpus == 1) {
+        init_cpu_impl(dt_root);
+    } else {
+        darwin_smp_init(s->cpus, ms->smp.cpus, dt_root, info);
+    }
 
     // M4 (T8132) asserts SME's max VQ len is this many.
     // Specifically, rdsvl   x8, #0x1 must return 0x40.
-    s->cpu->sme_vq.supported = 0x0b;
-
-    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
-
-    // On Apple Si, FIQ is hardwired to platform timer
-    qdev_connect_gpio_out(cpudev, GTIMER_HYPVIRT, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    for (unsigned i = 0; i < ms->smp.cpus; i++) {
+        ARMCPU *c = s->cpus[i];
+        c->sme_vq.supported = 0x0b;
+        qdev_realize(DEVICE(c), NULL, &error_fatal);
+        if (ms->smp.cpus > 1) {
+            darwin_smp_connect_cpu(c);
+        } else {
+            qdev_connect_gpio_out(DEVICE(c), GTIMER_HYPVIRT,
+                                 qdev_get_gpio_in(DEVICE(c), ARM_CPU_FIQ));
+        }
+    }
 
     // Must come after realize, for the same reason as the FIQ above: before it,
     // the CPU has no canonical QOM path, object_property_set_link stores "" and
@@ -370,7 +473,8 @@ static void darwin_init(MachineState *ms) {
 static void darwin_machine_init(MachineClass *mc) {
     mc->desc = "Generic Apple Silicon Device";
     mc->init = darwin_init;
-    mc->max_cpus = 1;
+    mc->max_cpus = DARWIN_MAX_CPUS;
+    mc->default_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
 }
 

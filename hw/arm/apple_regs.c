@@ -31,6 +31,33 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 
 #include "apple_regs_autogen.h"
 
+void apple_regs_pv_cpu_handoff(CPUARMState *dst, CPUARMState *src)
+{
+    /* The virtual platform supplies the already-established protection map
+     * to a powered-off CPU. SPTM secondary bring-up validates these registers
+     * in ctrr_ctxr_check_region (24A5430a: 0xfffffff0270b3f5c onwards).
+     * Copy only the protection map, never execution state or authentication
+     * keys. The caller owns src and holds BQL; dst must still be powered off.
+     */
+#define COPY_REGION(r) do { \
+    APPLE_STATE(dst)->r##_ctl_el2 = APPLE_STATE(src)->r##_ctl_el2; \
+    APPLE_STATE(dst)->r##_lwr_el2 = APPLE_STATE(src)->r##_lwr_el2; \
+    APPLE_STATE(dst)->r##_upr_el2 = APPLE_STATE(src)->r##_upr_el2 & ~0xfffull; \
+} while (0)
+    COPY_REGION(ctrr_a);
+    COPY_REGION(ctrr_b);
+    COPY_REGION(ctrr_c);
+    COPY_REGION(ctrr_d);
+    COPY_REGION(ctxr_a);
+    COPY_REGION(ctxr_b);
+    COPY_REGION(ctxr_c);
+    COPY_REGION(ctxr_d);
+#undef COPY_REGION
+    /* Upper bounds read back as page addresses: SPTM+0xb42d0 masks its
+     * stored inclusive upper bound before comparing with CTRR_C_UPR_EL1;
+     * the CTXR checks at +0xb4334 etc use the same 4 KiB mask. */
+}
+
 static uint64_t pmc0_read(CPUARMState *env, const ARMCPRegInfo *ri) {
     if (0 == env->pc) return 0;
     APPLE_STATE(env)->pmc0_internal_count += rand() % 10000;

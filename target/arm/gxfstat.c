@@ -10,6 +10,7 @@
 #include <time.h>
 
 uint64_t gxfstat_genter;
+bool gxfstat_enabled = true;
 uint64_t gxfstat_gexit;
 uint64_t gxfstat_sysreg_rd;
 uint64_t gxfstat_sysreg_wr;
@@ -35,6 +36,9 @@ static struct {
 
 void gxfstat_note_sysreg(const char *name, int el, int is_write)
 {
+    if (!gxfstat_enabled) {
+        return;
+    }
     uintptr_t h = ((uintptr_t)name >> 4) & (GXFSTAT_NREG - 1);
 
     gxfstat_sysreg_el[el & 3]++;
@@ -155,6 +159,11 @@ static void *gxfstat_thread(void *unused)
 
 void gxfstat_start(void)
 {
+    static bool started;
+    if (started || !gxfstat_enabled) {
+        return;
+    }
+    started = true;
     const char *e = getenv("DARWIN_GXFSTAT");
     pthread_t th;
 
