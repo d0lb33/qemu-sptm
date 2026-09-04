@@ -5,6 +5,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
+#include "migration/vmstate.h"
 #include "xnu/apple_dtree.h"
 #include "trace.h"
 
@@ -91,11 +92,30 @@ static void amcc_init(Object *obj) {
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
+static const VMStateDescription vmstate_amcc = {
+    .name = TYPE_AMCC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_ARRAY(ctrr_lwr, AMCCState, AMCC_NUM_BANKS),
+        VMSTATE_UINT64_ARRAY(ctrr_upr, AMCCState, AMCC_NUM_BANKS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void amcc_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->vmsd = &vmstate_amcc;
+}
+
 static const TypeInfo amcc_info = {
     .name           =  TYPE_AMCC,
     .parent         =  TYPE_SYS_BUS_DEVICE,
     .instance_size  =  sizeof(AMCCState),
     .instance_init  =  amcc_init,
+    .class_init     =  amcc_class_init,
 };
 
 static void amcc_register_types(void) {

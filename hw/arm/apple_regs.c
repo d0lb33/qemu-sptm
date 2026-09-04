@@ -33,9 +33,8 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 
 static uint64_t pmc0_read(CPUARMState *env, const ARMCPRegInfo *ri) {
     if (0 == env->pc) return 0;
-    static uint64_t internal_count = 0;
-    internal_count += rand() % 10000;
-    return internal_count;
+    APPLE_STATE(env)->pmc0_internal_count += rand() % 10000;
+    return APPLE_STATE(env)->pmc0_internal_count;
 }
 
 static void pmc0_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) {
@@ -43,12 +42,39 @@ static void pmc0_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) {
 
 static uint64_t pmc1_read(CPUARMState *env, const ARMCPRegInfo *ri) {
     if (0 == env->pc) return 0;
-    static uint64_t internal_count = 0;
-    internal_count += rand() % 1000;
-    return internal_count;
+    APPLE_STATE(env)->pmc1_internal_count += rand() % 1000;
+    return APPLE_STATE(env)->pmc1_internal_count;
 }
 
 static void pmc1_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val) {
+}
+
+/*
+ * Migration must not use the guest-visible PMC accessors above: reads advance
+ * the synthetic counters and writes are intentionally ignored.  Raw access
+ * stores and restores the backing values without side effects, which also
+ * makes ARM's post-load write/read-back validation deterministic.
+ */
+static uint64_t pmc0_raw_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return APPLE_STATE(env)->pmc0_internal_count;
+}
+
+static void pmc0_raw_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                           uint64_t val)
+{
+    APPLE_STATE(env)->pmc0_internal_count = val;
+}
+
+static uint64_t pmc1_raw_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return APPLE_STATE(env)->pmc1_internal_count;
+}
+
+static void pmc1_raw_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                           uint64_t val)
+{
+    APPLE_STATE(env)->pmc1_internal_count = val;
 }
 
 typedef struct {
@@ -61,11 +87,53 @@ static const ARMCPRegInfo apple_pmcregs[] = {
         .name = "PMC0", .state = ARM_CP_STATE_AA64, .access = PL1_RW,
         .opc0 = 3, .opc1 = 2, .crn = 15, .crm = 0, .opc2 = 0,
         .readfn = pmc0_read, .writefn = pmc0_write,
+        .raw_readfn = pmc0_raw_read, .raw_writefn = pmc0_raw_write,
     },
     {
         .name = "PMC1", .state = ARM_CP_STATE_AA64, .access = PL1_RW,
         .opc0 = 3, .opc1 = 2, .crn = 15, .crm = 1, .opc2 = 0,
         .readfn = pmc1_read, .writefn = pmc1_write,
+        .raw_readfn = pmc1_raw_read, .raw_writefn = pmc1_raw_write,
+    },
+};
+
+static bool apple_cpu_state_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->env.apple_state != NULL;
+}
+
+const VMStateDescription vmstate_apple_cpu = {
+    .name = "cpu/apple-darwin",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = apple_cpu_state_needed,
+    .fields = (const VMStateField[]) {
+        /*
+         * apple_state_t is generated from the complete IMP-DEF register list.
+         * It contains values only; its address is destination-local.
+         */
+        VMSTATE_BUFFER_POINTER_UNSAFE(env.apple_state, ARMCPU, 1,
+                                      sizeof(apple_state_t)),
+        VMSTATE_UINT64_ARRAY(env.sprr_config_el, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.sprr_pperm_el, ARMCPU, 4),
+        VMSTATE_UINT64(env.sprr_uperm_el0, ARMCPU),
+        VMSTATE_UINT64_ARRAY(env.gxf_config_el, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.gxf_entry_el, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.gxf_pabentry_el, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.sp_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.tpidr_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.aspsr_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.vbar_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.far_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.esr_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.elr_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.spsr_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.pmcr1_gl, ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(env.afsr1_gl, ARMCPU, 4),
+        VMSTATE_UINT64(env.currentg, ARMCPU),
+        VMSTATE_END_OF_LIST()
     },
 };
 

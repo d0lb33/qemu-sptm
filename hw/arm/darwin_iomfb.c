@@ -183,6 +183,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "exec/memattrs.h"
@@ -300,6 +301,49 @@ struct DarwinIOMFB {
     char *cb_after;
     uint64_t cb_sent;
 };
+
+static int darwin_iomfb_post_load(void *opaque, int version_id)
+{
+    DarwinIOMFB *m = opaque;
+
+    if ((m->cb_next || m->cb_busy || m->cb_started) && !m->cb_script) {
+        return -EINVAL;
+    }
+    if (m->cb_script && m->cb_next > m->cb_script->len) {
+        return -EINVAL;
+    }
+    if (m->heap_known && !m->heap_dva) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_iomfb = {
+    .name = "darwin-iomfb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_iomfb_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(sid, DarwinIOMFB),
+        VMSTATE_UINT32_EQUAL(level, DarwinIOMFB),
+        VMSTATE_BOOL(heap_known, DarwinIOMFB),
+        VMSTATE_UINT64(heap_dva, DarwinIOMFB),
+        VMSTATE_UINT64(rpcs, DarwinIOMFB),
+        VMSTATE_UINT32(cb_next, DarwinIOMFB),
+        VMSTATE_BOOL(cb_busy, DarwinIOMFB),
+        VMSTATE_BOOL(cb_started, DarwinIOMFB),
+        VMSTATE_BOOL(cb_flag9, DarwinIOMFB),
+        VMSTATE_UINT64(cb_sent, DarwinIOMFB),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+void darwin_iomfb_register_vmstate(DarwinIOMFB *m, unsigned instance_id)
+{
+    int ret = vmstate_register(NULL, instance_id, &vmstate_darwin_iomfb, m);
+
+    g_assert(ret == 0);
+}
 
 /* One scripted outbound callback, or an @NAME AP-RPC barrier. */
 typedef struct {

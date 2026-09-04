@@ -54,3 +54,5 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
 // One 64-bit mailbox message arrived from the AP on `ep`. Always returns true:
 // an endpoint we advertise must never look dead, and never faults.
 bool darwin_iomfb_handle(DarwinIOMFB *m, uint8_t ep, uint64_t msg);
+
+void darwin_iomfb_register_vmstate(DarwinIOMFB *m, unsigned instance_id);

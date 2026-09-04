@@ -34,6 +34,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "migration/vmstate.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -339,6 +340,46 @@ static void darwin_dart_realize(DeviceState *dev, Error **errp) {
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
+static int darwin_dart_post_load(void *opaque, int version_id)
+{
+    DarwinDARTState *s = opaque;
+
+    if (!s->num_sids || s->num_sids > DART_MAX_SIDS ||
+        !s->ttbr_count || s->ttbr_count > DART_MAX_TTBRS_PER_SID ||
+        s->page_shift < 12 || s->page_shift > 16) {
+        return -EINVAL;
+    }
+    /*
+     * There is deliberately no translation cache: page-table memory and
+     * these authoritative registers are consulted on every DMA.
+     */
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_dart = {
+    .name = TYPE_DARWIN_DART,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_dart_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(mmio_size, DarwinDARTState),
+        VMSTATE_UINT32_EQUAL(num_sids, DarwinDARTState),
+        VMSTATE_UINT32_EQUAL(page_shift, DarwinDARTState),
+        VMSTATE_UINT32_EQUAL(va_width, DarwinDARTState),
+        VMSTATE_UINT32_EQUAL(pa_width, DarwinDARTState),
+        VMSTATE_UINT32_EQUAL(ttbr_count, DarwinDARTState),
+        VMSTATE_UINT32_ARRAY(streams_enabled, DarwinDARTState, 8),
+        VMSTATE_UINT32_ARRAY(tcr, DarwinDARTState, DART_MAX_SIDS),
+        VMSTATE_UINT32_2DARRAY(ttbr, DarwinDARTState, DART_MAX_SIDS,
+                              DART_MAX_TTBRS_PER_SID),
+        VMSTATE_UINT32(protect, DarwinDARTState),
+        VMSTATE_UINT32(error, DarwinDARTState),
+        VMSTATE_UINT32(error_mask, DarwinDARTState),
+        VMSTATE_VBUFFER_UINT32(misc, DarwinDARTState, 1, NULL, mmio_size),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_dart_properties[] = {
     DEFINE_PROP_STRING("name", DarwinDARTState, name),
     DEFINE_PROP_UINT32("mmio-size", DarwinDARTState, mmio_size, 0),
@@ -353,6 +394,7 @@ static const Property darwin_dart_properties[] = {
 static void darwin_dart_class_init(ObjectClass *klass, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_dart_realize;
+    dc->vmsd = &vmstate_darwin_dart;
     dc->desc = "Apple DART IOMMU (t8110)";
     device_class_set_props(dc, darwin_dart_properties);
     dc->user_creatable = false;

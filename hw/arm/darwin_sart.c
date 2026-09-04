@@ -146,6 +146,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "migration/vmstate.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -468,6 +469,46 @@ static void darwin_sart_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
+static int darwin_sart_post_load(void *opaque, int version_id)
+{
+    DarwinSARTState *s = opaque;
+
+    if (!s->num_windows || s->num_windows > SART_MAX_WINDOWS ||
+        s->version < SART_MIN_VERSION || s->version > SART_MAX_VERSION ||
+        s->throttle_version < SART_MIN_VERSION ||
+        s->throttle_version > SART_MAX_VERSION) {
+        return -EINVAL;
+    }
+    /*
+     * rl/tl and the window back-pointers are destination-process objects
+     * reconstructed by realize.  The stream contains only register bytes.
+     */
+    s->rl = &sart_region_layouts[s->version - 1];
+    s->tl = &sart_throttle_layouts[s->throttle_version - 1];
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_sart = {
+    .name = TYPE_DARWIN_SART,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_sart_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(version, DarwinSARTState),
+        VMSTATE_UINT32_EQUAL(throttle_version, DarwinSARTState),
+        VMSTATE_UINT32_EQUAL(num_windows, DarwinSARTState),
+        VMSTATE_UINT32_EQUAL(window_size[0], DarwinSARTState),
+        VMSTATE_UINT32_EQUAL(window_size[1], DarwinSARTState),
+        VMSTATE_UINT64_EQUAL(window_base[0], DarwinSARTState),
+        VMSTATE_UINT64_EQUAL(window_base[1], DarwinSARTState),
+        VMSTATE_VBUFFER_UINT32(win[0].store, DarwinSARTState, 1, NULL,
+                               window_size[0]),
+        VMSTATE_VBUFFER_UINT32(win[1].store, DarwinSARTState, 1, NULL,
+                               window_size[1]),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_sart_properties[] = {
     DEFINE_PROP_STRING("name", DarwinSARTState, name),
     DEFINE_PROP_UINT32("version", DarwinSARTState, version, 3),
@@ -490,6 +531,7 @@ static void darwin_sart_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_sart_realize;
+    dc->vmsd = &vmstate_darwin_sart;
     dc->desc = "Apple SART DMA address filter";
     device_class_set_props(dc, darwin_sart_properties);
     dc->user_creatable = false;

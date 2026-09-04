@@ -53,6 +53,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "xnu/darwin_asc.h"
 #include "xnu/darwin_afk.h"
 #include "xnu/darwin_dart.h"
@@ -112,6 +113,17 @@ typedef struct DarwinDCP {
     uint8_t options;        /* EPIC packet header options byte */
     uint16_t next_iface;    /* firmware-chosen interface ids, 1-based */
 } DarwinDCP;
+
+static const VMStateDescription vmstate_darwin_dcp = {
+    .name = "darwin-dcp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(msgs, DarwinDCP),
+        VMSTATE_UINT16(next_iface, DarwinDCP),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 /*
  * Endpoints the firmware advertises in the RTKit endpoint map. 0x20..0x2a is
@@ -482,6 +494,8 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
 
     d->afk = darwin_afk_new(d->asc, adt_get_prop_val(dcp, "role"), dart, sid,
                             NULL, &dcp_afk_ops, d);
+    g_assert(vmstate_register(NULL, 0, &vmstate_darwin_dcp, d) == 0);
+    darwin_afk_register_vmstate(d->afk, 0);
     /*
      * The IOMFB link reaches the AP's RPC heap through the same DART and
      * stream id as the AFK rings -- both are DMA by the same coprocessor, and
@@ -490,6 +504,7 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
      */
     if (d->iomfb_level) {
         d->iomfb = darwin_iomfb_new(d->asc, dart, sid, d->iomfb_level);
+        darwin_iomfb_register_vmstate(d->iomfb, 0);
     }
     for (size_t i = 0; i < ARRAY_SIZE(dcp_eps); i++) {
         darwin_afk_add_endpoint(d->afk, dcp_eps[i]);
