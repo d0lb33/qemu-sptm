@@ -212,12 +212,30 @@
  * selector-word-8 request; neither operation polls a completion response.
  *
  * Once the boot-on PMGR device transitions complete, both images perform the
- * same four cold-start latch sequences: range 43 +0x8ac000 bit 0; +0x800000
- * bit 2 followed by bit 5; +0x8ac028 bit 0; and +0x864000 bit 1.  The blocks
- * are research raw +0x69250 and release raw +0x68540.  Each operation reads,
- * sets only the named bit, and writes the result without a status poll.  Model
- * only those words as cold-clear storage and accept only those exact ordered
- * sequences; this does not claim physical reset values or invent completion.
+ * same cold-start latch sequences: range 43 +0x8ac000 bit 0; +0x800000 bit 2
+ * followed by bit 5; +0x8ac028 bit 0; +0x864000 bit 1; and +0x8aa0bc bit 6.
+ * The first four are in the blocks at research raw +0x69250 and release raw
+ * +0x68540.  The last uses a four-instruction leaf at research raw +0x6e45c
+ * and release raw +0x6d74c.  Each operation reads, sets only the named bit,
+ * and writes the result without a status poll.  Model only those words as
+ * cold-clear storage and accept only those exact ordered sequences; this does
+ * not claim physical reset values or invent completion.
+ *
+ * The selected table then applies two 32-bit RMW records under PMGR range 1
+ * base +0x50000: +0x400 uses (mask,value)=(0x00000fff,0), and +0x408 uses
+ * (0x00ffffff,0x00000352).  Runtime identifies the active adjacent records at
+ * research raw +0x265948/+0x265958 and release raw +0x2634f8/+0x263508; their
+ * referenced tuples are cross-build identical.  They are non-polling table
+ * writes.  Admit only the exact ordered cold-zero observations and writes.
+ * The next selected table has nine more non-polling 32-bit RMW records at
+ * range 1 +0x3c000..+0x3c330.  Runtime identifies the active records at
+ * research raw +0x265a60 and release raw +0x263610; each tuple below is
+ * cross-build identical.  Keep the whole path ordered and fail closed.
+ * Finally, the currently selected list writes range 1 +0x38060 through the
+ * active records at research raw +0x265b30 and release raw +0x2636e0.  The
+ * first of three records for that address has the cross-build-identical
+ * tuple (mask,value)=(0xffffffff,0x1c); accepting only that first transaction
+ * deliberately leaves later reprogramming behind a new protocol boundary.
  */
 
 #include "qemu/osdep.h"
@@ -282,9 +300,11 @@
 #define D47_MCC_TUNABLE_COUNT        2
 #define D47_PMGR_DEVICE_NAME_LEN     16
 #define D47_PMGR_INITIAL_TARGET_STATE     UINT32_C(0x0f)
-#define D47_PMGR_RANGE43_SINGLE_COUNT     3
+#define D47_PMGR_RANGE43_SINGLE_COUNT     4
 #define D47_PMGR_RANGE43_DOUBLE_OFFSET    UINT64_C(0x800000)
 #define D47_PMGR_RANGE43_MAX_OFFSET       UINT64_C(0x8ac028)
+#define D47_PMGR_POST_RANGE43_COUNT        2
+#define D47_PMGR_POST_RANGE43_BLOCK_COUNT  9
 #define D47_PMGR_STATE_TARGET_MASK   UINT32_C(0x0000000f)
 #define D47_PMGR_STATE_ACTUAL_MASK   UINT32_C(0x000000f0)
 #define D47_PMGR_STATE_CONTROL_MASK  UINT32_C(0x9000000f)
@@ -338,11 +358,38 @@ static const DarwinPMGRInitialTarget d47_initial_targets[] = {
 };
 
 static const uint64_t d47_range43_single_offsets[] = {
-    0x8ac000, 0x8ac028, 0x864000,
+    0x8ac000, 0x8ac028, 0x864000, 0x8aa0bc,
 };
 
 static const uint32_t d47_range43_single_masks[] = {
-    0x00000001, 0x00000001, 0x00000002,
+    0x00000001, 0x00000001, 0x00000002, 0x00000040,
+};
+
+static const uint64_t d47_post_range43_offsets[] = {
+    0x50400, 0x50408,
+};
+
+static const uint32_t d47_post_range43_masks[] = {
+    0x00000fff, 0x00ffffff,
+};
+
+static const uint32_t d47_post_range43_values[] = {
+    0x00000000, 0x00000352,
+};
+
+static const uint64_t d47_post_range43_block_offsets[] = {
+    0x3c000, 0x3c020, 0x3c044, 0x3c100, 0x3c110,
+    0x3c114, 0x3c118, 0x3c32c, 0x3c330,
+};
+
+static const uint32_t d47_post_range43_block_masks[] = {
+    0x00000001, 0x3fffffff, 0x00000001, 0x00000001, 0xffffffff,
+    0xffffffff, 0x01ffffff, 0x000000ff, 0x800001ff,
+};
+
+static const uint32_t d47_post_range43_block_values[] = {
+    0x00000001, 0x3f1c7ff7, 0x00000001, 0x00000001, 0xf37fe05f,
+    0xcbff9400, 0x01fe4047, 0x00000000, 0x00000000,
 };
 
 typedef struct DarwinPMGRHandshake {
@@ -439,6 +486,8 @@ typedef struct DarwinPMGRMaskedTunable {
     uint64_t offset;
     unsigned reg_index;
     unsigned phase;
+    unsigned *ready_phase;
+    unsigned required_phase;
 } DarwinPMGRMaskedTunable;
 
 typedef struct DarwinPMGRBitSetSequence {
@@ -448,6 +497,8 @@ typedef struct DarwinPMGRBitSetSequence {
     uint64_t offset;
     unsigned reg_index;
     unsigned phase;
+    unsigned *ready_phase;
+    unsigned required_phase;
 } DarwinPMGRBitSetSequence;
 
 typedef struct DarwinPMGRStartupWord {
@@ -505,6 +556,12 @@ typedef struct DarwinPMGRIboot {
     DarwinPMGRMaskedTunable range43_single_latches[
         D47_PMGR_RANGE43_SINGLE_COUNT];
     DarwinPMGRBitSetSequence range43_double_latch;
+    DarwinPMGRMaskedTunable post_range43_tunables[
+        D47_PMGR_POST_RANGE43_COUNT];
+    DarwinPMGRMaskedTunable post_range43_block[
+        D47_PMGR_POST_RANGE43_BLOCK_COUNT];
+    DarwinPMGRMaskedTunable post_range43_38060;
+    unsigned range43_phase;
     DarwinPMGRRootZero root_zero;
     DarwinPMGRMCCConfig mcc_configs[D47_MCC_CONFIG_COUNT];
     DarwinPMGRMCCTunable mcc_tunables[
@@ -1110,10 +1167,15 @@ static uint64_t darwin_pmgr_masked_tunable_read(void *opaque, hwaddr offset,
 {
     DarwinPMGRMaskedTunable *slot = opaque;
 
-    if (offset != 0 || size != 4 || slot->phase != 0) {
+    if (offset != 0 || size != 4 || slot->phase != 0 ||
+        (slot->ready_phase &&
+         *slot->ready_phase != slot->required_phase)) {
         error_report("darwin-pmgr: invalid masked tunable range%u+0x%" PRIx64
-                     " read offset=0x%" HWADDR_PRIx " size=%u phase=%u",
-                     slot->reg_index, slot->offset, offset, size, slot->phase);
+                     " read offset=0x%" HWADDR_PRIx
+                     " size=%u phase=%u ready-phase=%u required=%u",
+                     slot->reg_index, slot->offset, offset, size, slot->phase,
+                     slot->ready_phase ? *slot->ready_phase : 0,
+                     slot->required_phase);
         exit(EXIT_FAILURE);
     }
     slot->phase = 1;
@@ -1139,6 +1201,9 @@ static void darwin_pmgr_masked_tunable_write(void *opaque, hwaddr offset,
     }
     slot->word = expected;
     slot->phase = 2;
+    if (slot->ready_phase) {
+        (*slot->ready_phase)++;
+    }
     fprintf(stderr,
             "darwin-pmgr: masked tunable range%u+0x%" PRIx64
             " applied mask=0x%08x value=0x%08x result=0x%08x\n",
@@ -1152,11 +1217,15 @@ static uint64_t darwin_pmgr_bit_set_sequence_read(void *opaque,
 {
     DarwinPMGRBitSetSequence *slot = opaque;
 
-    if (offset != 0 || size != 4 || (slot->phase != 0 && slot->phase != 2)) {
+    if (offset != 0 || size != 4 || (slot->phase != 0 && slot->phase != 2) ||
+        (slot->ready_phase &&
+         *slot->ready_phase != slot->required_phase)) {
         error_report("darwin-pmgr: invalid bit-set sequence range%u+0x%"
                      PRIx64 " read offset=0x%" HWADDR_PRIx
-                     " size=%u phase=%u", slot->reg_index, slot->offset,
-                     offset, size, slot->phase);
+                     " size=%u phase=%u ready-phase=%u required=%u",
+                     slot->reg_index, slot->offset, offset, size, slot->phase,
+                     slot->ready_phase ? *slot->ready_phase : 0,
+                     slot->required_phase);
         exit(EXIT_FAILURE);
     }
     slot->phase++;
@@ -1191,6 +1260,9 @@ static void darwin_pmgr_bit_set_sequence_write(void *opaque, hwaddr offset,
     }
     slot->word = expected;
     slot->phase++;
+    if (slot->phase == 4 && slot->ready_phase) {
+        (*slot->ready_phase)++;
+    }
     fprintf(stderr,
             "darwin-pmgr: range%u+0x%" PRIx64
             " bit-set step %u applied mask=0x%08x result=0x%08x\n",
@@ -1893,8 +1965,15 @@ static void darwin_pmgr_state_write(void *opaque, hwaddr offset,
         (slot->state & D47_PMGR_STATE_ACTUAL_MASK) ||
         ((word ^ slot->state) &
          ~(D47_PMGR_STATE_CONTROL_MASK | D47_PMGR_STATE_ACTUAL_MASK))) {
-        error_report("darwin-pmgr: invalid %s state write value=0x%" PRIx64,
-                     slot->name, value);
+        error_report("darwin-pmgr: invalid %s state write range%u+0x%" PRIx64
+                     " value=0x%" PRIx64 " current=0x%08x"
+                     " changed-outside-model=0x%08x pc=0x%" PRIx64,
+                     slot->name, slot->reg_index, slot->offset, value,
+                     slot->state,
+                     (word ^ slot->state) &
+                     ~(D47_PMGR_STATE_CONTROL_MASK |
+                       D47_PMGR_STATE_ACTUAL_MASK),
+                     current_cpu ? ARM_CPU(current_cpu)->env.pc : 0);
         exit(EXIT_FAILURE);
     }
     target = word & D47_PMGR_STATE_TARGET_MASK;
@@ -2548,6 +2627,18 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                     D47_PMGR_RANGE43_SINGLE_COUNT);
     G_STATIC_ASSERT(ARRAY_SIZE(d47_range43_single_masks) ==
                     D47_PMGR_RANGE43_SINGLE_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_offsets) ==
+                    D47_PMGR_POST_RANGE43_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_masks) ==
+                    D47_PMGR_POST_RANGE43_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_values) ==
+                    D47_PMGR_POST_RANGE43_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_block_offsets) ==
+                    D47_PMGR_POST_RANGE43_BLOCK_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_block_masks) ==
+                    D47_PMGR_POST_RANGE43_BLOCK_COUNT);
+    G_STATIC_ASSERT(ARRAY_SIZE(d47_post_range43_block_values) ==
+                    D47_PMGR_POST_RANGE43_BLOCK_COUNT);
 
     if (!pmgr) {
         error_report("darwin-pmgr: PMGR node is absent");
@@ -2602,6 +2693,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
                       D47_PMGR_HANDSHAKE_STATUS + 4 ||
         regs[1].len < D47_PMGR_CPFM_OFFSET + 8 ||
         regs[1].len < D47_PMGR_TUNING_FUSE_OFFSET + 4 ||
+        regs[1].len < d47_post_range43_offsets[
+                      D47_PMGR_POST_RANGE43_COUNT - 1] + 4 ||
         regs[1].len < D47_PMGR_IDENTITY_OFFSET + 4 ||
         regs[1].len < D47_PMGR_CHIP_REV_OFFSET + 4 ||
         regs[5].len < D47_PMGR_DOMAIN_STATE_OFFSET + 8 ||
@@ -2723,6 +2816,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
         slot->reg_index = 43;
         slot->mask = d47_range43_single_masks[i];
         slot->value = slot->mask;
+        slot->ready_phase = &s->range43_phase;
+        slot->required_phase = i == 0 ? 0 : i + 1;
         pa = iobase + regs[43].base + slot->offset;
         memory_region_init_io(&slot->mr, NULL,
                               &darwin_pmgr_masked_tunable_ops, slot,
@@ -2734,6 +2829,8 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
     s->range43_double_latch.reg_index = 43;
     s->range43_double_latch.masks[0] = UINT32_C(0x4);
     s->range43_double_latch.masks[1] = UINT32_C(0x20);
+    s->range43_double_latch.ready_phase = &s->range43_phase;
+    s->range43_double_latch.required_phase = 1;
     pa = iobase + regs[43].base + s->range43_double_latch.offset;
     memory_region_init_io(&s->range43_double_latch.mr, NULL,
                           &darwin_pmgr_bit_set_sequence_ops,
@@ -2742,8 +2839,59 @@ void darwin_pmgr_iboot_init(struct dtree_node *dt_root, uint64_t iobase)
     memory_region_add_subregion_overlap(get_system_memory(), pa,
                                         &s->range43_double_latch.mr, 10);
     fprintf(stderr,
-            "darwin-pmgr: four exact range43 cold-start latch words"
+            "darwin-pmgr: five exact range43 cold-start latch words"
             " initialized to canonical cold-clear storage\n");
+
+    for (i = 0; i < D47_PMGR_POST_RANGE43_COUNT; i++) {
+        DarwinPMGRMaskedTunable *slot = &s->post_range43_tunables[i];
+
+        slot->offset = d47_post_range43_offsets[i];
+        slot->reg_index = 1;
+        slot->mask = d47_post_range43_masks[i];
+        slot->value = d47_post_range43_values[i];
+        slot->ready_phase = &s->range43_phase;
+        slot->required_phase = D47_PMGR_RANGE43_SINGLE_COUNT + 1 + i;
+        pa = iobase + regs[1].base + slot->offset;
+        memory_region_init_io(&slot->mr, NULL,
+                              &darwin_pmgr_masked_tunable_ops, slot,
+                              "darwin-pmgr-iboot-post-range43-tunable", 4);
+        memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                            &slot->mr, 10);
+    }
+
+    for (i = 0; i < D47_PMGR_POST_RANGE43_BLOCK_COUNT; i++) {
+        DarwinPMGRMaskedTunable *slot = &s->post_range43_block[i];
+
+        slot->offset = d47_post_range43_block_offsets[i];
+        slot->reg_index = 1;
+        slot->mask = d47_post_range43_block_masks[i];
+        slot->value = d47_post_range43_block_values[i];
+        slot->ready_phase = &s->range43_phase;
+        slot->required_phase = D47_PMGR_RANGE43_SINGLE_COUNT + 1 +
+                               D47_PMGR_POST_RANGE43_COUNT + i;
+        pa = iobase + regs[1].base + slot->offset;
+        memory_region_init_io(&slot->mr, NULL,
+                              &darwin_pmgr_masked_tunable_ops, slot,
+                              "darwin-pmgr-iboot-post-range43-block", 4);
+        memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                            &slot->mr, 10);
+    }
+
+    s->post_range43_38060.offset = 0x38060;
+    s->post_range43_38060.reg_index = 1;
+    s->post_range43_38060.mask = UINT32_MAX;
+    s->post_range43_38060.value = UINT32_C(0x1c);
+    s->post_range43_38060.ready_phase = &s->range43_phase;
+    s->post_range43_38060.required_phase =
+        D47_PMGR_RANGE43_SINGLE_COUNT + 1 +
+        D47_PMGR_POST_RANGE43_COUNT + D47_PMGR_POST_RANGE43_BLOCK_COUNT;
+    pa = iobase + regs[1].base + s->post_range43_38060.offset;
+    memory_region_init_io(&s->post_range43_38060.mr, NULL,
+                          &darwin_pmgr_masked_tunable_ops,
+                          &s->post_range43_38060,
+                          "darwin-pmgr-iboot-post-range43-38060", 4);
+    memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                        &s->post_range43_38060.mr, 10);
 
     pa = iobase + regs[2].base;
     memory_region_init_io(&s->root_zero.mr, NULL,
