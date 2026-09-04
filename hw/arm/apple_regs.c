@@ -108,6 +108,7 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
     APPLE_STATE(env)->acc_ctxr_c_ctl_el2 = 0xc000000000aa026a;
     APPLE_STATE(env)->acc_ctxr_d_ctl_el2 = 0xc000000000aa02a9;
 
+    if (!info->iboot) {
 #define REGION_START(s) adt_find_region_first_page(dt_root, s)
 #define REGION_END(s)   adt_find_region_last_page(dt_root, s)
 
@@ -149,8 +150,14 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
     //
     // When boot args memsize is 31/32 of dram size, we need to move the tag
     // offset forward another 1/32nd, so we subtract 2 * (1/32) of dram size.
-    APPLE_STATE(env)->tag_offset_el2 = TAG_OFFSET_EL2_LOCK |
-        (info->dram_base + info->dram_size - ((2 * info->dram_size) / 32));
+        APPLE_STATE(env)->tag_offset_el2 = TAG_OFFSET_EL2_LOCK |
+            (info->dram_base + info->dram_size - ((2 * info->dram_size) / 32));
+    }
+
+    /* The direct loader populates chosen/memory-map and establishes the
+     * protected ranges above.  iBoot mode deliberately loads none of those
+     * artifacts, so leave their reset-zero bounds for iBoot to program rather
+     * than manufacturing security state from sentinel device-tree entries. */
 
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);

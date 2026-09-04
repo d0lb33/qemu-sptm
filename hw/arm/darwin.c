@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -54,6 +55,7 @@ struct DarwinState {
 };
 
 MACHINE_CLASS_ARG(bootkc);
+MACHINE_CLASS_ARG(iboot);
 MACHINE_CLASS_ARG(args);
 MACHINE_CLASS_ARG(dtree);
 MACHINE_CLASS_ARG(sptm);
@@ -87,10 +89,13 @@ static void do_darwin_reset(void *state) {
     env->xregs[0] = s->bootinfo.init_x0;
     env->pc = s->bootinfo.init_pc;
 
-    // SPTM needs fpu enabled:
-    env->cp15.cpacr_el1 |= CPACR_ENABLE_FPU;
-    env->cp15.cptr_el[2] |= CPTR_ENABLE_FPU;
-    arm_rebuild_hflags(env);
+    if (!s->bootinfo.iboot) {
+        // SPTM needs the FPU enabled.  iBoot starts from architectural reset
+        // state; do not silently grant it an input that has not been derived.
+        env->cp15.cpacr_el1 |= CPACR_ENABLE_FPU;
+        env->cp15.cptr_el[2] |= CPTR_ENABLE_FPU;
+        arm_rebuild_hflags(env);
+    }
 }
 
 static mmap_file_t check_and_open(const char *path, const char *errmsg) {
@@ -247,21 +252,36 @@ static void darwin_init(MachineState *ms) {
     struct xnu_boot_info *info = &s->bootinfo;
     struct dtree_node *dt_root;
 
-    if (!info->args) info->args = g_default_args;
-    parse_fb_args(info);
-    info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel");
+    bool iboot_mode = info->iboot != NULL;
+
+    if (iboot_mode &&
+        (info->bootkc || info->tc || info->ramdisk || info->sptm || info->txm ||
+         info->args || info->fb || info->fbmode)) {
+        error_report("-iboot cannot be combined with direct-boot inputs");
+        exit(1);
+    }
+
+    if (!iboot_mode) {
+        if (!info->args) info->args = g_default_args;
+        parse_fb_args(info);
+    }
     info->dtree_f = check_and_open(info->dtree, "error opening device tree");
-    info->tc_f = check_and_open(info->tc, "error opening trust cache");
-    info->ramdisk_f = check_and_open(info->ramdisk, "error opening ramdisk");
-    if (info->sptm) {
-        info->sptm_f = check_and_open(info->sptm, "error opening SPTM");
-        info->txm_f = check_and_open(info->txm, "error opening TXM");
+    if (iboot_mode) {
+        info->iboot_f = check_and_open(info->iboot, "error opening raw iBoot image");
+    } else {
+        info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel");
+        info->tc_f = check_and_open(info->tc, "error opening trust cache");
+        info->ramdisk_f = check_and_open(info->ramdisk, "error opening ramdisk");
+        if (info->sptm) {
+            info->sptm_f = check_and_open(info->sptm, "error opening SPTM");
+            info->txm_f = check_and_open(info->txm, "error opening TXM");
+        }
     }
     dt_root = info->dtree_f.buf;
 
     check_dtree(dt_root);
 
-    info->has_mte = kc_uses_mte(info->bootkc_f.buf);
+    info->has_mte = !iboot_mode && kc_uses_mte(info->bootkc_f.buf);
 
     Object *cpuobj = object_new(ms->cpu_type);
     DeviceState *cpudev = DEVICE(cpuobj);
@@ -288,7 +308,11 @@ static void darwin_init(MachineState *ms) {
     info->dram_size = *(u64*)adt_get_prop_val(chosen_node, "dram-size");
 
     s->cpu = ARM_CPU(cpuobj);
-    arm_load_xnu(s->cpu, ms, info);
+    if (iboot_mode) {
+        arm_load_xnu_iboot(s->cpu, ms, info);
+    } else {
+        arm_load_xnu(s->cpu, ms, info);
+    }
     if (info->has_mte) setup_mte(cpuobj, MACHINE(s), info);
 
     struct dtree_node *amcc_node = adt_find_node(dt_root, "chosen/lock-regs/amcc");
@@ -357,13 +381,17 @@ static void darwin_init(MachineState *ms) {
     darwin_fb_init(info, uart);
 
     qemu_register_reset(do_darwin_reset, s);
-    munmap(info->bootkc_f.buf, info->bootkc_f.len);
     munmap(info->dtree_f.buf, info->dtree_f.len);
-    munmap(info->tc_f.buf, info->tc_f.len);
-    munmap(info->ramdisk_f.buf, info->ramdisk_f.len);
-    if (info->sptm) {
-        munmap(info->sptm_f.buf, info->sptm_f.len);
-        munmap(info->txm_f.buf, info->txm_f.len);
+    if (iboot_mode) {
+        munmap(info->iboot_f.buf, info->iboot_f.len);
+    } else {
+        munmap(info->bootkc_f.buf, info->bootkc_f.len);
+        munmap(info->tc_f.buf, info->tc_f.len);
+        munmap(info->ramdisk_f.buf, info->ramdisk_f.len);
+        if (info->sptm) {
+            munmap(info->sptm_f.buf, info->sptm_f.len);
+            munmap(info->txm_f.buf, info->txm_f.len);
+        }
     }
 }
 
@@ -378,6 +406,7 @@ static void darwin_machine_class_init(ObjectClass *oc, const void *data) {
     MachineClass *mc = MACHINE_CLASS(oc);
 
     object_class_property_add_str(oc, "bootkc", bootkc_darwin_class_get, bootkc_darwin_class_set);
+    object_class_property_add_str(oc, "iboot", iboot_darwin_class_get, iboot_darwin_class_set);
     object_class_property_add_str(oc, "args", args_darwin_class_get, args_darwin_class_set);
     object_class_property_add_str(oc, "dtree", dtree_darwin_class_get, dtree_darwin_class_set);
     object_class_property_add_str(oc, "sptm", sptm_darwin_class_get, sptm_darwin_class_set);

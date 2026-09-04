@@ -153,7 +153,7 @@ void arm_load_xnu_iboot(ARMCPU *cpu, MachineState *ms,
     iboot_validate(&info->iboot_f);
 
     boot_memory = g_new0(MemoryRegion, 1);
-    memory_region_init_ram(boot_memory, OBJECT(ms), "darwin.iboot-memory",
+    memory_region_init_ram(boot_memory, NULL, "darwin.iboot-memory",
                            IBOOT_MEMORY_END - IBOOT_MEMORY_BASE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), IBOOT_MEMORY_BASE,
                                 boot_memory);
@@ -177,4 +177,5 @@ void arm_load_xnu_iboot(ARMCPU *cpu, MachineState *ms,
             IBOOT_LOAD_ADDR);
 
     (void)cpu;
+    (void)ms;
 }
