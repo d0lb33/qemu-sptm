@@ -994,6 +994,9 @@ struct ArchCPU {
     QEMUTimer *pmu_timer;
     /* Timer used for WFxT timeouts OR event stream events */
     QEMUTimer *wfxt_timer;
+    /* Optional implementation-defined WFE event source, absolute virtual ns.
+     * Installed by the machine, not guest state; returns -1 when disabled. */
+    int64_t (*vendor_event_stream_deadline_ns)(ARMCPU *cpu);
 
     /* GPIO outputs for generic timer */
     qemu_irq gt_timer_outputs[NUM_GTIMERS];

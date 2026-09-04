@@ -574,6 +574,12 @@ static int64_t gt_calc_next_event_stream(CPUARMState *env)
         }
     }
 
+    if (cpu->vendor_event_stream_deadline_ns) {
+        int64_t vendor_time = cpu->vendor_event_stream_deadline_ns(cpu);
+        if (vendor_time > 0 && (next_time < 0 || vendor_time < next_time)) {
+            next_time = vendor_time;
+        }
+    }
     return next_time;
 }
 #endif
