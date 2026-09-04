@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "xnu/boot/xnuboot.h"
@@ -23,11 +24,141 @@ typedef struct {
 } UnimpNode;
 
 typedef struct {
+    uint64_t addr;
+    uint64_t value;
+} UnimpWrite;
+
+typedef struct {
     MemoryRegion mr;
     uint64_t base;
     GHashTable *writes;     // addr -> value (last written)
     GHashTable *seen;       // addr -> count (for log rate limiting)
+    int32_t migration_count;
+    UnimpWrite *migration_entries;
 } UnimpRegion;
+
+#define UNIMP_MIGRATION_MAX_WRITES (1U << 20)
+
+static bool unimp_migration_count_valid(void *opaque, int version_id)
+{
+    UnimpRegion *r = opaque;
+
+    return r->migration_count >= 0 &&
+           r->migration_count <= UNIMP_MIGRATION_MAX_WRITES;
+}
+
+static int unimp_write_compare(const void *ap, const void *bp)
+{
+    const UnimpWrite *a = ap;
+    const UnimpWrite *b = bp;
+
+    return (a->addr > b->addr) - (a->addr < b->addr);
+}
+
+static int unimp_pre_save(void *opaque)
+{
+    UnimpRegion *r = opaque;
+    GHashTableIter iter;
+    gpointer key, value;
+    unsigned i = 0;
+
+    g_clear_pointer(&r->migration_entries, g_free);
+    r->migration_count = g_hash_table_size(r->writes);
+    if (!unimp_migration_count_valid(r, 1)) {
+        return -E2BIG;
+    }
+    r->migration_entries = g_new0(UnimpWrite, r->migration_count);
+    g_hash_table_iter_init(&iter, r->writes);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        r->migration_entries[i].addr = *(uint64_t *)key;
+        r->migration_entries[i].value = *(uint64_t *)value;
+        i++;
+    }
+    qsort(r->migration_entries, r->migration_count,
+          sizeof(*r->migration_entries), unimp_write_compare);
+    return 0;
+}
+
+static void unimp_post_save(void *opaque)
+{
+    UnimpRegion *r = opaque;
+
+    g_clear_pointer(&r->migration_entries, g_free);
+    r->migration_count = 0;
+}
+
+static int unimp_pre_load(void *opaque)
+{
+    UnimpRegion *r = opaque;
+
+    g_clear_pointer(&r->migration_entries, g_free);
+    r->migration_count = 0;
+    return 0;
+}
+
+static int unimp_post_load(void *opaque, int version_id)
+{
+    UnimpRegion *r = opaque;
+
+    for (int32_t i = 0; i < r->migration_count; i++) {
+        UnimpWrite *entry = &r->migration_entries[i];
+
+        if (entry->addr < r->base || entry->addr - r->base >=
+            memory_region_size(&r->mr) ||
+            (i && entry->addr <= r->migration_entries[i - 1].addr)) {
+            g_clear_pointer(&r->migration_entries, g_free);
+            r->migration_count = 0;
+            return -EINVAL;
+        }
+    }
+
+    g_hash_table_remove_all(r->writes);
+    for (int32_t i = 0; i < r->migration_count; i++) {
+        UnimpWrite *entry = &r->migration_entries[i];
+        uint64_t *key;
+        uint64_t *value;
+
+        key = g_new(uint64_t, 1);
+        value = g_new(uint64_t, 1);
+        *key = entry->addr;
+        *value = entry->value;
+        g_hash_table_replace(r->writes, key, value);
+    }
+    g_clear_pointer(&r->migration_entries, g_free);
+    r->migration_count = 0;
+    return 0;
+}
+
+static const VMStateDescription vmstate_unimp_write = {
+    .name = "darwin-unimp/write",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(addr, UnimpWrite),
+        VMSTATE_UINT64(value, UnimpWrite),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_darwin_unimp = {
+    .name = "darwin-unimp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = unimp_pre_save,
+    .post_save = unimp_post_save,
+    .pre_load = unimp_pre_load,
+    .post_load = unimp_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_EQUAL(base, UnimpRegion),
+        VMSTATE_INT32(migration_count, UnimpRegion),
+        VMSTATE_VALIDATE("migration_count <= 1048576",
+                         unimp_migration_count_valid),
+        VMSTATE_STRUCT_VARRAY_ALLOC(migration_entries, UnimpRegion,
+                                    migration_count, 1,
+                                    vmstate_unimp_write, UnimpWrite),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static UnimpNode *g_nodes;
 static int g_num_nodes;
@@ -148,12 +279,13 @@ void darwin_unimp_init(struct dtree_node *dt_root, uint64_t iobase) {
         if (!size) continue;
         UnimpRegion *r = g_new0(UnimpRegion, 1);
         r->base = parent;
-        r->writes = g_hash_table_new(u64_hash, u64_equal);
+        r->writes = g_hash_table_new_full(u64_hash, u64_equal, g_free, g_free);
         r->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
         char *name = g_strdup_printf("darwin-unimp-%zu", i);
         memory_region_init_io(&r->mr, NULL, &unimp_ops, r, name, size);
         // priority below every real device (they use priority 0)
         memory_region_add_subregion_overlap(get_system_memory(), parent, &r->mr, -1000);
+        g_assert(vmstate_register(NULL, i, &vmstate_darwin_unimp, r) == 0);
         fprintf(stderr, "darwin-unimp: backing arm-io range 0x%" PRIx64 " + 0x%" PRIx64 "\n", parent, size);
     }
 }

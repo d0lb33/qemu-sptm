@@ -207,6 +207,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "migration/vmstate.h"
 #include "qemu/guest-random.h"
 #include "crypto/hash.h"
 #include "hw/core/sysbus.h"
@@ -2237,6 +2238,95 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     for (int i = 0; i < 4; i++) sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
 }
 
+static int darwin_sep_post_load(void *opaque, int version_id)
+{
+    DarwinSEPState *s = opaque;
+
+    if (s->i2a_head < 0 || s->i2a_head >= MBOX_FIFO_DEPTH ||
+        s->i2a_count < 0 || s->i2a_count > MBOX_FIFO_VISIBLE ||
+        s->pend_head < 0 || s->pend_head >= MBOX_PEND_DEPTH ||
+        s->pend_count < 0 || s->pend_count > MBOX_PEND_DEPTH ||
+        (s->status != SEP_STATUS_ROM && s->status != SEP_STATUS_TZ0)) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < SEP_MAX_EPS; i++) {
+        SEPEndpointState *e = &s->ep[i];
+
+        if (e->ool_in_addr + e->ool_in_size < e->ool_in_addr ||
+            e->ool_out_addr + e->ool_out_size < e->ool_out_addr) {
+            return -EINVAL;
+        }
+    }
+
+    /*
+     * DMA is synchronous and DART is resolved again while constructing the
+     * destination machine.  Only the mailbox's level signals need replay.
+     */
+    sep_update_irqs(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_sep_msg = {
+    .name = "darwin-sep/msg",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(msg0, SEPMsg),
+        VMSTATE_UINT64(msg1, SEPMsg),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_sep_endpoint = {
+    .name = "darwin-sep/endpoint",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(advertised, SEPEndpointState),
+        VMSTATE_UINT64(ool_in_addr, SEPEndpointState),
+        VMSTATE_UINT64(ool_out_addr, SEPEndpointState),
+        VMSTATE_UINT32(ool_in_size, SEPEndpointState),
+        VMSTATE_UINT32(ool_out_size, SEPEndpointState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_darwin_sep = {
+    .name = TYPE_DARWIN_SEP,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_sep_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(mmio_size, DarwinSEPState),
+        VMSTATE_VBUFFER_UINT32(misc, DarwinSEPState, 1, NULL, mmio_size),
+        VMSTATE_UINT32(cpu_control, DarwinSEPState),
+        VMSTATE_UINT32(cpu_status, DarwinSEPState),
+        VMSTATE_UINT32(a2i_ctrl_raw, DarwinSEPState),
+        VMSTATE_UINT32(i2a_ctrl_raw, DarwinSEPState),
+        VMSTATE_UINT64(a2i_send0, DarwinSEPState),
+        VMSTATE_STRUCT_ARRAY(i2a_fifo, DarwinSEPState, MBOX_FIFO_DEPTH, 1,
+                             vmstate_sep_msg, SEPMsg),
+        VMSTATE_INT32(i2a_head, DarwinSEPState),
+        VMSTATE_INT32(i2a_count, DarwinSEPState),
+        VMSTATE_STRUCT_ARRAY(pend_fifo, DarwinSEPState, MBOX_PEND_DEPTH, 1,
+                             vmstate_sep_msg, SEPMsg),
+        VMSTATE_INT32(pend_head, DarwinSEPState),
+        VMSTATE_INT32(pend_count, DarwinSEPState),
+        VMSTATE_BOOL(announced, DarwinSEPState),
+        VMSTATE_UINT32(status, DarwinSEPState),
+        VMSTATE_BOOL(os_alive, DarwinSEPState),
+        VMSTATE_UINT64(shm_dva, DarwinSEPState),
+        VMSTATE_UINT32(shm_size, DarwinSEPState),
+        VMSTATE_UINT64(txm_dva, DarwinSEPState),
+        VMSTATE_UINT64(txm_size, DarwinSEPState),
+        VMSTATE_BOOL(txm_published, DarwinSEPState),
+        VMSTATE_STRUCT_ARRAY(ep, DarwinSEPState, SEP_MAX_EPS, 1,
+                             vmstate_sep_endpoint, SEPEndpointState),
+        VMSTATE_UINT64(sks_op19_requests, DarwinSEPState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_sep_properties[] = {
     DEFINE_PROP_STRING("role", DarwinSEPState, role),
     DEFINE_PROP_UINT32("mmio-size", DarwinSEPState, mmio_size, 0),
@@ -2248,6 +2338,7 @@ static const Property darwin_sep_properties[] = {
 static void darwin_sep_class_init(ObjectClass *klass, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_sep_realize;
+    dc->vmsd = &vmstate_darwin_sep;
     dc->desc = "Apple Secure Enclave, AP-facing protocol only";
     device_class_set_props(dc, darwin_sep_properties);
     dc->user_creatable = false;

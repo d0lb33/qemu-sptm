@@ -12,6 +12,7 @@
 #include "migration/vmstate.h"
 #include "target/arm/gtimer.h"
 #include "hw/arm/machines-qom.h"
+#include "xnu/apple_regs.h"
 
 static bool vfp_needed(void *opaque)
 {
@@ -1343,6 +1344,7 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_pstate64,
         &vmstate_event,
         &vmstate_fpmr,
+        &vmstate_apple_cpu,
         NULL
     }
 };

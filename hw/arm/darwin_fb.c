@@ -18,6 +18,7 @@
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "ui/input.h"
@@ -226,6 +227,34 @@ static const QemuInputHandler darwin_kbd_handler = {
     .event = darwin_kbd_event,
 };
 
+static int darwin_fb_post_load(void *opaque, int version_id)
+{
+    DarwinFBState *s = opaque;
+
+    /*
+     * The pixels themselves are guest RAM.  The host surface is recreated by
+     * realize and must be attached to the destination console, never copied
+     * from the source process.
+     */
+    s->surface_attached = false;
+    qemu_console_update_full(s->con);
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_fb = {
+    .name = TYPE_DARWIN_FB,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_fb_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(shift, DarwinFBState),
+        VMSTATE_BOOL(ctrl, DarwinFBState),
+        VMSTATE_BOOL(alt, DarwinFBState),
+        VMSTATE_BOOL(caps, DarwinFBState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 /* ---------------- device ---------------- */
 
 static void darwin_fb_realize(DeviceState *dev, Error **errp)
@@ -261,6 +290,7 @@ static void darwin_fb_class_init(ObjectClass *klass, const void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = darwin_fb_realize;
+    dc->vmsd = &vmstate_darwin_fb;
     dc->desc = "XNU boot framebuffer";
     dc->user_creatable = false;
 }

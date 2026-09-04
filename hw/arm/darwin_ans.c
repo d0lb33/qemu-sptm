@@ -159,6 +159,8 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
+#include "migration/vmstate.h"
 #include "qemu/units.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
@@ -1790,6 +1792,134 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
+static int darwin_ans_post_load(void *opaque, int version_id)
+{
+    DarwinANSState *s = opaque;
+    uint32_t asz = ans_acq_entries(s);
+    /*
+     * CreateIO{S,C}Q encodes QSIZE as a zero-based value even though this
+     * Apple generation exposes CAP.MQES and the DT queue depth as counts.
+     * Consequently the observed legal maximum is queue_entries + 1 (65 on
+     * t8140), while tag validation still uses the 64-entry DT tag space.
+     */
+    uint32_t io_queue_limit = s->queue_entries + 1;
+
+    if (s->n_aux > ANS_AUX_MAX || asz > s->queue_entries ||
+        (asz ? (s->acq_head >= asz || s->acq_tail >= asz) :
+               (s->acq_head || s->acq_tail || (s->cc & NVME_CC_EN))) ||
+        (s->iocq_live && (!s->iocq_size || s->iocq_head >= s->iocq_size ||
+                          s->iocq_tail >= s->iocq_size)) ||
+        (s->iosq_live && !s->iosq_size) ||
+        s->iosq_size > io_queue_limit ||
+        s->iocq_size > io_queue_limit ||
+        (s->iocq_live && (s->iocq_id != 1 || !s->iocq_addr)) ||
+        (s->iosq_live && (s->iosq_id != 1 || !s->iosq_addr))) {
+        error_report("darwin-ans: invalid migrated queue state: aux=%u "
+                     "acq=%u/%u/%u io-cq=%u/%u/%u live=%u "
+                     "io-sq-size=%u live=%u max=%u",
+                     s->n_aux, s->acq_head, s->acq_tail, asz,
+                     s->iocq_head, s->iocq_tail, s->iocq_size,
+                     s->iocq_live, s->iosq_size, s->iosq_live,
+                     s->queue_entries);
+        return -EINVAL;
+    }
+
+    /*
+     * All commands execute synchronously in the doorbell MMIO callback, so
+     * there is no host AIO request to recreate.  Re-drive the one level IRQ
+     * from the restored producer/consumer indices and interrupt mask.
+     */
+    ans_update_irq(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_darwin_ans = {
+    .name = TYPE_DARWIN_ANS,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_ans_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(nvmmu_size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(nvme_size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(queue_entries, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(n_aux, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(mqes, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(num_sl, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(sl_idle_status, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(nsid, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(lba_size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(sqe_stride, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(mdts, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[0].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[1].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[2].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[3].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[4].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[5].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[6].size, DarwinANSState),
+        VMSTATE_UINT32_EQUAL(aux[7].size, DarwinANSState),
+        VMSTATE_VBUFFER_UINT32(nvmmu_store, DarwinANSState, 1, NULL,
+                               nvmmu_size),
+        VMSTATE_VBUFFER_UINT32(nvme_store, DarwinANSState, 1, NULL,
+                               nvme_size),
+        VMSTATE_VBUFFER_UINT32(aux[0].store, DarwinANSState, 1, NULL,
+                               aux[0].size),
+        VMSTATE_VBUFFER_UINT32(aux[1].store, DarwinANSState, 1, NULL,
+                               aux[1].size),
+        VMSTATE_VBUFFER_UINT32(aux[2].store, DarwinANSState, 1, NULL,
+                               aux[2].size),
+        VMSTATE_VBUFFER_UINT32(aux[3].store, DarwinANSState, 1, NULL,
+                               aux[3].size),
+        VMSTATE_VBUFFER_UINT32(aux[4].store, DarwinANSState, 1, NULL,
+                               aux[4].size),
+        VMSTATE_VBUFFER_UINT32(aux[5].store, DarwinANSState, 1, NULL,
+                               aux[5].size),
+        VMSTATE_VBUFFER_UINT32(aux[6].store, DarwinANSState, 1, NULL,
+                               aux[6].size),
+        VMSTATE_VBUFFER_UINT32(aux[7].store, DarwinANSState, 1, NULL,
+                               aux[7].size),
+        VMSTATE_UINT64(cap, DarwinANSState),
+        VMSTATE_UINT32(vs, DarwinANSState),
+        VMSTATE_UINT32(cc, DarwinANSState),
+        VMSTATE_UINT32(csts, DarwinANSState),
+        VMSTATE_UINT32(aqa, DarwinANSState),
+        VMSTATE_UINT32(intms, DarwinANSState),
+        VMSTATE_UINT64(asq, DarwinANSState),
+        VMSTATE_UINT64(acq, DarwinANSState),
+        VMSTATE_UINT64(ioq_sq_base, DarwinANSState),
+        VMSTATE_UINT64(ioq_cq_base, DarwinANSState),
+        VMSTATE_UINT32(max_pend_cmds, DarwinANSState),
+        VMSTATE_UINT32(linear_sq_ctrl, DarwinANSState),
+        VMSTATE_UINT32(modesel, DarwinANSState),
+        VMSTATE_UINT32(base_cmd_id, DarwinANSState),
+        VMSTATE_BOOL(booted, DarwinANSState),
+        VMSTATE_UINT32(num_tcbs, DarwinANSState),
+        VMSTATE_UINT64(asq_tcb_base, DarwinANSState),
+        VMSTATE_UINT64(iosq_tcb_base, DarwinANSState),
+        VMSTATE_UINT32(acq_head, DarwinANSState),
+        VMSTATE_UINT32(acq_tail, DarwinANSState),
+        VMSTATE_BOOL(acq_phase, DarwinANSState),
+        VMSTATE_UINT32(iocq_head, DarwinANSState),
+        VMSTATE_UINT32(iocq_tail, DarwinANSState),
+        VMSTATE_BOOL(iocq_phase, DarwinANSState),
+        VMSTATE_UINT64(iosq_addr, DarwinANSState),
+        VMSTATE_UINT64(iocq_addr, DarwinANSState),
+        VMSTATE_UINT16(iosq_size, DarwinANSState),
+        VMSTATE_UINT16(iocq_size, DarwinANSState),
+        VMSTATE_UINT16(iocq_id, DarwinANSState),
+        VMSTATE_UINT16(iosq_id, DarwinANSState),
+        VMSTATE_BOOL(iosq_live, DarwinANSState),
+        VMSTATE_BOOL(iocq_live, DarwinANSState),
+        VMSTATE_BOOL(iocq_ien, DarwinANSState),
+        VMSTATE_UINT64(n_admin, DarwinANSState),
+        VMSTATE_UINT64(n_io, DarwinANSState),
+        VMSTATE_UINT64(n_read_blocks, DarwinANSState),
+        VMSTATE_UINT64(n_write_blocks, DarwinANSState),
+        VMSTATE_UINT64(n_sart_denied, DarwinANSState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const Property darwin_ans_properties[] = {
     DEFINE_PROP_STRING("name", DarwinANSState, name),
     DEFINE_PROP_DRIVE("drive", DarwinANSState, blk),
@@ -1852,6 +1982,7 @@ static void darwin_ans_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_ans_realize;
+    dc->vmsd = &vmstate_darwin_ans;
     dc->desc = "Apple ANS NVMe storage controller";
     device_class_set_props(dc, darwin_ans_properties);
     dc->user_creatable = false;

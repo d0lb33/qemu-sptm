@@ -103,3 +103,6 @@ void darwin_afk_reset(DarwinAFK *a);
  */
 bool darwin_afk_find_iommu(struct dtree_node *dt_root, struct dtree_node *node,
                            struct dtree_node **dart_node, unsigned *sid);
+
+/* Register the non-QOM transport state in the migration stream. */
+void darwin_afk_register_vmstate(DarwinAFK *a, unsigned instance_id);

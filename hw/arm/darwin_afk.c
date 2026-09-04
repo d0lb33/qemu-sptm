@@ -128,6 +128,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "exec/memattrs.h"
@@ -262,6 +263,88 @@ struct DarwinAFK {
     void *opaque;
     AFKEndpoint eps[AFK_MAX_EPS];
 };
+
+static int darwin_afk_post_load(void *opaque, int version_id)
+{
+    DarwinAFK *a = opaque;
+
+    if (!a->block || !a->hdr_size || a->hdr_size >= a->ring_size) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < AFK_MAX_EPS; i++) {
+        AFKEndpoint *e = &a->eps[i];
+
+        if (e->state > AFK_EP_STARTED || e->dva + e->buf_size < e->dva) {
+            return -EINVAL;
+        }
+        if (e->state >= AFK_EP_INITRB &&
+            (!e->tx.bufsz || !e->rx.bufsz ||
+             e->tx_rptr >= e->tx.bufsz || e->rx_wptr >= e->rx.bufsz ||
+             e->tx.off > e->buf_size ||
+             e->tx.size > e->buf_size - e->tx.off ||
+             e->rx.off > e->buf_size ||
+             e->rx.size > e->buf_size - e->rx.off)) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_afk_ring = {
+    .name = "darwin-afk/ring",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(off, AFKRing),
+        VMSTATE_UINT32(size, AFKRing),
+        VMSTATE_UINT32(bufsz, AFKRing),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_afk_endpoint = {
+    .name = "darwin-afk/endpoint",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(state, AFKEndpoint),
+        VMSTATE_BOOL(is_afk, AFKEndpoint),
+        VMSTATE_UINT16(tag, AFKEndpoint),
+        VMSTATE_UINT64(dva, AFKEndpoint),
+        VMSTATE_UINT32(buf_size, AFKEndpoint),
+        VMSTATE_STRUCT(tx, AFKEndpoint, 1, vmstate_afk_ring, AFKRing),
+        VMSTATE_STRUCT(rx, AFKEndpoint, 1, vmstate_afk_ring, AFKRing),
+        VMSTATE_UINT32(tx_rptr, AFKEndpoint),
+        VMSTATE_UINT32(rx_wptr, AFKEndpoint),
+        VMSTATE_UINT64(n_recv, AFKEndpoint),
+        VMSTATE_UINT64(n_sent, AFKEndpoint),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_darwin_afk = {
+    .name = "darwin-afk",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = darwin_afk_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(sid, DarwinAFK),
+        VMSTATE_UINT32_EQUAL(block, DarwinAFK),
+        VMSTATE_UINT32_EQUAL(hdr_size, DarwinAFK),
+        VMSTATE_UINT32_EQUAL(ring_size, DarwinAFK),
+        VMSTATE_UINT32_EQUAL(ring_version, DarwinAFK),
+        VMSTATE_STRUCT_ARRAY(eps, DarwinAFK, AFK_MAX_EPS, 1,
+                             vmstate_afk_endpoint, AFKEndpoint),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+void darwin_afk_register_vmstate(DarwinAFK *a, unsigned instance_id)
+{
+    int ret = vmstate_register(NULL, instance_id, &vmstate_darwin_afk, a);
+
+    g_assert(ret == 0);
+}
 
 static const char *afk_type_name(unsigned t) {
     switch (t) {

@@ -307,6 +307,8 @@ def main():
     print("typedef struct {")
     for r in rs_opaque:
         print(f"    uint64_t   {r.lower()};")
+    print("    uint64_t   pmc0_internal_count;")
+    print("    uint64_t   pmc1_internal_count;")
     print("} apple_state_t;\n")
     for r in rs_opaque:
         print(f"OPAQUE_SYSREG_ACCESSORS({r.lower()})")
