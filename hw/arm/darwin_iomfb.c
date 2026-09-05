@@ -182,8 +182,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "xnu/darwin_fb.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
+#include "hw/arm/darwin_iomfb_swap.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "exec/memattrs.h"
@@ -238,6 +240,8 @@ typedef struct QEMU_PACKED {
     uint32_t in_len;
     uint32_t out_len;
 } IOMFBRpcHdr;
+
+#define IOMFB_SWAP_QUEUE_SIZE 8
 
 struct DarwinIOMFB {
     DeviceState *asc;
@@ -300,13 +304,22 @@ struct DarwinIOMFB {
     bool cb_flag9;          /* mirror the AP's own bit 9; see iomfb_callback_send */
     char *cb_after;
     uint64_t cb_sent;
+
+    /* Opt-in native D594 completion of accepted A408s. IDs come from the
+     * actual request; completion state is separate from the boot script. */
+    bool swap_enabled;
+    bool scanout_enabled;
+    uint32_t swap_ids[IOMFB_SWAP_QUEUE_SIZE];
+    uint32_t swap_head, swap_count;
+    bool swap_active, swap_failed;
 };
 
 static int darwin_iomfb_post_load(void *opaque, int version_id)
 {
     DarwinIOMFB *m = opaque;
 
-    if ((m->cb_next || m->cb_busy || m->cb_started) && !m->cb_script) {
+    if ((m->cb_next || m->cb_started ||
+         (m->cb_busy && !m->swap_active)) && !m->cb_script) {
         return -EINVAL;
     }
     if (m->cb_script && m->cb_next > m->cb_script->len) {
@@ -317,6 +330,39 @@ static int darwin_iomfb_post_load(void *opaque, int version_id)
     }
     return 0;
 }
+
+static bool iomfb_swap_state_needed(void *opaque)
+{
+    DarwinIOMFB *m = opaque;
+    return m->swap_count || m->swap_active || m->swap_failed;
+}
+
+static int iomfb_swap_post_load(void *opaque, int version_id)
+{
+    DarwinIOMFB *m = opaque;
+    if (!m->swap_enabled || m->swap_count > IOMFB_SWAP_QUEUE_SIZE ||
+        m->swap_head >= IOMFB_SWAP_QUEUE_SIZE ||
+        (m->swap_active && (!m->cb_busy || !m->swap_count || m->swap_failed))) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_iomfb_swap = {
+    .name = "darwin-iomfb/swap-completion",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = iomfb_swap_state_needed,
+    .post_load = iomfb_swap_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(swap_ids, DarwinIOMFB, IOMFB_SWAP_QUEUE_SIZE),
+        VMSTATE_UINT32(swap_head, DarwinIOMFB),
+        VMSTATE_UINT32(swap_count, DarwinIOMFB),
+        VMSTATE_BOOL(swap_active, DarwinIOMFB),
+        VMSTATE_BOOL(swap_failed, DarwinIOMFB),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_darwin_iomfb = {
     .name = "darwin-iomfb",
@@ -335,6 +381,10 @@ static const VMStateDescription vmstate_darwin_iomfb = {
         VMSTATE_BOOL(cb_flag9, DarwinIOMFB),
         VMSTATE_UINT64(cb_sent, DarwinIOMFB),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_iomfb_swap,
+        NULL
     },
 };
 
@@ -400,6 +450,40 @@ static bool iomfb_dma(DarwinIOMFB *m, uint64_t dva, void *buf, uint32_t len,
         p += chunk;
         len -= chunk;
     }
+    return true;
+}
+
+/* Pixel DMA is disp0/sid0, not the RPC heap's dcp/sid23. Proven by
+ * a 1 MiB byte match against native IOSurface pixels in VISIBLE_R6. */
+static bool iomfb_scanout(const uint8_t *input, uint32_t len)
+{
+    DarwinIOMFBSurface surface;
+    DeviceState *dart = darwin_dart_find("dart-disp0");
+    g_autofree uint8_t *pixels = NULL;
+    if (!dart || !darwin_iomfb_swap_surface(input, len, &surface)) {
+        fprintf(stderr, "iomfb: scanout unsupported primary BGRA profile\n");
+        return false;
+    }
+    pixels = g_malloc(surface.size);
+    for (uint32_t off = 0; off < surface.size; ) {
+        uint64_t dva = surface.dva + off, pa;
+        uint32_t chunk = MIN(0x1000 - (dva & 0xfff), surface.size - off);
+        if (!darwin_dart_translate(dart, 0, dva, &pa) ||
+            address_space_read(&address_space_memory, pa,
+                               MEMTXATTRS_UNSPECIFIED, pixels + off,
+                               chunk) != MEMTX_OK) {
+            fprintf(stderr, "iomfb: scanout DMA failed at 0x%" PRIx64 "\n", dva);
+            return false;
+        }
+        off += chunk;
+    }
+    if (!darwin_fb_present_bgra(pixels, surface.width, surface.height,
+                                surface.stride)) {
+        fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
+        return false;
+    }
+    fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
+            surface.width, surface.height, surface.stride, surface.dva);
     return true;
 }
 
@@ -681,6 +765,50 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
     return true;
 }
 
+static void iomfb_swap_pump(DarwinIOMFB *m, uint8_t ep)
+{
+    uint8_t input[DARWIN_IOMFB_SWAP_COMPLETION_SIZE];
+    IOMFBCallback cb = { .name = "D594", .name_be = 0x44353934 };
+
+    if (!m->swap_enabled || m->swap_failed || m->cb_busy || !m->swap_count) {
+        return;
+    }
+    darwin_iomfb_swap_completion(input, m->swap_ids[m->swap_head]);
+    cb.in = g_byte_array_new_take(g_memdup2(input, sizeof(input)), sizeof(input));
+    m->swap_active = iomfb_callback_send(m, ep, &cb);
+    g_byte_array_unref(cb.in);
+    if (!m->swap_active) {
+        /* Retain the ID for inspection rather than silently losing a frame. */
+        m->swap_failed = true;
+    }
+    fprintf(stderr, "iomfb: swap id %u D594 %s, queued %u\n",
+            m->swap_ids[m->swap_head], m->swap_active ? "sent" : "send failed",
+            m->swap_count);
+}
+
+static void iomfb_swap_enqueue(DarwinIOMFB *m, const uint8_t *input,
+                              uint32_t in_len, uint32_t out_len)
+{
+    uint32_t id;
+    if (!darwin_iomfb_swap_id(input, in_len, out_len, &id)) {
+        fprintf(stderr, "iomfb: unsupported A408 completion shape; no D594 queued\n");
+        return;
+    }
+    for (uint32_t i = 0; i < m->swap_count; i++) {
+        if (m->swap_ids[(m->swap_head + i) % IOMFB_SWAP_QUEUE_SIZE] == id) {
+            fprintf(stderr, "iomfb: swap id %u already queued; no duplicate D594\n", id);
+            return;
+        }
+    }
+    if (m->swap_count == IOMFB_SWAP_QUEUE_SIZE) {
+        m->swap_failed = true;
+        fprintf(stderr, "iomfb: swap completion queue full at id %u; stopped\n", id);
+        return;
+    }
+    m->swap_ids[(m->swap_head + m->swap_count) % IOMFB_SWAP_QUEUE_SIZE] = id;
+    m->swap_count++;
+}
+
 /* Send the next scripted callback, if any and if none is outstanding. */
 static void iomfb_callback_pump(DarwinIOMFB *m, uint8_t ep)
 {
@@ -698,6 +826,7 @@ static void iomfb_callback_pump(DarwinIOMFB *m, uint8_t ep)
         }
         /* Could not send it at all: move on rather than stalling the script. */
     }
+    iomfb_swap_pump(m, ep);
 }
 
 /*
@@ -737,6 +866,20 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
 {
     const unsigned tag = 0;
     uint32_t status = (uint32_t)(msg >> 16);
+
+    if (m->swap_active) {
+        fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x\n",
+                m->swap_ids[m->swap_head], status);
+        m->cb_busy = m->swap_active = false;
+        if (status) {
+            m->swap_failed = true;
+            return;
+        }
+        m->swap_head = (m->swap_head + 1) % IOMFB_SWAP_QUEUE_SIZE;
+        m->swap_count--;
+        iomfb_callback_pump(m, ep);
+        return;
+    }
     const IOMFBCallback *cb =
         &g_array_index(m->cb_script, IOMFBCallback, m->cb_next - 1);
     uint32_t in_len = cb->in ? cb->in->len : 0;
@@ -1104,6 +1247,21 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     snprintf(what, sizeof(what), "class-2 completion for '%s', status 0, out %s", name, how);
     iomfb_send(m, ep, reply, what);
 
+    /* Copy before D594 releases the native surface mapping. */
+    if (m->scanout_enabled && h.name == 0x41343038) {
+        iomfb_scanout(buf + sizeof(h), h.in_len);
+    }
+
+    /* The AP inserts queue-item+0x3d4 before entering the A408 wrapper
+     * (a0c3730/a0c4500). Reply first, then use the native asynchronous
+     * completion path established by DISPLAY_COMPLETE_R25. */
+    if (m->swap_enabled && h.name == 0x41343038) {
+        iomfb_swap_enqueue(m, buf + sizeof(h), h.in_len, h.out_len);
+        if (!m->cb_script || m->cb_next == m->cb_script->len) {
+            iomfb_swap_pump(m, ep);
+        }
+    }
+
     /* A script barrier observes a completed AP call, never merely its arrival. */
     iomfb_callback_barrier(m, ep, name);
 
@@ -1176,6 +1334,13 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->dart = dart;
     m->sid = sid;
     m->level = level;
+    const char *scanout = getenv("DARWIN_DCP_IOMFB_SCANOUT");
+    m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
+    const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
+    m->swap_enabled = level >= 3 && complete && !strcmp(complete, "1");
+    if (m->swap_enabled) {
+        fprintf(stderr, "iomfb: native A408/D594 swap completion enabled\n");
+    }
     m->debug = dbg && dbg[0] && dbg[0] != '0';
     m->rpc_trace = trace && trace[0] && trace[0] != '0';
     if (m->rpc_trace) {

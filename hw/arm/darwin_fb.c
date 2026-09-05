@@ -38,6 +38,9 @@ struct DarwinFBState {
     DisplaySurface *surface;
     bool surface_attached;
 
+    uint8_t *scanout_pixels;
+    uint32_t scanout_size;
+    bool scanout_valid;
     uint8_t *host;
     uint32_t width, height, scale;
     hwaddr guest_base;
@@ -62,6 +65,46 @@ static bool darwin_fb_gfx_update(void *opaque)
 
     // The surface is backed directly by guest RAM, so just flag a full refresh.
     // The UI backends (vnc in particular) do their own dirty-tile detection.
+    qemu_console_update_full(s->con);
+    return true;
+}
+
+/* The console owns attached surfaces; external pixel storage remains ours. */
+static void darwin_fb_scanout_surface(DarwinFBState *s)
+{
+    DisplaySurface *next = qemu_create_displaysurface_from(
+        s->width, s->height, PIXMAN_x8r8g8b8, s->width * 4,
+        s->scanout_pixels);
+    if (!s->surface_attached) {
+        qemu_free_displaysurface(s->surface);
+    }
+    s->surface = next;
+    qemu_console_set_surface(s->con, next);
+    s->surface_attached = true;
+}
+
+bool darwin_fb_present_bgra(const uint8_t *pixels, uint32_t width,
+                            uint32_t height, uint32_t stride)
+{
+    bool ambiguous = false;
+    Object *obj = object_resolve_path_type("", TYPE_DARWIN_FB, &ambiguous);
+    DarwinFBState *s;
+    if (!obj || ambiguous || !pixels) {
+        return false;
+    }
+    s = DARWIN_FB(obj);
+    if (width != s->width || height != s->height ||
+        (uint64_t)stride < (uint64_t)width * 4) {
+        return false;
+    }
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(s->scanout_pixels + (size_t)y * width * 4,
+               pixels + (size_t)y * stride, width * 4);
+    }
+    if (!s->scanout_valid) {
+        darwin_fb_scanout_surface(s);
+        s->scanout_valid = true;
+    }
     qemu_console_update_full(s->con);
     return true;
 }
@@ -231,15 +274,34 @@ static int darwin_fb_post_load(void *opaque, int version_id)
 {
     DarwinFBState *s = opaque;
 
-    /*
-     * The pixels themselves are guest RAM.  The host surface is recreated by
-     * realize and must be attached to the destination console, never copied
-     * from the source process.
-     */
-    s->surface_attached = false;
+    if (s->scanout_valid) {
+        darwin_fb_scanout_surface(s);
+    }
     qemu_console_update_full(s->con);
     return 0;
 }
+
+static bool darwin_fb_scanout_needed(void *opaque)
+{
+    return ((DarwinFBState *)opaque)->scanout_valid;
+}
+
+static const VMStateDescription vmstate_darwin_fb_scanout = {
+    .name = TYPE_DARWIN_FB "/scanout",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = darwin_fb_scanout_needed,
+    .fields = (const VMStateField[]) {
+        /* Destination geometry fixes the allocation before loading any bytes. */
+        VMSTATE_UINT32_EQUAL(width, DarwinFBState),
+        VMSTATE_UINT32_EQUAL(height, DarwinFBState),
+        VMSTATE_UINT32_EQUAL(scanout_size, DarwinFBState),
+        VMSTATE_VBUFFER_UINT32(scanout_pixels, DarwinFBState, 0, NULL,
+                              scanout_size),
+        VMSTATE_BOOL(scanout_valid, DarwinFBState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_darwin_fb = {
     .name = TYPE_DARWIN_FB,
@@ -253,6 +315,9 @@ static const VMStateDescription vmstate_darwin_fb = {
         VMSTATE_BOOL(caps, DarwinFBState),
         VMSTATE_END_OF_LIST()
     },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_darwin_fb_scanout, NULL
+    },
 };
 
 /* ---------------- device ---------------- */
@@ -265,6 +330,13 @@ static void darwin_fb_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "darwin-fb: no framebuffer memory configured");
         return;
     }
+
+    if ((uint64_t)s->width * s->height * 4 > 64 * 1024 * 1024) {
+        error_setg(errp, "darwin-fb: framebuffer exceeds 64 MiB");
+        return;
+    }
+    s->scanout_size = s->width * s->height * 4;
+    s->scanout_pixels = g_malloc0(s->scanout_size);
 
     // XNU's boot video pixel format is "BBBBBBBBGGGGGGGGRRRRRRRR" (32bpp,
     // little endian B,G,R,X in memory), which is pixman x8r8g8b8.
