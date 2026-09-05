@@ -7,6 +7,7 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"
+#include "qemu/timer.h"
 #include "cpregs.h"
 #include "system/system.h"
 #include "xnu/apple_regs.h"
@@ -133,6 +134,30 @@ static uint64_t pmc1_raw_read(CPUARMState *env, const ARMCPRegInfo *ri)
     return APPLE_STATE(env)->pmc1_internal_count;
 }
 
+/*
+ * Explicit virtual-platform ABI, paired with tools/re/rtc_pv_patch.py.
+ *
+ * S3_0_C15_C15_6 is Apple HID24 in scripts/darwin/sysregs.py, so it cannot
+ * be used here.  S3_0_C15_C15_1 has no generated Apple register definition
+ * and no matching MRS in the supported 24A5430a kernelcache.  It is exposed
+ * only when DARWIN_RTC_PV is exactly "1".  This is a read-only host wall
+ * clock: it has no guest-visible backing state and deliberately bypasses
+ * migration, RTC persistence, alarms, and settimeofday handling.
+ */
+static uint64_t pv_rtc_ns_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+    return now_ns > 0 ? now_ns : 0;
+}
+
+static const ARMCPRegInfo pv_rtc_regs[] = {
+    { .name = "DVM_PV_RTC_NS", .state = ARM_CP_STATE_AA64,
+      .access = PL1_R, .type = ARM_CP_OVERRIDE | ARM_CP_NO_RAW | ARM_CP_IO,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 15, .opc2 = 1,
+      .readfn = pv_rtc_ns_read },
+};
+
 static void pmc1_raw_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t val)
 {
@@ -219,6 +244,7 @@ static hwaddr adt_find_region_last_page(struct dtree_node *dt_root, const char *
 
 void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, struct xnu_boot_info *info) {
     const char *pauth_cache = getenv("DARWIN_PAUTH_CACHE");
+    const char *rtc_pv = getenv("DARWIN_RTC_PV");
     cpu->pauth_mask_cache.mode = pauth_cache && !strcmp(pauth_cache, "off") ? 0 :
                                 pauth_cache && !strcmp(pauth_cache, "verify") ? 2 : 1;
     CPUARMState *env = &cpu->env;
@@ -288,5 +314,8 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
 
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);
+    if (rtc_pv && !strcmp(rtc_pv, "1")) {
+        define_arm_cp_regs(cpu, pv_rtc_regs);
+    }
     gxfstat_start();
 }

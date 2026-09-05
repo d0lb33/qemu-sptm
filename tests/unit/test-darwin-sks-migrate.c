@@ -401,23 +401,28 @@ static void reject_unwrap_truncation(void)
 
 static void device_state_native_decoder_contract(void)
 {
-    /* DISPLAY_UNLOCK_R1: the real guest decoder returned 0, record+0 = 4,
-     * record+0x2a = -6. The old nine-byte blob returned an all-zero record. */
-    static const uint8_t guest_validated_der[] = {
-        0x31, 0x12,
+    /* DISPLAY_UNLOCK_R1 validates bh=-6 and ss=4. AppleSEPKeyStore's
+     * method-17 decoder at 0xfffffff009581144 maps the adjacent "sls"
+     * descriptor to record+4, which _MKBGetDeviceLockState returns as ls. */
+    static const uint8_t expected_der[] = {
+        0x31, 0x1c,
         0x30, 0x07, 0x0c, 0x02, 'b', 'h', 0x02, 0x01, 0xfa,
         0x30, 0x07, 0x0c, 0x02, 's', 's', 0x02, 0x01, 0x04,
+        0x30, 0x08, 0x0c, 0x03, 's', 'l', 's', 0x02, 0x01, 0x03,
     };
     uint8_t reply[DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE + 1];
 
     memset(reply, 0xa5, sizeof(reply));
     g_assert_cmpuint(darwin_sks_build_unlocked_device_state(reply,
-                     sizeof(reply)), ==, 28);
+                     sizeof(reply)), ==,
+                     DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE);
     g_assert_cmpuint(ldl_le_p(reply), ==, 0);
-    g_assert_cmpuint(ldl_le_p(reply + 4), ==, sizeof(guest_validated_der));
-    g_assert_cmpmem(reply + 8, sizeof(guest_validated_der),
-                    guest_validated_der, sizeof(guest_validated_der));
-    g_assert_cmpuint(reply[28], ==, 0xa5);
+    g_assert_cmpuint(ldl_le_p(reply + 4), ==, sizeof(expected_der));
+    g_assert_cmpmem(reply + 8, sizeof(expected_der),
+                    expected_der, sizeof(expected_der));
+    g_assert_cmpuint(reply[38], ==, 0);
+    g_assert_cmpuint(reply[39], ==, 0);
+    g_assert_cmpuint(reply[DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE], ==, 0xa5);
 }
 
 static void device_state_reject_small_buffer(void)

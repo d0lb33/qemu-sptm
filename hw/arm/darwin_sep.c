@@ -552,8 +552,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * 0xfffffff0095812f0..0x95812f8 places that INTEGER at parsed-record offset
  * +0x2a. Each key/value pair needs a SEQUENCE inside the outer SET. The
  * previous nine-byte record lacked that wrapper and decoded as all zeros.
- * darwin_sks_build_unlocked_device_state supplies the guest-validated
- * 20-byte DER record with bh=-6 and ss=4 (first unlock has occurred).
+ * darwin_sks_build_unlocked_device_state supplies a 30-byte DER record:
+ * bh=-6, ss=4 (first unlock has occurred), and sls=3 (no passcode).
+ * See its native method-17 parser/consumer evidence in darwin_sks.c.
  */
 #define SKS_GET_DEVICE_STATE_REQUEST_SIZE       0x60
 #define SKS_GET_DEVICE_STATE_SELECTOR_OFF       0x4c
@@ -1594,7 +1595,7 @@ static void sep_handle_sks(DarwinSEPState *s, uint64_t m)
                  == payload_size);
         if (s->sks_log_current) {
             fprintf(stderr, "sep(%s): sks op19 returns selector 0 with a "
-                    "20-byte DER device-state blob (bh=-6 ss=4) in a %u-byte "
+                    "30-byte DER device-state blob (bh=-6 ss=4 sls=3) in a %u-byte "
                     "IPC v1 reply\n", s->role,
                     SKS_IPC_V1_HEADER_SIZE +
                         SKS_GET_DEVICE_STATE_RESPONSE_PAYLOAD_SIZE);
