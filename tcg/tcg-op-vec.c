@@ -218,6 +218,20 @@ void tcg_gen_mov_vec(TCGv_vec r, TCGv_vec a)
     }
 }
 
+void tcg_gen_extract2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                          unsigned offset)
+{
+    TCGType type = tcgv_vec_temp(r)->base_type;
+
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == type);
+    tcg_debug_assert(tcgv_vec_temp(b)->base_type == type);
+    tcg_debug_assert(offset < (8u << (type - TCG_TYPE_V64)));
+    tcg_debug_assert(tcg_op_supported(INDEX_op_extract2_vec, type, 0));
+    tcg_assert_listed_vecop(INDEX_op_extract2_vec);
+    vec_gen_4(INDEX_op_extract2_vec, type, MO_8,
+              tcgv_vec_arg(r), tcgv_vec_arg(a), tcgv_vec_arg(b), offset);
+}
+
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec r, uint64_t a)
 {
     TCGTemp *rt = tcgv_vec_temp(r);

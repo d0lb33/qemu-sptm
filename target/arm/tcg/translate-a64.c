@@ -33,6 +33,8 @@
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_gcspr[4];
 static TCGv_i64 cpu_pc;
+/* Experimental host lowering: mixed SIMD improves, pure EXT chains may not. */
+static bool vector_ext_enabled;
 
 /* Load/store exclusive handling */
 static TCGv_i64 cpu_exclusive_high;
@@ -83,12 +85,14 @@ static int scale_by_log2_tag_granule(DisasContext *s, int x)
 /* initialize TCG globals.  */
 void a64_translate_init(void)
 {
+    const char *vector_ext = getenv("QEMU_ARM_TCG_VECTOR_EXT");
     static const char gcspr_names[4][12] = {
         "gcspr_el0", "gcspr_el1", "gcspr_el2", "gcspr_el3"
     };
 
     int i;
 
+    vector_ext_enabled = vector_ext && strcmp(vector_ext, "1") == 0;
     cpu_pc = tcg_global_mem_new_i64(tcg_env,
                                     offsetof(CPUARMState, pc),
                                     "pc");
@@ -7800,6 +7804,37 @@ static bool trans_FCSEL(DisasContext *s, arg_FCSEL *a)
  * Advanced SIMD Extract
  */
 
+static bool gen_ext_vec(DisasContext *s, int rd, int rn, int rm,
+                        unsigned imm)
+{
+    TCGType type = TCG_TYPE_V128;
+    TCGv_vec lo, hi, result;
+
+    if (imm == 0) {
+        /* EXT with offset zero is a copy, including upper-lane clearing. */
+        tcg_gen_gvec_mov(MO_8, vec_full_reg_offset(s, rd),
+                         vec_full_reg_offset(s, rn), 16,
+                         vec_full_reg_size(s));
+        return true;
+    }
+
+    if (!vector_ext_enabled ||
+        !tcg_op_supported(INDEX_op_extract2_vec, type, 0)) {
+        return false;
+    }
+
+    /* Capture both sources before storing: Rd may alias either or both. */
+    lo = tcg_temp_new_vec(type);
+    hi = tcg_temp_new_vec(type);
+    result = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(lo, tcg_env, vec_full_reg_offset(s, rn));
+    tcg_gen_ld_vec(hi, tcg_env, vec_full_reg_offset(s, rm));
+    tcg_gen_extract2_vec(result, lo, hi, imm);
+    tcg_gen_st_vec(result, tcg_env, vec_full_reg_offset(s, rd));
+    clear_vec_high(s, true, rd);
+    return true;
+}
+
 static bool trans_EXT_d(DisasContext *s, arg_EXT_d *a)
 {
     if (fp_access_check(s)) {
@@ -7820,6 +7855,10 @@ static bool trans_EXT_q(DisasContext *s, arg_EXT_q *a)
     int elt = a->imm >> 3;
 
     if (!fp_access_check(s)) {
+        return true;
+    }
+
+    if (gen_ext_vec(s, a->rd, a->rn, a->rm, a->imm)) {
         return true;
     }
 

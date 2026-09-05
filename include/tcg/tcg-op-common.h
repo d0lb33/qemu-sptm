@@ -485,6 +485,9 @@ void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d);
 
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
+/* Caller must check support; offset is in bytes, not vector elements. */
+void tcg_gen_extract2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                          unsigned offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
 

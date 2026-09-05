@@ -781,6 +781,14 @@ specifies the length of the element (if applicable) in log2 8-bit units.
 
      - | Similarly, *v0* = *v1* * *v2*.
 
+   * - extract2_vec *v0*, *v1*, *v2*, *offset*
+
+     - | Extract one vector-sized byte window starting at *offset* from the
+         concatenation of *v1* followed by *v2* (low to high bytes).
+       | *offset* is a byte count less than the vector size, and VECE is 0.
+         Currently supports V64 and V128. This is optional: callers must check
+         opcode support and supply a fallback on hosts without a lowering.
+
    * - neg_vec *v0*, *v1*
 
      - | Similarly, *v0* = -*v1*.

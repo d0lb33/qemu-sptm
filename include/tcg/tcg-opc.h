@@ -136,6 +136,8 @@ DEF(dupm_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(mul_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* Byte window of two concatenated vectors, constant byte offset. */
+DEF(extract2_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(neg_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(abs_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(ssadd_vec, 1, 2, 0, TCG_OPF_VECTOR)

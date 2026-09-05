@@ -540,10 +540,15 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
     tlb_debug("page addr: %016" VADDR_PRIx " mmu_map:0x%x\n", addr, idxmap);
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-        if ((idxmap >> mmu_idx) & 1) {
-            tlb_flush_page_locked(cpu, mmu_idx, addr);
-        }
+    /*
+     * A clean mode has no translations in either the main or victim TLB.
+     * Use the same conservative tracking as a full flush, not the occupancy
+     * estimate used for resizing. Keep jump-cache invalidation below.
+     */
+    idxmap &= cpu->neg.tlb.c.dirty;
+    for (; idxmap; idxmap &= idxmap - 1) {
+        mmu_idx = ctz32(idxmap);
+        tlb_flush_page_locked(cpu, mmu_idx, addr);
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
@@ -730,18 +735,23 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
               d.addr, d.bits, d.len, d.idxmap);
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-        if ((d.idxmap >> mmu_idx) & 1) {
-            tlb_flush_range_locked(cpu, mmu_idx, d.addr, d.len, d.bits);
-        }
+    /* Clean modes cannot contain matching main or victim entries. */
+    d.idxmap &= cpu->neg.tlb.c.dirty;
+    for (; d.idxmap; d.idxmap &= d.idxmap - 1) {
+        mmu_idx = ctz32(d.idxmap);
+        tlb_flush_range_locked(cpu, mmu_idx, d.addr, d.len, d.bits);
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
     /*
-     * If the length is larger than the jump cache size, then it will take
-     * longer to clear each entry individually than it will to clear it all.
+     * Let G be the number of page-hash groups in the jump cache. Within an
+     * aligned G-page block, the page hash is a permutation of all G groups.
+     * Any 2*G-1 consecutive pages contain such a block. Include the preceding
+     * page below: at this length, clearing the whole cache invalidates exactly
+     * the same entries as the page loop, without repeatedly clearing groups.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
+    if (d.len >= TARGET_PAGE_SIZE *
+                 (2 * (TB_JMP_CACHE_SIZE / TB_JMP_PAGE_SIZE) - 2)) {
         tcg_flush_jmp_cache(cpu);
         return;
     }

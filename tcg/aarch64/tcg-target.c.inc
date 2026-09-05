@@ -2967,6 +2967,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_dupm_vec:
         tcg_out_dupm_vec(s, type, vece, a0, a1, a2);
         break;
+    case INDEX_op_extract2_vec:
+        /* AdvSIMD EXT: Q:30, Rm:20:16, imm4:14:11, Rn:9:5, Rd:4:0. */
+        tcg_debug_assert(vece == MO_8 && is_q <= 1);
+        tcg_debug_assert(args[3] < (8u << is_q));
+        tcg_out32(s, 0x2e000000 | (is_q << 30) | ((a2 & 31) << 16) |
+                  (args[3] << 11) | ((a1 & 31) << 5) | (a0 & 31));
+        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, rrr_e, ADD, vece, a0, a1, a2);
@@ -3268,6 +3275,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_shlv_vec:
     case INDEX_op_bitsel_vec:
         return 1;
+    case INDEX_op_extract2_vec:
+        return type <= TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_rotli_vec:
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:
@@ -3377,6 +3386,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:
     case INDEX_op_aa64_sshl_vec:
+        return C_O1_I2(w, w, w);
+    case INDEX_op_extract2_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_not_vec:
     case INDEX_op_neg_vec:

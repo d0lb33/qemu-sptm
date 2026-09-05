@@ -9,6 +9,10 @@
 
 #include "tcg-target-has.h"
 
+#ifndef TCG_TARGET_HAS_extract2_vec
+#define TCG_TARGET_HAS_extract2_vec     0
+#endif
+
 #if !defined(TCG_TARGET_HAS_v64) \
     && !defined(TCG_TARGET_HAS_v128) \
     && !defined(TCG_TARGET_HAS_v256)

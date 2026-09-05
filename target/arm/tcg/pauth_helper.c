@@ -420,13 +420,20 @@ static uint64_t pauth_original_ptr(uint64_t ptr, ARMVAParameters param)
 static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)
 {
     ARMCPU *cpu = env_archcpu(env);
-    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
+    ARMMMUIdx mmu_idx;
     uint64_t tcr, mask, result;
 
     if (!cpu->pauth_mask_cache.mode) {
         return pauth_original_ptr(ptr,
-                                 aa64_va_parameters(env, ptr, mmu_idx, data, false));
+                                 aa64_va_parameters(env, ptr,
+                                     arm_stage1_mmu_idx(env), data, false));
     }
+    /*
+     * These A64 instruction helpers run with the current TB's hflags.
+     * Reuse its MMU regime instead of re-deriving EL/HCR/PAN on every PAC
+     * operation. Continue reading the live TCR to cover register banking.
+     */
+    mmu_idx = stage_1_mmu_idx(core_to_aa64_mmu_idx(arm_env_mmu_index(env)));
     tcr = regime_tcr(env, mmu_idx);
     if (!cpu->pauth_mask_cache.valid || cpu->pauth_mask_cache.tcr != tcr ||
         cpu->pauth_mask_cache.mmu_idx != mmu_idx) {
@@ -449,6 +456,7 @@ static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)
     mask = cpu->pauth_mask_cache.mask[data][extract64(ptr, 55, 1)];
     result = extract64(ptr, 55, 1) ? ptr | mask : ptr & ~mask;
     if (unlikely(cpu->pauth_mask_cache.mode == 2)) {
+        g_assert(mmu_idx == arm_stage1_mmu_idx(env));
         uint64_t reference = pauth_original_ptr(
             ptr, aa64_va_parameters(env, ptr, mmu_idx, data, false));
         g_assert(result == reference);
