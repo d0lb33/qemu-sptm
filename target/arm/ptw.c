@@ -63,6 +63,8 @@ typedef struct S1Translate {
      * and will not change the state of the softmmu TLBs.
      */
     bool in_debug;
+    const ARMPTWMemoryOps *in_ops;
+    void *in_opaque;
     /*
      * in_at: is this AccessType_AT?
      * This is also set for debug, because at heart that is also
@@ -729,10 +731,12 @@ static bool S1_ptw_translate(CPUARMState *env, S1Translate *ptw,
 
     ptw->out_virt = addr;
 
-    if (unlikely(ptw->in_debug)) {
+    if (unlikely(ptw->in_debug || ptw->in_ops)) {
         /*
-         * From gdbstub, do not use softmmu so that we don't modify the
-         * state of the cpu at all, including softmmu tlb contents.
+         * Debug accesses must not populate the soft TLB. An accelerator
+         * supplying descriptor I/O does not have a TCG soft TLB at all.
+         * Only debug suppresses architectural AF/dirty updates and checks;
+         * the explicit-I/O path retains normal translation semantics.
          */
         ARMSecuritySpace s2_space
             = S2_security_space(ptw->cur_space, s2_mmu_idx);
@@ -740,7 +744,9 @@ static bool S1_ptw_translate(CPUARMState *env, S1Translate *ptw,
             .in_mmu_idx = s2_mmu_idx,
             .in_ptw_idx = ptw_idx_for_stage_2(env, s2_mmu_idx),
             .in_space = s2_space,
-            .in_debug = true,
+            .in_debug = ptw->in_debug,
+            .in_ops = ptw->in_ops,
+            .in_opaque = ptw->in_opaque,
             .in_prot_check = PAGE_READ,
         };
         GetPhysAddrResult s2 = { };
@@ -752,7 +758,7 @@ static bool S1_ptw_translate(CPUARMState *env, S1Translate *ptw,
         ptw->out_phys = s2.f.phys_addr;
         pte_attrs = s2.cacheattrs.attrs;
         ptw->out_host = NULL;
-        ptw->out_rw = false;
+        ptw->out_rw = s2.f.prot & PAGE_WRITE;
         ptw->out_space = s2.f.attrs.space;
     } else {
 #ifdef CONFIG_TCG
@@ -810,12 +816,34 @@ static bool S1_ptw_translate(CPUARMState *env, S1Translate *ptw,
 }
 
 /* All loads done in the course of a page table walk go through here. */
+static uint64_t arm_ld_ops_ptw(S1Translate *ptw, unsigned size,
+                               ARMMMUFaultInfo *fi)
+{
+    MemTxAttrs attrs = {
+        .space = ptw->out_space,
+        .secure = arm_space_is_secure(ptw->out_space),
+    };
+    uint64_t value = 0;
+    MemTxResult tx = ptw->in_ops->read(ptw->in_opaque, ptw->out_phys,
+                                       attrs, size, ptw->out_be, &value);
+
+    if (tx != MEMTX_OK) {
+        fi->type = ARMFault_SyncExternalOnWalk;
+        fi->ea = arm_extabort_type(tx);
+    }
+    return value;
+}
+
 static uint32_t arm_ldl_ptw(CPUARMState *env, S1Translate *ptw,
                             ARMMMUFaultInfo *fi)
 {
     CPUState *cs = env_cpu(env);
     void *host = ptw->out_host;
     uint32_t data;
+
+    if (ptw->in_ops) {
+        return arm_ld_ops_ptw(ptw, 4, fi);
+    }
 
     if (likely(host)) {
         /* Page tables are in RAM, and we have the host address. */
@@ -855,6 +883,10 @@ static uint64_t arm_ldq_ptw(CPUARMState *env, S1Translate *ptw,
     void *host = ptw->out_host;
     uint64_t data;
 
+    if (ptw->in_ops) {
+        return arm_ld_ops_ptw(ptw, 8, fi);
+    }
+
     if (likely(host)) {
         /* Page tables are in RAM, and we have the host address. */
         data = qatomic_read((uint64_t *)host);
@@ -890,6 +922,46 @@ static uint64_t arm_casq_ptw(CPUARMState *env, uint64_t old_val,
                              uint64_t new_val, S1Translate *ptw,
                              ARMMMUFaultInfo *fi)
 {
+    if (ptw->in_ops) {
+        MemTxAttrs attrs = {
+            .space = ptw->out_space,
+            .secure = arm_space_is_secure(ptw->out_space),
+        };
+        uint64_t observed = old_val;
+        MemTxResult tx;
+
+        /* AF/dirty updates need stage-2 write permission, too. */
+        if (!ptw->out_rw) {
+            ARMMMUIdx idx = ptw->in_ptw_idx;
+            S1Translate s2ptw = {
+                .in_mmu_idx = idx,
+                .in_ptw_idx = ptw_idx_for_stage_2(env, idx),
+                .in_space = S2_security_space(ptw->cur_space, idx),
+                .in_ops = ptw->in_ops,
+                .in_opaque = ptw->in_opaque,
+                .in_prot_check = PAGE_WRITE,
+            };
+            GetPhysAddrResult s2 = {};
+
+            if (!get_phys_addr_gpc(env, &s2ptw, ptw->out_virt,
+                                   MMU_DATA_STORE, 0, &s2, fi)) {
+                fi->s2addr = ptw->out_virt;
+                fi->stage2 = regime_is_stage2(idx);
+                fi->s1ptw = fi->stage2;
+                fi->s1ns = fault_s1ns(ptw->cur_space, idx);
+                return 0;
+            }
+            ptw->out_rw = true;
+        }
+        tx = ptw->in_ops->cmpxchg64(ptw->in_opaque, ptw->out_phys,
+                                    attrs, ptw->out_be, old_val, new_val,
+                                    &observed);
+        if (tx != MEMTX_OK) {
+            fi->type = ARMFault_SyncExternalOnWalk;
+            fi->ea = arm_extabort_type(tx);
+        }
+        return observed;
+    }
 #ifdef CONFIG_TCG
     uint64_t cur_val;
     void *host = ptw->out_host;
@@ -4151,6 +4223,25 @@ bool get_phys_addr(CPUARMState *env, vaddr address,
         .in_prot_check = 1 << access_type,
     };
 
+    return get_phys_addr_gpc(env, &ptw, address, access_type,
+                             memop, result, fi);
+}
+
+bool get_phys_addr_with_ops(CPUARMState *env, vaddr address,
+                            MMUAccessType access_type, MemOp memop,
+                            ARMMMUIdx mmu_idx, GetPhysAddrResult *result,
+                            ARMMMUFaultInfo *fi, const ARMPTWMemoryOps *ops,
+                            void *opaque)
+{
+    S1Translate ptw = {
+        .in_mmu_idx = mmu_idx,
+        .in_space = arm_mmu_idx_to_security_space(env, mmu_idx),
+        .in_prot_check = 1 << access_type,
+        .in_ops = ops,
+        .in_opaque = opaque,
+    };
+
+    assert(ops && ops->read && ops->cmpxchg64);
     return get_phys_addr_gpc(env, &ptw, address, access_type,
                              memop, result, fi);
 }

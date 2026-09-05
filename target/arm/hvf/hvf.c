@@ -12,6 +12,8 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
+#include "qemu/host-utils.h"
 
 #include "system/runstate.h"
 #include "system/hvf.h"
@@ -41,6 +43,8 @@
 #include "migration/vmstate.h"
 
 #include "gdbstub/enums.h"
+#include "ptw-probe.h"
+#include "virtual-el2.h"
 
 #define MDSCR_EL1_SS_SHIFT  0
 #define MDSCR_EL1_MDE_SHIFT 15
@@ -785,6 +789,108 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, const char *cpname,
     return false;
 }
 
+/*
+ * Experimental workaround for HCR API accesses clearing E2H/TGE on the
+ * tested M5/macOS 27 host. Native MRS/MSR preserves them. This is deliberately
+ * opt-in until the helper has been exercised across the complete iOS boot.
+ * See tools/perf/native_hcr_state.* and native_hcr_mmu.* in the parent repo.
+ */
+#define HVF_HCR_HELPER_GPA UINT64_C(0xf00000000)
+static MemoryRegion hvf_hcr_helper_rom;
+static bool hvf_hcr_helper_ready;
+static bool hvf_native_hcr;
+
+static void hvf_hcr_helper_init(void)
+{
+    MemoryRegionSection overlap;
+    uint32_t *code;
+    size_t size = qemu_real_host_page_size();
+
+    assert(bql_locked());
+    if (hvf_hcr_helper_ready) {
+        return;
+    }
+    overlap = memory_region_find(get_system_memory(), HVF_HCR_HELPER_GPA,
+                                 size);
+    if (overlap.mr) {
+        error_report("HVF native HCR helper overlaps %s at 0x%" PRIx64,
+                     memory_region_name(overlap.mr), HVF_HCR_HELPER_GPA);
+        memory_region_unref(overlap.mr);
+        exit(EXIT_FAILURE);
+    }
+    memory_region_init_rom(&hvf_hcr_helper_rom, NULL,
+                           "hvf-native-hcr-helper", size, &error_fatal);
+    code = memory_region_get_ram_ptr(&hvf_hcr_helper_rom);
+    stl_le_p(code + 0, 0xd53c1109); /* MRS X9, HCR_EL2 */
+    stl_le_p(code + 1, 0xd4000aa3); /* SMC #0x55 */
+    stl_le_p(code + 2, 0xd51c1109); /* MSR HCR_EL2, X9 */
+    stl_le_p(code + 3, 0xd5033fdf); /* ISB */
+    stl_le_p(code + 4, 0xd53c1109); /* MRS X9, HCR_EL2 */
+    stl_le_p(code + 5, 0xd4000aa3); /* SMC #0x55 */
+    memory_region_add_subregion(get_system_memory(), HVF_HCR_HELPER_GPA,
+                                &hvf_hcr_helper_rom);
+    hvf_hcr_helper_ready = true;
+}
+
+static uint64_t hvf_access_hcr(CPUState *cpu, bool write, uint64_t value)
+{
+    hv_vcpu_t fd = cpu->accel->fd;
+    uint64_t pc, pstate, x9, sctlr, mdscr, result = 0;
+    hv_vcpu_exit_t helper_exit = { 0 };
+    bool vtimer_mask, completed = false;
+    int attempt;
+
+    hvf_hcr_helper_init();
+    assert_hvf_ok(hv_vcpu_get_reg(fd, HV_REG_PC, &pc));
+    assert_hvf_ok(hv_vcpu_get_reg(fd, HV_REG_CPSR, &pstate));
+    assert_hvf_ok(hv_vcpu_get_reg(fd, HV_REG_X9, &x9));
+    assert_hvf_ok(hv_vcpu_get_sys_reg(fd, HV_SYS_REG_SCTLR_EL2, &sctlr));
+    assert_hvf_ok(hv_vcpu_get_sys_reg(fd, HV_SYS_REG_MDSCR_EL1, &mdscr));
+    assert_hvf_ok(hv_vcpu_get_vtimer_mask(fd, &vtimer_mask));
+
+    /*
+     * Run only VMM-owned instructions with translation disabled and async
+     * exceptions/debug masked. No guest table or permission is changed.
+     * Restore every temporary change before returning to guest execution.
+     */
+    assert_hvf_ok(hv_vcpu_set_vtimer_mask(fd, true));
+    assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_MDSCR_EL1, 0));
+    assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_SCTLR_EL2,
+                                     sctlr & ~SCTLR_M));
+    assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_CPSR, 0x3c9));
+    if (write) {
+        assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_X9, value));
+    }
+    assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_PC,
+                                 HVF_HCR_HELPER_GPA + (write ? 8 : 0)));
+    for (attempt = 0; attempt < 16; attempt++) {
+        assert_hvf_ok(hv_vcpu_run(fd));
+        helper_exit = *cpu->accel->exit;
+        if (helper_exit.reason == HV_EXIT_REASON_CANCELED) {
+            continue;
+        }
+        completed = helper_exit.reason == HV_EXIT_REASON_EXCEPTION &&
+                    helper_exit.exception.syndrome == 0x5e000055;
+        break;
+    }
+    assert_hvf_ok(hv_vcpu_get_reg(fd, HV_REG_X9, &result));
+    assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_X9, x9));
+    assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_PC, pc));
+    assert_hvf_ok(hv_vcpu_set_reg(fd, HV_REG_CPSR, pstate));
+    assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_SCTLR_EL2, sctlr));
+    assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_MDSCR_EL1, mdscr));
+    assert_hvf_ok(hv_vcpu_set_vtimer_mask(fd, vtimer_mask));
+    if (!completed || (write && result != value)) {
+        error_report("HVF native HCR helper failed: reason=%u syndrome=0x%"
+                     PRIx64 " readback=0x%" PRIx64,
+                     helper_exit.reason, helper_exit.exception.syndrome,
+                     result);
+        /* Callers cannot recover with stale architectural state. */
+        exit(EXIT_FAILURE);
+    }
+    return result;
+}
+
 int hvf_arch_get_registers(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -792,9 +898,14 @@ int hvf_arch_get_registers(CPUState *cpu)
     hv_return_t ret;
     uint64_t val;
     hv_simd_fp_uchar16_t fpval;
+    uint64_t native_hcr = 0;
     int i, n;
 
     assert(!cpu->vcpu_dirty);
+    if (hvf_native_hcr) {
+        /* Capture before other accessors can synchronize virtual EL2 state. */
+        native_hcr = hvf_access_hcr(cpu, false, 0);
+    }
 
     for (i = 0; i < ARRAY_SIZE(hvf_reg_match); i++) {
         ret = hv_vcpu_get_reg(cpu->accel->fd, hvf_reg_match[i].reg, &val);
@@ -821,6 +932,27 @@ int hvf_arch_get_registers(CPUState *cpu)
 
     ret = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &val);
     assert_hvf_ok(ret);
+    if (hvf_virtual_el2) {
+        if ((val & 0xc) != 4) {
+            error_report("Virtual EL2 unexpected physical PSTATE=0x%" PRIx64,
+                         val);
+            exit(EXIT_FAILURE);
+        }
+        pstate_write(env, (val & ~UINT64_C(0xc)) | 8);
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL0,
+                                          &env->sp_el[0]));
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
+                         arm_apple_is_gl(env) ? &env->sp_gl[2] : &env->sp_el[2]));
+        if (cpu_isar_feature(aa64_sme, arm_cpu)) {
+            if (__builtin_available(macOS 15.2, *)) {
+                hvf_arch_get_sme(cpu);
+            } else {
+                g_assert_not_reached();
+            }
+        }
+        aarch64_restore_sp(env, 2);
+        return 0;
+    }
     pstate_write(env, val);
 
     for (i = 0, n = arm_cpu->cpreg_array_len; i < n; i++) {
@@ -919,8 +1051,12 @@ int hvf_arch_get_registers(CPUState *cpu)
             }
         }
 
-        ret = hv_vcpu_get_sys_reg(cpu->accel->fd, hvf_id, &val);
-        assert_hvf_ok(ret);
+        if (hvf_native_hcr && hvf_id == HV_SYS_REG_HCR_EL2) {
+            val = native_hcr;
+        } else {
+            ret = hv_vcpu_get_sys_reg(cpu->accel->fd, hvf_id, &val);
+            assert_hvf_ok(ret);
+        }
 
         arm_cpu->cpreg_values[i] = val;
     }
@@ -945,6 +1081,7 @@ int hvf_arch_put_registers(CPUState *cpu)
     hv_return_t ret;
     uint64_t val;
     hv_simd_fp_uchar16_t fpval;
+    uint64_t native_hcr = 0;
     int i, n;
 
     assert(cpu->vcpu_dirty);
@@ -980,6 +1117,54 @@ int hvf_arch_put_registers(CPUState *cpu)
     ret = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_FPSR, vfp_get_fpsr(env));
     assert_hvf_ok(ret);
 
+    if (hvf_virtual_el2) {
+        if (arm_current_el(env) != 2 ||
+            (env->cp15.sctlr_el[1] & SCTLR_M) ||
+            (!!(env->cp15.sctlr_el[2] & SCTLR_M) != hvf_vsh.active)) {
+            error_report("Virtual EL2 context lacks shadow owner");
+            exit(EXIT_FAILURE);
+        }
+        aarch64_save_sp(env, 2);
+        assert_hvf_ok(hv_vcpu_set_reg(cpu->accel->fd, HV_REG_CPSR,
+                                      (pstate_read(env) & ~UINT64_C(0xc)) | 4));
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL0,
+                                          env->sp_el[0]));
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
+                         arm_apple_is_gl(env) ? env->sp_gl[2] : env->sp_el[2]));
+        /*
+         * Guest EL2 FP permissions do not follow physical EL1's CPACR.
+         * Use the architectural trap decision, including VHE CPTR format,
+         * before allowing native FP/SIMD. Keep physical EL0, SVE and SME
+         * disabled; those virtual execution contexts are not integrated.
+         */
+        uint64_t cpacr = FIELD_DP64(0, CPACR_EL1, FPEN,
+                                    fp_exception_el(env, 2) ? 0 : 1);
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
+                                          HV_SYS_REG_CPACR_EL1, cpacr));
+        if (hvf_vsh.active) {
+            hvf_vsh_put(cpu);
+        } else {
+            assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
+                                              HV_SYS_REG_SCTLR_EL1, 0));
+        }
+        /* Native PAC instructions must use the guest's architectural keys. */
+        static const hv_sys_reg_t keys[] = {
+            HV_SYS_REG_APIAKEYLO_EL1, HV_SYS_REG_APIAKEYHI_EL1,
+            HV_SYS_REG_APIBKEYLO_EL1, HV_SYS_REG_APIBKEYHI_EL1,
+            HV_SYS_REG_APDAKEYLO_EL1, HV_SYS_REG_APDAKEYHI_EL1,
+            HV_SYS_REG_APDBKEYLO_EL1, HV_SYS_REG_APDBKEYHI_EL1,
+            HV_SYS_REG_APGAKEYLO_EL1, HV_SYS_REG_APGAKEYHI_EL1,
+        };
+        for (unsigned k = 0; k < ARRAY_SIZE(keys); k++) {
+            const ARMCPRegInfo *ri = get_arm_cp_reginfo(arm_cpu->cp_regs,
+                kvm_to_cpreg_id(HVF_TO_KVMID(keys[k])));
+            if (ri) {
+                assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, keys[k],
+                                                  read_raw_cp_reg(env, ri)));
+            }
+        }
+        return 0;
+    }
     ret = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_CPSR, pstate_read(env));
     assert_hvf_ok(ret);
 
@@ -1071,12 +1256,21 @@ int hvf_arch_put_registers(CPUState *cpu)
         }
 
         val = arm_cpu->cpreg_values[i];
-        ret = hv_vcpu_set_sys_reg(cpu->accel->fd, hvf_id, val);
-        assert_hvf_ok(ret);
+        if (hvf_native_hcr && hvf_id == HV_SYS_REG_HCR_EL2) {
+            native_hcr = val;
+        } else {
+            ret = hv_vcpu_set_sys_reg(cpu->accel->fd, hvf_id, val);
+            assert_hvf_ok(ret);
+        }
     }
 
     ret = hv_vcpu_set_vtimer_offset(cpu->accel->fd, hvf_state->vtimer_offset);
     assert_hvf_ok(ret);
+
+    if (hvf_native_hcr) {
+        /* Later EL2 setters can replace HCR with the framework's copy. */
+        hvf_access_hcr(cpu, true, native_hcr);
+    }
 
     return 0;
 }
@@ -1293,6 +1487,18 @@ void hvf_arm_set_cpu_features_from_host(ARMCPU *cpu)
 
     cpu->dtb_compatible = arm_host_cpu_features.dtb_compatible;
     cpu->isar = arm_host_cpu_features.isar;
+    if (hvf_virtual_el2) {
+        /* VHE/HCRX are software state; no HVF feature register is changed. */
+        FIELD_DP64_IDREG(&cpu->isar, ID_AA64MMFR1, VH, 1);
+        FIELD_DP64_IDREG(&cpu->isar, ID_AA64MMFR1, HCX, 1);
+        /*
+         * DC ZVA is executed by the virtual platform, not the host CPU.
+         * SPTM's zero loop at 0xfffffff0270a3be4 advances by 64 bytes.
+         * HVF's host feature record leaves DCZID.BS zero; supply the Apple
+         * guest contract for both the emulated operation and DCZID reads.
+         */
+        set_dczid_bs(cpu, 4);
+    }
     cpu->env.features = arm_host_cpu_features.features;
     cpu->midr = arm_host_cpu_features.midr;
     cpu->reset_sctlr = arm_host_cpu_features.reset_sctlr;
@@ -1301,6 +1507,10 @@ void hvf_arm_set_cpu_features_from_host(ARMCPU *cpu)
 
 void hvf_arch_vcpu_destroy(CPUState *cpu)
 {
+    if (hvf_virtual_el2) {
+        hvf_vsh_destroy();
+        migrate_del_blocker(&hvf_virtual_migration_blocker);
+    }
     if (!hvf_irqchip_in_kernel()) {
         timer_free(cpu->accel->wfi_timer);
         cpu->accel->wfi_timer = NULL;
@@ -1331,10 +1541,11 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
     }
     chosen_ipa_bit_size = pa_range;
 
-    if (__builtin_available(macOS 15.0, *)) {
-        if (hvf_nested_virt_enabled()) {
+    if (hvf_nested_virt_enabled()) {
+        if (__builtin_available(macOS 15.0, *)) {
             if (!hvf_arm_el2_supported()) {
                 error_report("Nested virtualization not supported on this system.");
+                ret = HV_UNSUPPORTED;
                 goto cleanup;
             }
             ret = hv_vm_config_set_el2_enabled(config, true);
@@ -1342,6 +1553,10 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
                 error_report("Failed to enable nested virtualization.");
                 goto cleanup;
             }
+        } else {
+            error_report("Guest EL2 requires macOS 15 or newer.");
+            ret = HV_UNSUPPORTED;
+            goto cleanup;
         }
     }
 
@@ -1391,6 +1606,17 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     uint64_t pfr;
     hv_return_t ret;
     int i;
+
+    if (hvf_virtual_el2) {
+        if (CPU_NEXT(first_cpu)) {
+            error_report("Virtual EL2 integration currently requires one CPU");
+            return -EINVAL;
+        }
+#ifdef CONFIG_TCG
+        /* Register callbacks may flush an empty software TLB. */
+        qemu_spin_init(&cpu->neg.tlb.c.lock);
+#endif
+    }
 
     if (__builtin_available(macOS 15.2, *)) {
         if (hvf_arm_sme2_supported()) {
@@ -2379,6 +2605,16 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         break;
     }
     case EC_DATAABORT: {
+        if (hvf_virtual_el2) {
+            cpu_synchronize_state(cpu);
+            error_report("Virtual EL2 native data abort pc=0x%" PRIx64
+                         " ESR=0x%" PRIx64 " IPA=0x%" PRIx64
+                         " VA=0x%" PRIx64,
+                         env->pc, syndrome, excp->physical_address,
+                         excp->virtual_address);
+            ret = EXCP_DEBUG;
+            break;
+        }
         bool isv = FIELD_EX32(syndrome, DABORT_ISS, ISV);
         bool iswrite = FIELD_EX32(syndrome, DABORT_ISS, WNR);
         bool s1ptw = FIELD_EX32(syndrome, DABORT_ISS, S1PTW);
@@ -2403,13 +2639,15 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         /* Handle dirty page logging for ram. */
         if (iswrite) {
             hwaddr xlat;
-            MemoryRegion *mr = address_space_translate(as, ipa, &xlat,
-                                                       NULL, true,
+            uintptr_t page_size = qemu_real_host_page_size();
+            uint64_t ipa_page = QEMU_ALIGN_DOWN(ipa, page_size);
+            hwaddr mapped_len = page_size;
+            MemoryRegion *mr = address_space_translate(as, ipa_page, &xlat,
+                                                       &mapped_len, true,
                                                        MEMTXATTRS_UNSPECIFIED);
-            if (memory_region_is_ram(mr)) {
-                uintptr_t page_size = qemu_real_host_page_size();
-                intptr_t page_mask = -(intptr_t)page_size;
-                uint64_t ipa_page = ipa & page_mask;
+            if (memory_region_is_ram(mr) && mapped_len == page_size &&
+                QEMU_IS_ALIGNED((uintptr_t)memory_region_get_ram_ptr(mr) +
+                                xlat, page_size)) {
 
                 /* TODO: Inject exception to the guest. */
                 assert(!mr->readonly);
@@ -2460,6 +2698,19 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         uint64_t val;
         int sysreg_ret = 0;
 
+        if (hvf_virtual_el2) {
+            uint32_t word = 0xd5000000 | (isread << 21) |
+                (SYSREG_OP0(reg) << 19) | (SYSREG_OP1(reg) << 16) |
+                (SYSREG_CRN(reg) << 12) | (SYSREG_CRM(reg) << 8) |
+                (SYSREG_OP2(reg) << 5) | rt;
+            if (!hvf_virtual_instruction(cpu, word, &advance_pc)) {
+                advance_pc = false;
+                ret = EXCP_DEBUG;
+                break;
+            }
+            break;
+        }
+
         if (isread) {
             sysreg_ret = hvf_sysreg_read(cpu, reg, &val);
             if (!sysreg_ret) {
@@ -2487,6 +2738,13 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_AA64_HVC:
+        if (hvf_virtual_el2) {
+            cpu_synchronize_state(cpu);
+            error_report("Virtual EL2 HVC requires virtual exception delivery "
+                         "at 0x%" PRIx64, env->pc);
+            ret = EXCP_DEBUG;
+            break;
+        }
         cpu_synchronize_state(cpu);
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Do NOT advance $pc for HVC */
@@ -2501,6 +2759,111 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_AA64_SMC:
+        if (hvf_virtual_el2 && (syndrome & 0xffff) == 0xda01) {
+            if (!hvf_vsh_exception(cpu)) {
+                ret = EXCP_DEBUG;
+            }
+            /* Resume the interrupted PC, never advance the private vector. */
+            break;
+        }
+        if (hvf_virtual_el2 && (syndrome & 0xf000) == 0xe000) {
+            unsigned index = syndrome & 0xfff;
+            if (index >= hvf_virtual_word_count ||
+                !hvf_virtual_instruction(cpu, hvf_virtual_words[index],
+                                          &advance_pc)) {
+                advance_pc = false;
+                ret = EXCP_DEBUG;
+                break;
+            }
+            break;
+        }
+        if (hvf_virtual_el2) {
+            cpu_synchronize_state(cpu);
+            error_report("Virtual EL2 unknown SMC at 0x%" PRIx64, env->pc);
+            ret = EXCP_DEBUG;
+            break;
+        }
+        if (g_strcmp0(getenv("QEMU_HVF_PTW_PROBE"), "1") == 0 &&
+            (syndrome & 0xffff) == 0xd300) {
+            if (!hvf_ptw_probe(cpu)) {
+                ret = EXCP_DEBUG;
+                break;
+            }
+            advance_pc = true;
+            break;
+        }
+        /*
+         * Explicit, boot-only Apple compatibility experiment. The companion
+         * native_sptm_patch.py rewrites selected AGTCNTVOFF_EL2 and optional
+         * VBAR_EL1 sites into SMCs. Ordinary instructions still run in HVF.
+         *
+         * Keep the existing model's per-CPU offset readback; this is NOT an
+         * auxiliary timer implementation. No SPRR/GXF operation is accepted.
+         * Do not synchronize unrelated system registers here: the public
+         * HCR_EL2 accessor changes the guest's VHE bits on the tested host.
+         */
+        if (getenv("QEMU_HVF_APPLE_BOOT_COMPAT") &&
+            (syndrome & 0xffc0) == 0xd100) {
+            uint64_t pstate;
+            uint32_t rt = syndrome & 31;
+            bool read = syndrome & 32;
+            const ARMCPRegInfo *ri = get_arm_cp_reginfo(arm_cpu->cp_regs,
+                ENCODE_AA64_CP_REG(3, 1, 15, 9, 4));
+
+            r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &pstate);
+            assert_hvf_ok(r);
+            if (!hvf_nested_virt_enabled() || (pstate & 0xc) != 8 ||
+                !ri || !ri->readfn || !ri->writefn) {
+                error_report("HVF Apple boot adapter: invalid AGTCNTVOFF call");
+                ret = EXCP_DEBUG;
+                break;
+            }
+            if (read) {
+                hvf_set_reg(cpu, rt, ri->readfn(env, ri));
+            } else {
+                uint64_t value = hvf_get_reg(cpu, rt);
+                ri->writefn(env, ri, value);
+                trace_hvf_emu_reginfo_write("Apple boot adapter",
+                                            ri->name, value);
+            }
+            advance_pc = true;
+            break;
+        }
+        if (getenv("QEMU_HVF_APPLE_BOOT_COMPAT") &&
+            (syndrome & 0xffc0) == 0xd200) {
+            uint64_t pstate, hcr, value;
+            uint32_t rt = syndrome & 31;
+            bool read = syndrome & 32;
+            hv_sys_reg_t vbar;
+
+            assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR,
+                                          &pstate));
+            if (!hvf_native_hcr || (pstate & 0xc) != 8) {
+                error_report("HVF VBAR adapter requires native HCR at EL2");
+                ret = EXCP_DEBUG;
+                break;
+            }
+            /*
+             * HVF advertises VH=0. Distinct-bank native_vhe_alias tests show
+             * that EL1 names do not alias EL2 even when guest E2H reads as 1.
+             * Recreate just VBAR's architectural alias for patched accesses;
+             * no page-table or protection operation is bypassed here.
+             */
+            hcr = hvf_access_hcr(cpu, false, 0);
+            vbar = hcr & HCR_E2H ? HV_SYS_REG_VBAR_EL2 : HV_SYS_REG_VBAR_EL1;
+            if (read) {
+                assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, vbar,
+                                                  &value));
+                hvf_set_reg(cpu, rt, value);
+            } else {
+                value = hvf_get_reg(cpu, rt) & ~UINT64_C(0x7ff);
+                assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, vbar,
+                                                  value));
+            }
+            hvf_access_hcr(cpu, true, hcr);
+            advance_pc = true;
+            break;
+        }
         cpu_synchronize_state(cpu);
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
             /* Secure Monitor Call exception, we need to advance $pc */
@@ -2531,6 +2894,8 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         cpu_synchronize_state(cpu);
         trace_hvf_exit(syndrome, ec, env->pc);
         error_report("0x%llx: unhandled exception ec=0x%x", env->pc, ec);
+        /* Preserve the first fault instead of retrying it indefinitely. */
+        ret = EXCP_DEBUG;
     }
 
     /* flush any changed cpu state back to HVF */
@@ -2587,6 +2952,7 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
 {
     int ret;
     hv_return_t r;
+    hv_vcpu_exit_t guest_exit;
 
     if (cpu->halted) {
         if (!cpu_has_work(cpu)) {
@@ -2613,7 +2979,9 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
         bql_lock();
         switch (r) {
         case HV_SUCCESS:
-            ret = hvf_handle_vmexit(cpu, cpu->accel->exit);
+            /* State synchronization can run the native HCR helper. */
+            guest_exit = *cpu->accel->exit;
+            ret = hvf_handle_vmexit(cpu, &guest_exit);
             break;
         case HV_ILLEGAL_GUEST_STATE:
             trace_hvf_illegal_guest_state();
@@ -2692,6 +3060,17 @@ static void hvf_vm_state_change(void *opaque, bool running, RunState state)
 
 int hvf_arch_init(void)
 {
+    if (hvf_virtual_init()) {
+        return -EINVAL;
+    }
+    hvf_native_hcr = g_strcmp0(getenv("QEMU_HVF_NATIVE_HCR"), "1") == 0;
+    if (hvf_native_hcr &&
+        (!hvf_nested_virt_enabled() || chosen_ipa_bit_size < 36 ||
+         hvf_irqchip_in_kernel())) {
+        error_report("HVF native HCR requires nested virtualization and "
+                     "at least 36 IPA bits with kernel-irqchip=off");
+        return -EINVAL;
+    }
     hvf_state->vtimer_offset = mach_absolute_time();
     vmstate_register(NULL, 0, &vmstate_hvf_vtimer, &vtimer);
     qemu_add_vm_change_state_handler(hvf_vm_state_change, &vtimer);
@@ -2878,6 +3257,26 @@ void hvf_arch_update_guest_debug(CPUState *cpu)
     }
 
     cpu_synchronize_state(cpu);
+
+    if (hvf_virtual_el2) {
+        /*
+         * Host debugging must not change the virtual guest MDSCR bank.
+         * SPTM reads that bank during boot; leaking MDE changes its next
+         * architectural write merely because a debugger set a breakpoint.
+         */
+        uint64_t debug = 0;
+        if (cpu_single_stepping(cpu)) {
+            debug |= 1ULL << MDSCR_EL1_SS_SHIFT;
+            pstate_write(env, pstate_read(env) | PSTATE_SS);
+        }
+        if (hvf_arm_hw_debug_active(cpu)) {
+            debug |= 1ULL << MDSCR_EL1_MDE_SHIFT;
+        }
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
+                                          HV_SYS_REG_MDSCR_EL1, debug));
+        hvf_arch_set_traps(cpu);
+        return;
+    }
 
     /* Enable/disable single-stepping */
     if (cpu_single_stepping(cpu)) {

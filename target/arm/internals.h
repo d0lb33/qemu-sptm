@@ -1544,6 +1544,35 @@ typedef struct GetPhysAddrResult {
     int s2prot;
 } GetPhysAddrResult;
 
+/*
+ * Physical descriptor accesses for an accelerator without a TCG soft TLB.
+ * Values are decoded descriptor integers; callbacks apply the descriptor's
+ * byte order. cmpxchg64 returns the value observed before the exchange.
+ * Callbacks must serialize updates against every writer (including DMA), and
+ * may record descriptor dependencies for a shadow mapper. A successful walk
+ * alone does not make caching its result safe: the caller owns invalidation.
+ * These callbacks cover translation descriptors, not RME granule tables.
+ */
+typedef struct ARMPTWMemoryOps {
+    MemTxResult (*read)(void *opaque, hwaddr pa, MemTxAttrs attrs,
+                        unsigned size, bool be, uint64_t *value);
+    MemTxResult (*cmpxchg64)(void *opaque, hwaddr pa, MemTxAttrs attrs,
+                             bool be, uint64_t old, uint64_t new,
+                             uint64_t *observed);
+} ARMPTWMemoryOps;
+
+/*
+ * Normal architectural checks and AF/dirty updates, with explicit descriptor
+ * I/O instead of the TCG soft TLB. This is deliberately not a debug/AT walk.
+ * The two-stage result's lg_page_size retains the TCG invalidation convention;
+ * it is NOT a promise that a shadow mapping of that size is homogeneous.
+ */
+bool get_phys_addr_with_ops(CPUARMState *env, vaddr address,
+                            MMUAccessType access_type, MemOp memop,
+                            ARMMMUIdx mmu_idx, GetPhysAddrResult *result,
+                            ARMMMUFaultInfo *fi, const ARMPTWMemoryOps *ops,
+                            void *opaque);
+
 /**
  * get_phys_addr: get the physical address for a virtual address
  * @env: CPUARMState

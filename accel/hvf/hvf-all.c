@@ -26,6 +26,9 @@ bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
 static bool hvf_kernel_irqchip_override;
+#ifdef HOST_AARCH64
+static uint32_t hvf_ipa_bits;
+#endif
 
 void hvf_nested_virt_enable(bool nested_virt)
 {
@@ -88,16 +91,33 @@ void hvf_unprotect_dirty_range(hwaddr addr, size_t size)
                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 }
 
+static bool hvf_section_bounds(MemoryRegionSection *section,
+                               uint64_t *gpa, uint64_t *size, uint64_t *delta)
+{
+    uint64_t page_size = qemu_real_host_page_size();
+
+    *gpa = section->offset_within_address_space;
+    *size = int128_get64(section->size);
+    *delta = -*gpa & (page_size - 1);
+    if (*size <= *delta) {
+        return false;
+    }
+    *gpa += *delta;
+    *size = QEMU_ALIGN_DOWN(*size - *delta, page_size);
+    return *size != 0;
+}
+
 static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     MemoryRegion *area = section->mr;
-    bool writable = !area->readonly && !area->rom_device;
+    bool writable = !section->readonly && !area->readonly && !area->rom_device;
     hv_memory_flags_t flags;
     uint64_t page_size = qemu_real_host_page_size();
     uint64_t gpa = section->offset_within_address_space;
     uint64_t size = int128_get64(section->size);
     hv_return_t ret;
     void *mem;
+    uint64_t delta;
 
     if (!memory_region_is_ram(area)) {
         if (writable) {
@@ -111,10 +131,14 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
         }
     }
 
-    if (!QEMU_IS_ALIGNED(size, page_size) ||
-        !QEMU_IS_ALIGNED(gpa, page_size)) {
-        /* Not page aligned, so we can not map as RAM */
-        add = false;
+    /*
+     * Only map complete pages owned by this section. Rounding outwards
+     * would expose adjacent MMIO or bypass its permissions. The remaining
+     * bytes stay unmapped and use the normal trapped access path. Apply the
+     * same bounds on removal; HVF rejects unaligned unmap lengths too.
+     */
+    if (!hvf_section_bounds(section, &gpa, &size, &delta)) {
+        return;
     }
 
     if (!add) {
@@ -125,7 +149,12 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     }
 
     flags = HV_MEMORY_READ | HV_MEMORY_EXEC | (writable ? HV_MEMORY_WRITE : 0);
-    mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
+    mem = memory_region_get_ram_ptr(area) +
+          section->offset_within_region + delta;
+    if (!QEMU_IS_ALIGNED((uintptr_t)mem, page_size)) {
+        /* A shifted alias cannot be mapped with this host page granule. */
+        return;
+    }
 
     trace_hvf_vm_map(gpa, size, mem, flags,
                      flags & HV_MEMORY_READ ?  'R' : '-',
@@ -135,13 +164,32 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     assert_hvf_ok(ret);
 }
 
+static void hvf_log_protect(MemoryRegionSection *section, bool writable)
+{
+    uint64_t gpa, size, delta;
+    void *mem;
+
+    if (!hvf_section_bounds(section, &gpa, &size, &delta)) {
+        return;
+    }
+    mem = memory_region_get_ram_ptr(section->mr) +
+          section->offset_within_region + delta;
+    if (!QEMU_IS_ALIGNED((uintptr_t)mem, qemu_real_host_page_size())) {
+        return;
+    }
+    /* Dirty logging must not make a ROM or read-only alias writable. */
+    writable &= !section->readonly && !section->mr->readonly &&
+                !section->mr->rom_device;
+    do_hv_vm_protect(gpa, size, HV_MEMORY_READ | HV_MEMORY_EXEC |
+                    (writable ? HV_MEMORY_WRITE : 0));
+}
+
 static void hvf_log_start(MemoryListener *listener,
                           MemoryRegionSection *section, int old, int new)
 {
     assert(new != 0);
     if (old == 0) {
-        hvf_protect_clean_range(section->offset_within_address_space,
-                                int128_get64(section->size));
+        hvf_log_protect(section, false);
     }
 }
 
@@ -150,8 +198,7 @@ static void hvf_log_stop(MemoryListener *listener,
 {
     assert(old != 0);
     if (new == 0) {
-        hvf_unprotect_dirty_range(section->offset_within_address_space,
-                                  int128_get64(section->size));
+        hvf_log_protect(section, true);
     }
 }
 
@@ -163,8 +210,7 @@ static void hvf_log_clear(MemoryListener *listener,
      * Some number of those pages may have been dirtied and
      * the write permission enabled.  Reset the range read-only.
      */
-    hvf_protect_clean_range(section->offset_within_address_space,
-                            int128_get64(section->size));
+    hvf_log_protect(section, false);
 }
 
 static void hvf_region_add(MemoryListener *listener,
@@ -204,6 +250,18 @@ static int hvf_accel_init(AccelState *as, MachineState *ms)
             return -EINVAL;
         }
     }
+#ifdef HOST_AARCH64
+    if (hvf_ipa_bits) {
+        if (hvf_ipa_bits < pa_range ||
+            hvf_ipa_bits > hvf_arch_get_max_ipa_bit_size()) {
+            error_report("HVF IPA bits %u outside machine/host range %d..%u",
+                         hvf_ipa_bits, pa_range,
+                         hvf_arch_get_max_ipa_bit_size());
+            return -EINVAL;
+        }
+        pa_range = hvf_ipa_bits;
+    }
+#endif
 
     if (mc->get_kernel_irqchip_default) {
         bool kernel_irqchip_default = mc->get_kernel_irqchip_default(ms);
@@ -217,6 +275,10 @@ static int hvf_accel_init(AccelState *as, MachineState *ms)
         error_report("Could not access HVF. Is the executable signed"
                      " with com.apple.security.hypervisor entitlement?");
         exit(1);
+    }
+    if (ret == HV_UNSUPPORTED) {
+        error_report("Requested HVF configuration is unsupported");
+        return -ENOTSUP;
     }
     assert_hvf_ok(ret);
 
@@ -269,12 +331,51 @@ static void hvf_set_kernel_irqchip(Object *obj, Visitor *v,
     }
 }
 
+#ifdef HOST_AARCH64
+static void hvf_get_ipa_bits(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &hvf_ipa_bits, errp);
+}
+
+static void hvf_set_ipa_bits(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &hvf_ipa_bits, errp);
+}
+
+static bool hvf_get_nested_virt(Object *obj, Error **errp)
+{
+    return hvf_nested_virt;
+}
+
+static void hvf_set_nested_virt(Object *obj, bool value, Error **errp)
+{
+    /*
+     * Non-virt machines also need to select EL2 before HVF creates the VM
+     * and queries host CPU features. The architecture backend checks actual
+     * host support; this does not imply Apple guest extensions are emulated.
+     */
+    hvf_nested_virt_enable(value);
+}
+#endif
+
 static void hvf_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
     ac->name = "HVF";
     ac->init_machine = hvf_accel_init;
     ac->allowed = &hvf_allowed;
+#ifdef HOST_AARCH64
+    object_class_property_add(oc, "ipa-bits", "uint32", hvf_get_ipa_bits,
+                              hvf_set_ipa_bits, NULL, NULL);
+    object_class_property_set_description(oc, "ipa-bits",
+        "Guest physical address bits (0 selects the machine default)");
+    object_class_property_add_bool(oc, "nested-virt",
+                                   hvf_get_nested_virt, hvf_set_nested_virt);
+    object_class_property_set_description(oc, "nested-virt",
+        "Enable guest EL2 on a supported Apple Silicon host");
+#endif
     hvf_kernel_irqchip_override = false;
     hvf_kernel_irqchip = false;
     object_class_property_add(oc, "kernel-irqchip", "on|off|split",
