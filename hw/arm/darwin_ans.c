@@ -161,6 +161,7 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "migration/vmstate.h"
+#include "migration/blocker.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
 #include "hw/core/sysbus.h"
@@ -326,6 +327,15 @@ struct DarwinANSState {
     /* properties */
     char *name;
     BlockBackend *blk;
+    /* Opt-in synthetic auxiliary namespace, separate from migrated storage.
+     * Uses existing NVMe Identify/Read/Write semantics (NVMe 1.4, sections
+     * 5.15 and 6.1); it is not a claim about an extra physical Apple device.
+     * Guest namespace enumeration/access must be established by a probe.
+     */
+    BlockBackend *aux_blk;
+    uint32_t aux_nsid;
+    bool aux_readonly;
+    Error *aux_migration_blocker;
     uint32_t nvmmu_size, nvme_size;
     uint32_t queue_entries;     /* "nvme-queue-entries" */
     uint32_t mqes;              /* CAP.MQES; 0 = same as queue_entries */
@@ -630,12 +640,21 @@ static void ans_str_pad(uint8_t *dst, size_t n, const char *src)
     }
 }
 
-static int64_t ans_nsze(DarwinANSState *s)
+static BlockBackend *ans_namespace(DarwinANSState *s, uint32_t nsid)
 {
-    if (!s->blk) {
+    if (nsid == s->nsid) {
+        return s->blk;
+    }
+    return nsid == s->aux_nsid ? s->aux_blk : NULL;
+}
+
+static int64_t ans_nsze(DarwinANSState *s, uint32_t nsid)
+{
+    BlockBackend *blk = ans_namespace(s, nsid);
+    if (!blk) {
         return 0;
     }
-    int64_t bytes = blk_getlength(s->blk);
+    int64_t bytes = blk_getlength(blk);
     if (bytes < 0) {
         return 0;
     }
@@ -664,7 +683,7 @@ static void ans_identify_ctrl(DarwinANSState *s, uint8_t *buf)
     buf[0x200] = 0x66;                      /* SQES: 64 bytes min and max */
     buf[0x201] = 0x44;                      /* CQES: 16 bytes min and max */
     stw_le_p(buf + 0x202, s->queue_entries);/* MAXCMD */
-    stl_le_p(buf + 0x204, 1);               /* NN: one namespace */
+    stl_le_p(buf + 0x204, s->aux_blk ? MAX(s->nsid, s->aux_nsid) : 1);
     /* ONCS: DSM (bit 2) and Write Zeroes (bit 3). APFS trims. */
     stw_le_p(buf + 0x208, BIT(2) | BIT(3));
     buf[0x20c] = 0;                         /* FNA */
@@ -677,12 +696,12 @@ static void ans_identify_ctrl(DarwinANSState *s, uint8_t *buf)
 static void ans_identify_ns(DarwinANSState *s, uint32_t nsid, uint8_t *buf)
 {
     memset(buf, 0, ANS_IDENTIFY_SIZE);
-    if (nsid != s->nsid || !s->blk) {
+    if (!ans_namespace(s, nsid)) {
         /* NVMe 1.4 6.1.5: an inactive NSID returns all zeroes, which is how
          * the driver learns the namespace is not there. */
         return;
     }
-    int64_t nsze = ans_nsze(s);
+    int64_t nsze = ans_nsze(s, nsid);
     stq_le_p(buf + 0x00, nsze);             /* NSZE */
     stq_le_p(buf + 0x08, nsze);             /* NCAP */
     stq_le_p(buf + 0x10, nsze);             /* NUSE */
@@ -694,6 +713,13 @@ static void ans_identify_ns(DarwinANSState *s, uint32_t nsid, uint8_t *buf)
     buf[0x1d] = 0;                          /* DPS */
     /* LBAF0: MS=0, LBADS=log2(lba_size), RP=0 */
     stl_le_p(buf + 0x80, (uint32_t)ctz32(s->lba_size) << 16);
+    if (s->aux_blk && nsid == s->aux_nsid) {
+        /* 24A5430a DetermineNamespaces, bootkc 0xfffffff00a104c54,
+         * reads this vendor byte; AllocateNodes at 0xa104330..340 skips
+         * type zero. Type 8 is our synthetic, distinct non-root namespace
+         * (matching the opt-in DT tuple), not a physical T8140 claim. */
+        buf[0x180] = 8;
+    }
 }
 
 /* ---------------- command execution ---------------- */
@@ -724,17 +750,31 @@ static uint16_t ans_admin_identify(DarwinANSState *s, const ANSCmd *c, uint32_t 
     switch (cns) {
     case 0x00:  /* Identify Namespace */
         ans_identify_ns(s, c->nsid, buf);
-        if (c->nsid != s->nsid) {
-            ans_log(s, "Identify Namespace for nsid %u, which we do not back "
-                    "(only nsid %u has a block device) -- returning inactive\n",
-                    c->nsid, s->nsid);
+        if (!ans_namespace(s, c->nsid)) {
+            ans_log(s, "Identify Namespace for unbacked nsid %u "
+                    "-- returning inactive\n", c->nsid);
         }
         break;
     case 0x01:  /* Identify Controller */
         ans_identify_ctrl(s, buf);
         break;
     case 0x02:  /* Active Namespace ID list */
-        stl_le_p(buf, s->blk ? s->nsid : 0);
+        /* Cursor is exclusive; same contract as hw/nvme/ctrl.c's active
+         * namespace list. Aux NSID is required to exceed the root NSID. */
+        if (s->aux_blk) {
+            if (c->nsid >= UINT32_MAX - 1) {
+                return NVME_SC_INVALID_NS;
+            }
+            unsigned next = 0;
+            if (s->blk && c->nsid < s->nsid) {
+                stl_le_p(buf + 4 * next++, s->nsid);
+            }
+            if (c->nsid < s->aux_nsid) {
+                stl_le_p(buf + 4 * next, s->aux_nsid);
+            }
+        } else {
+            stl_le_p(buf, s->blk ? s->nsid : 0);
+        }
         break;
     case 0x03: {
         /* Namespace Identification Descriptor list. One descriptor: NIDT 3
@@ -743,7 +783,10 @@ static uint16_t ans_admin_identify(DarwinANSState *s, const ANSCmd *c, uint32_t 
         buf[0] = 0x02;          /* NIDT = NGUID */
         buf[1] = 0x10;          /* NIDL = 16 */
         buf[4] = 0x00; buf[5] = 0x00; buf[6] = 0x10; buf[7] = 0x6b;
-        stl_be_p(buf + 4 + 12, s->nsid);
+        if (s->aux_blk && !ans_namespace(s, c->nsid)) {
+            return NVME_SC_INVALID_NS;
+        }
+        stl_be_p(buf + 4 + 12, s->aux_blk ? c->nsid : s->nsid);
         break;
     }
     default:
@@ -915,10 +958,21 @@ static uint16_t ans_admin(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
 static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
 {
     *result = 0;
+    BlockBackend *blk = ans_namespace(s, c->nsid);
+    bool readonly = c->nsid == s->aux_nsid && s->aux_blk ?
+                    s->aux_readonly : s->blk_readonly;
+
+    if (s->aux_blk && !blk) {
+        return NVME_SC_INVALID_NS;
+    }
 
     if (c->opcode == NVME_IO_FLUSH) {
-        if (s->blk && !s->blk_readonly) {
-            blk_flush(s->blk);
+        BlockBackend *flush_blk = s->aux_blk ? blk : s->blk;
+        if (flush_blk && !readonly) {
+            int ret = blk_flush(flush_blk);
+            if (s->aux_blk && ret < 0) {
+                return NVME_SC_DATA_XFER_ERR;
+            }
         }
         return NVME_SC_SUCCESS;
     }
@@ -940,7 +994,7 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
         return NVME_SC_INVALID_OPCODE;
     }
 
-    if ((is_write || is_wz) && s->blk_readonly) {
+    if ((is_write || is_wz) && readonly) {
         /*
          * The NVMe status for this is "Attempted Write to Read Only Range",
          * but the sources here disagree on its encoding and we have never seen
@@ -952,12 +1006,12 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
         return NVME_SC_INTERNAL;
     }
 
-    if (!s->blk) {
+    if (!s->blk && !blk) {
         ans_log(s, "io opcode 0x%02x with no block backend attached; "
                 "pass -drive if=none,id=ans,file=...\n", c->opcode);
         return NVME_SC_INTERNAL;
     }
-    if (c->nsid != s->nsid) {
+    if (!blk) {
         return NVME_SC_INVALID_NS;
     }
 
@@ -965,16 +1019,17 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
     uint32_t nlb = (c->cdw12 & 0xffff) + 1;
     uint64_t off = slba * s->lba_size;
     uint64_t len = (uint64_t)nlb * s->lba_size;
-    int64_t total = blk_getlength(s->blk);
+    int64_t total = blk_getlength(blk);
 
-    if (total < 0 || (int64_t)(off + len) > total) {
+    if (slba > UINT64_MAX / s->lba_size || total < 0 ||
+        off > (uint64_t)total || len > (uint64_t)total - off) {
         ans_log(s, "LBA range: slba %" PRIu64 " nlb %u runs past the %" PRId64
                 "-byte backing image\n", slba, nlb, total);
         return NVME_SC_LBA_RANGE;
     }
 
     if (is_wz) {
-        if (blk_pwrite_zeroes(s->blk, off, len, 0) < 0) {
+        if (blk_pwrite_zeroes(blk, off, len, 0) < 0) {
             return NVME_SC_DATA_XFER_ERR;
         }
         s->n_write_blocks += nlb;
@@ -983,7 +1038,7 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
 
     g_autofree uint8_t *buf = g_malloc(len);
     if (is_read) {
-        if (blk_pread(s->blk, off, len, buf, 0) < 0) {
+        if (blk_pread(blk, off, len, buf, 0) < 0) {
             ans_log(s, "host read of 0x%" PRIx64 "+0x%" PRIx64 " failed\n", off, len);
             return NVME_SC_DATA_XFER_ERR;
         }
@@ -995,7 +1050,7 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
         if (!ans_prp_rw(s, c->prp1, c->prp2, buf, len, false)) {
             return NVME_SC_DATA_XFER_ERR;
         }
-        if (blk_pwrite(s->blk, off, len, buf, 0) < 0) {
+        if (blk_pwrite(blk, off, len, buf, 0) < 0) {
             ans_log(s, "host write of 0x%" PRIx64 "+0x%" PRIx64 " failed\n", off, len);
             return NVME_SC_DATA_XFER_ERR;
         }
@@ -1776,6 +1831,29 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    if (s->aux_blk) {
+        if (!s->blk || blk_bs(s->aux_blk) == blk_bs(s->blk) ||
+            s->aux_nsid <= s->nsid ||
+            s->aux_nsid == UINT32_MAX || blk_getlength(s->aux_blk) <= 0 ||
+            blk_getlength(s->aux_blk) % s->lba_size) {
+            error_setg(errp, "ANS auxiliary namespace needs a distinct, nonempty aligned backend and NSID above root");
+            return;
+        }
+        s->aux_readonly = !blk_supports_write_perm(s->aux_blk);
+        uint64_t perm = BLK_PERM_CONSISTENT_READ |
+                        (s->aux_readonly ? 0 : BLK_PERM_WRITE);
+        if (blk_set_perm(s->aux_blk, perm, BLK_PERM_ALL, errp) < 0) {
+            return;
+        }
+        error_setg(&s->aux_migration_blocker,
+                   "ANS auxiliary transport state has no checkpoint contract yet");
+        if (migrate_add_blocker(&s->aux_migration_blocker, errp) < 0) {
+            return;
+        }
+        ans_log(s, "AUX namespace=%u bytes=%" PRId64 " readonly=%u migration=blocked\n",
+                s->aux_nsid, blk_getlength(s->aux_blk), s->aux_readonly);
+    }
+
     s->nvmmu_store = g_new0(uint32_t, s->nvmmu_size / 4);
     s->nvme_store = g_new0(uint32_t, s->nvme_size / 4);
 
@@ -1878,10 +1956,24 @@ static int darwin_ans_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static int darwin_ans_pre_load(void *opaque)
+{
+    DarwinANSState *s = opaque;
+    /* Outgoing migration is blocked at realize. Reject an old/non-aux stream
+     * loaded into an aux-configured destination too: neither the external
+     * mailbox nor its peer/session is represented in this VMState. */
+    if (s->aux_blk) {
+        error_report("ANS auxiliary transport cannot restore checkpoint state");
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_darwin_ans = {
     .name = TYPE_DARWIN_ANS,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = darwin_ans_pre_load,
     .post_load = darwin_ans_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_EQUAL(nvmmu_size, DarwinANSState),
@@ -1968,6 +2060,8 @@ static const VMStateDescription vmstate_darwin_ans = {
 static const Property darwin_ans_properties[] = {
     DEFINE_PROP_STRING("name", DarwinANSState, name),
     DEFINE_PROP_DRIVE("drive", DarwinANSState, blk),
+    DEFINE_PROP_DRIVE("aux-drive", DarwinANSState, aux_blk),
+    DEFINE_PROP_UINT32("aux-nsid", DarwinANSState, aux_nsid, 6),
     DEFINE_PROP_UINT32("nvmmu-size", DarwinANSState, nvmmu_size, 0),
     DEFINE_PROP_UINT32("nvme-size", DarwinANSState, nvme_size, 0),
     /* "nvme-queue-entries" from the device tree; 0x40 on t8140. */
@@ -2023,10 +2117,17 @@ static const Property darwin_ans_properties[] = {
     DEFINE_PROP_STRING("model", DarwinANSState, model),
 };
 
+static void darwin_ans_unrealize(DeviceState *dev)
+{
+    DarwinANSState *s = DARWIN_ANS(dev);
+    migrate_del_blocker(&s->aux_migration_blocker);
+}
+
 static void darwin_ans_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = darwin_ans_realize;
+    dc->unrealize = darwin_ans_unrealize;
     dc->vmsd = &vmstate_darwin_ans;
     dc->desc = "Apple ANS NVMe storage controller";
     device_class_set_props(dc, darwin_ans_properties);
@@ -2299,6 +2400,16 @@ DeviceState *darwin_ans_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     BlockBackend *blk = ans_find_drive();
     if (blk) {
         qdev_prop_set_drive_err(dev, "drive", blk, &error_fatal);
+    }
+    /* Explicit experiment-only backend: never fall back to the root drive. */
+    const char *aux_id = getenv("DARWIN_ANS_AUX_DRIVE");
+    if (aux_id) {
+        BlockBackend *aux = blk_by_name(aux_id);
+        if (!aux) {
+            error_report("ANS auxiliary backend '%s' does not exist", aux_id);
+            exit(EXIT_FAILURE);
+        }
+        qdev_prop_set_drive_err(dev, "aux-drive", aux, &error_fatal);
     }
 
     /*
