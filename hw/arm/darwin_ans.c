@@ -336,7 +336,8 @@ struct DarwinANSState {
     uint32_t aux_nsid;
     bool aux_readonly;
     /* Host-only diagnostic counters; auxiliary mode already blocks migration.
-     * Trace only the first eight decoded auxiliary I/O commands, never root I/O. */
+     * Trace only the first eight auxiliary one-block reads at LBA0;
+     * namespace discovery otherwise consumes the limit with earlier1MiB reads. */
     bool aux_trace, aux_trace_head_pending;
     unsigned aux_trace_count;
     uint16_t aux_trace_cid;
@@ -1056,7 +1057,8 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
     }
 
     bool trace = s->aux_trace && s->aux_blk && c->nsid == s->aux_nsid &&
-                 s->aux_trace_count <= 8;
+                 c->opcode == NVME_IO_READ && c->cdw10 == 0 && c->cdw11 == 0 &&
+                 (c->cdw12 & 0xffff) == 0 && s->aux_trace_count <= 8;
     g_autofree uint8_t *buf = g_malloc(len);
     if (is_read) {
         if (trace) {
@@ -1186,7 +1188,9 @@ static void ans_submit(DarwinANSState *s, bool admin, uint32_t tag)
     ANSCmd c;
     ans_decode_cmd(raw, &c);
     bool aux_trace = !admin && s->aux_trace && s->aux_blk &&
-                     c.nsid == s->aux_nsid && ++s->aux_trace_count <= 8;
+                     c.nsid == s->aux_nsid && c.opcode == NVME_IO_READ &&
+                     c.cdw10 == 0 && c.cdw11 == 0 && (c.cdw12 & 0xffff) == 0 &&
+                     ++s->aux_trace_count <= 8;
     if (aux_trace) {
         ans_log(s, "AUXTRACE stage=submit tag=%u cid=%u nsid=%u opcode=%u lba=%" PRIu64 " nlb=%u prp1=%" PRIx64 " prp2=%" PRIx64 " host_ns=%" PRId64 "\n",
                 tag, c.cid, c.nsid, c.opcode,
