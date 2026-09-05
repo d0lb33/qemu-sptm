@@ -335,6 +335,11 @@ struct DarwinANSState {
     BlockBackend *aux_blk;
     uint32_t aux_nsid;
     bool aux_readonly;
+    /* Host-only diagnostic counters; auxiliary mode already blocks migration.
+     * Trace only the first eight decoded auxiliary I/O commands, never root I/O. */
+    bool aux_trace, aux_trace_head_pending;
+    unsigned aux_trace_count;
+    uint16_t aux_trace_cid;
     Error *aux_migration_blocker;
     uint32_t nvmmu_size, nvme_size;
     uint32_t queue_entries;     /* "nvme-queue-entries" */
@@ -584,7 +589,7 @@ static uint32_t ans_asq_entries(DarwinANSState *s) { return s->aqa & 0xfff; }
 static uint32_t ans_acq_entries(DarwinANSState *s) { return (s->aqa >> 16) & 0xfff; }
 
 static void ans_post_cqe(DarwinANSState *s, bool admin, uint16_t cid,
-                         uint16_t status, uint32_t result)
+                         uint16_t status, uint32_t result, bool aux_trace)
 {
     uint64_t base = admin ? s->acq : s->iocq_addr;
     uint32_t size = admin ? ans_acq_entries(s) : s->iocq_size;
@@ -610,7 +615,15 @@ static void ans_post_cqe(DarwinANSState *s, bool admin, uint16_t cid,
     stw_le_p(cqe + 14, (uint16_t)((status << 1) | (*phase ? 1 : 0)));
 
     uint64_t slot = base + (uint64_t)(*tail) * ANS_CQE_SIZE;
-    ans_dma(s, slot, cqe, sizeof(cqe), true, admin ? "admin cqe" : "io cqe");
+    bool dma_ok = ans_dma(s, slot, cqe, sizeof(cqe), true,
+                          admin ? "admin cqe" : "io cqe");
+    if (aux_trace) {
+        ans_log(s, "AUXTRACE stage=cqe cid=%u status=%u slot=%u phase=%u dma_ok=%u host_ns=%" PRId64 "\n",
+                cid, status, *tail, *phase, dma_ok,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        s->aux_trace_head_pending = true;
+        s->aux_trace_cid = cid;
+    }
 
     if (s->debug > 1) {
         ans_hexdump(s, admin ? "admin CQE" : "io CQE", cqe, sizeof(cqe));
@@ -626,6 +639,12 @@ static void ans_post_cqe(DarwinANSState *s, bool admin, uint16_t cid,
         *phase = !*phase;
     }
     ans_update_irq(s);
+    if (aux_trace) {
+        ans_log(s, "AUXTRACE stage=irq cid=%u head=%u tail=%u pending=%u masked=%u host_ns=%" PRId64 "\n",
+                cid, s->iocq_head, s->iocq_tail,
+                (s->acq_tail != s->acq_head) || (s->iocq_tail != s->iocq_head),
+                !!(s->intms & BIT(0)), qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+    }
 }
 
 /* ---------------- identify data ---------------- */
@@ -1036,13 +1055,29 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
         return NVME_SC_SUCCESS;
     }
 
+    bool trace = s->aux_trace && s->aux_blk && c->nsid == s->aux_nsid &&
+                 s->aux_trace_count <= 8;
     g_autofree uint8_t *buf = g_malloc(len);
     if (is_read) {
-        if (blk_pread(blk, off, len, buf, 0) < 0) {
+        if (trace) {
+            ans_log(s, "AUXTRACE stage=backend_enter cid=%u off=%" PRIu64 " bytes=%" PRIu64 " host_ns=%" PRId64 "\n",
+                    c->cid, off, len, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        }
+        int ret = blk_pread(blk, off, len, buf, 0);
+        if (trace) {
+            ans_log(s, "AUXTRACE stage=backend_return cid=%u ret=%d host_ns=%" PRId64 "\n",
+                    c->cid, ret, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        }
+        if (ret < 0) {
             ans_log(s, "host read of 0x%" PRIx64 "+0x%" PRIx64 " failed\n", off, len);
             return NVME_SC_DATA_XFER_ERR;
         }
-        if (!ans_prp_rw(s, c->prp1, c->prp2, buf, len, true)) {
+        bool dma_ok = ans_prp_rw(s, c->prp1, c->prp2, buf, len, true);
+        if (trace) {
+            ans_log(s, "AUXTRACE stage=data_dma cid=%u ok=%u host_ns=%" PRId64 "\n",
+                    c->cid, dma_ok, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        }
+        if (!dma_ok) {
             return NVME_SC_DATA_XFER_ERR;
         }
         s->n_read_blocks += nlb;
@@ -1150,6 +1185,14 @@ static void ans_submit(DarwinANSState *s, bool admin, uint32_t tag)
 
     ANSCmd c;
     ans_decode_cmd(raw, &c);
+    bool aux_trace = !admin && s->aux_trace && s->aux_blk &&
+                     c.nsid == s->aux_nsid && ++s->aux_trace_count <= 8;
+    if (aux_trace) {
+        ans_log(s, "AUXTRACE stage=submit tag=%u cid=%u nsid=%u opcode=%u lba=%" PRIu64 " nlb=%u prp1=%" PRIx64 " prp2=%" PRIx64 " host_ns=%" PRId64 "\n",
+                tag, c.cid, c.nsid, c.opcode,
+                ((uint64_t)c.cdw11 << 32) | c.cdw10, (c.cdw12 & 0xffff) + 1,
+                c.prp1, c.prp2, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+    }
 
     if (s->debug) {
         ans_log(s, "%s tag %u -> opcode 0x%02x cid %u nsid %u "
@@ -1177,7 +1220,7 @@ static void ans_submit(DarwinANSState *s, bool admin, uint32_t tag)
         s->n_io++;
         status = ans_io(s, &c, &result);
     }
-    ans_post_cqe(s, admin, c.cid, status, result);
+    ans_post_cqe(s, admin, c.cid, status, result, aux_trace);
 }
 
 /* ---------------- controller enable / disable ---------------- */
@@ -1466,6 +1509,13 @@ static void ans_write_block(DarwinANSState *s, ANSBlock blk, hwaddr reg,
             ans_update_irq(s);
             return;
         case ANS_IOCQ_DB:
+            if (s->aux_trace_head_pending) {
+                /* First subsequent head write, not proof of user-call return. */
+                ans_log(s, "AUXTRACE stage=head_write cid=%u old=%u new=%u tail=%u host_ns=%" PRId64 "\n",
+                        s->aux_trace_cid, s->iocq_head, (uint32_t)val,
+                        s->iocq_tail, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+                s->aux_trace_head_pending = false;
+            }
             s->iocq_head = (uint32_t)val;
             ans_update_irq(s);
             return;
@@ -1772,6 +1822,7 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
     const char *d = getenv("DARWIN_ANS_DEBUG");
     s->debug = d ? (atoi(d) ? atoi(d) : 1) : 0;
     s->profile = getenv("DARWIN_ANS_PROFILE") != NULL;
+    s->aux_trace = getenv("DARWIN_ANS_AUX_TRACE") != NULL;
     s->profile_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     s->profile_last_ns = s->profile_start_ns;
     const char *env = getenv("DARWIN_ANS_SQE_STRIDE");
