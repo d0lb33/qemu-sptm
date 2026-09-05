@@ -507,7 +507,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * for class 1 at
  * /tmp/dvm/probe/ROOT_SKS_OP09_CLASS17_UI2.stderr.log:138895; its rejection
  * alone starts the selector 10/7 timeout sequence at serial lines 1330-1331.
- * Accept only these five observed protection classes while keeping every
+ * Accept these five observed protection classes while keeping every
  * other invariant strict.  ROOT_SKS_LATE_HOST2 later emitted a 0x94-byte
  * form after two successful tagged User-volume migrations.  Its live OOL
  * page contains the same fields followed by a 40-byte wrapped record and
@@ -515,6 +515,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
  * serial line 2054.  The request was recovered from DART-translated DVA
  * 0x1000004c000 at PA 0x1001a478000 after the panic, rather than inferred
  * from an absent breakpoint.
+ * DISPLAY_SMP6_WARM2 cold-boots a completed-migration disk and adds a sixth
+ * observed class, 13, only in the 108-byte empty-record shape. Its endpoint-18
+ * request at DVA 0x1000000c000 (PA 0x1001a3d8000) has class at +0x60,
+ * zero record length at +0x64 and selector 2 at +0x68. Rejecting this request
+ * at stderr line 5782 leaves SKS and preference services waiting. The exact
+ * capture and malformed variants are covered by test-darwin-sks-migrate.
  *
  * The selector-2 codec at 0xfffffff0095619e8..0x9561a4c calls the blob helper
  * at 0xfffffff00957f830 three times, then the scalar helper at

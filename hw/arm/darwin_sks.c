@@ -248,6 +248,17 @@ bool darwin_sks_parse_unwrap_file_key_request(
         result.protection_class = sks_ldl_le(request + SKS_UNWRAP_CLASS_OFF);
     }
 
+    /* Decode selectors even on rejection, so diagnostics report the wire
+     * value rather than an uninitialized zero. Both offsets require an exact
+     * known size before being read. */
+    if (request_size == SKS_UNWRAP_SHORT_REQUEST_SIZE) {
+        result.output_selector = sks_ldl_le(
+            request + SKS_UNWRAP_SHORT_OUTPUT_SELECTOR_OFF);
+    } else if (request_size == SKS_UNWRAP_LONG_REQUEST_SIZE) {
+        result.output_selector = sks_ldl_le(
+            request + SKS_UNWRAP_LONG_OUTPUT_SELECTOR_OFF);
+    }
+
     common = request_size >= SKS_UNWRAP_CLASS_OFF + sizeof(uint32_t) &&
         result.header_body_size == SKS_IPC_V1_HEADER_BODY_SIZE &&
         result.ipc_version == SKS_IPC_VERSION_1 &&
@@ -258,7 +269,12 @@ bool darwin_sks_parse_unwrap_file_key_request(
         sks_ldl_le(request + SKS_UNWRAP_FIXED_ZERO1_OFF) == 0 &&
         (result.protection_class == 1 || result.protection_class == 2 ||
          result.protection_class == 3 || result.protection_class == 4 ||
-         result.protection_class == 17);
+         result.protection_class == 17 ||
+         /* DISPLAY_SMP6_WARM2: endpoint-18 DVA 0x1000000c000,
+          * PA 0x1001a3d8000, class 13 at +0x60; only the empty-record
+          * 108-byte form has been captured for this class. */
+         (result.protection_class == 13 &&
+          request_size == SKS_UNWRAP_SHORT_REQUEST_SIZE));
 
     if (common && request_size == SKS_UNWRAP_SHORT_REQUEST_SIZE &&
         sks_ldl_le(request + SKS_UNWRAP_RECORD_LEN_OFF) == 0) {

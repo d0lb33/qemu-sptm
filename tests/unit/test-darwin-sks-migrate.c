@@ -228,6 +228,73 @@ static void reject_truncation(void)
         captured_data_request, sizeof(captured_data_request) - 1, &parsed));
 }
 
+/* Exact WARM2 endpoint-18 empty-record request: DVA 0x1000000c000,
+ * translated PA 0x1001a3d8000. */
+static const uint8_t captured_unwrap_class13[] = {
+    0x48, 0x00, 0x00, 0x00, 0x35, 0x23, 0x6d, 0x69,
+    0xd9, 0x6a, 0x54, 0xac, 0xa9, 0xa7, 0x61, 0xa3,
+    0x09, 0x94, 0x71, 0xf6, 0x01, 0x00, 0x00, 0x00,
+    0xe1, 0x1e, 0x55, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x71, 0xdc, 0xbe, 0xd8, 0x4c, 0x82, 0x16, 0x78,
+    0x11, 0x27, 0xdd, 0xbc, 0x00, 0x19, 0x9f, 0xd4,
+    0x08, 0xb1, 0x00, 0x36, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00,
+};
+
+static void parse_unwrap_class13(void)
+{
+    DarwinSKSUnwrapFileKeyRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, captured_unwrap_class13,
+        sizeof(captured_unwrap_class13));
+    g_assert_cmpstr(digest, ==,
+        "20a77bfcf92a0288cb13070e23d9fbc8609320b8fc0037389329131aa1da8054");
+    g_assert_true(darwin_sks_parse_unwrap_file_key_request(
+        captured_unwrap_class13, sizeof(captured_unwrap_class13), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_UNWRAP_FILE_KEY_EMPTY_RECORD);
+    g_assert_cmpuint(parsed.protection_class, ==, 13);
+    g_assert_cmpuint(parsed.output_selector, ==, 2);
+    g_assert_cmpuint(parsed.record_len, ==, 0);
+}
+
+static void reject_unwrap_class13_malformed(void)
+{
+    static const size_t offsets[] = {
+        0x00, 0x14, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68,
+    };
+    uint8_t request[sizeof(captured_unwrap_request)];
+    DarwinSKSUnwrapFileKeyRequest parsed;
+
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        memcpy(request, captured_unwrap_class13, sizeof(captured_unwrap_class13));
+        request[offsets[i]] ^= 1;
+        g_assert_false(darwin_sks_parse_unwrap_file_key_request(
+            request, sizeof(captured_unwrap_class13), &parsed));
+        if (offsets[i] != 0x68) {
+            g_assert_cmpuint(parsed.output_selector, ==, 2);
+        }
+    }
+    memset(request, 0, sizeof(request));
+    memcpy(request, captured_unwrap_class13, sizeof(captured_unwrap_class13));
+    for (size_t size = 0; size <= sizeof(captured_unwrap_class13) + 1; size++) {
+        if (size != sizeof(captured_unwrap_class13)) {
+            g_assert_false(darwin_sks_parse_unwrap_file_key_request(
+                request, size, &parsed));
+        }
+    }
+    /* No class-13 wrapped-record request has been observed. */
+    memcpy(request, captured_unwrap_request, sizeof(request));
+    stl_le_p(request + 0x60, 13);
+    g_assert_false(darwin_sks_parse_unwrap_file_key_request(
+        request, sizeof(request), &parsed));
+}
+
 static void parse_captured_unwrap(void)
 {
     g_autofree char *digest = g_compute_checksum_for_data(
@@ -509,6 +576,8 @@ static void reject_corrupt_data_2_to_3(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/unwrap/class13", parse_unwrap_class13);
+    g_test_add_func("/darwin-sks/unwrap/reject-class13-malformed", reject_unwrap_class13_malformed);
     g_test_add_func("/darwin-sks/migrate/data-2-to-3", parse_captured_data_2_to_3);
     g_test_add_func("/darwin-sks/migrate/reject-data-2-to-3", reject_corrupt_data_2_to_3);
     g_test_add_func("/darwin-sks/migrate/user-4-to-3", parse_captured_user_4_to_3);
