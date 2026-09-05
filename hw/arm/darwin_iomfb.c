@@ -222,6 +222,7 @@
 #define IOMFB_AP_REQ_BASE 0x00000u      /* str x16,[x17,#8]  @ 0xa0cf664 */
 #define IOMFB_CB_TX_BASE  0x20000u      /* str x13,[x17,#8]  @ 0xa0cf6a0 */
 #define IOMFB_CB_REQ_BASE 0x40000u      /* str x15,[x17,#0x18] @ 0xa0cf6cc */
+#define IOMFB_AP_RX_BASE  0x60000u      /* str x0,[x17,#0x18] @ 0xa0cf67c */
 
 /* At most 64 sparse rows (1024 input bytes) are printed per unique request. */
 #define IOMFB_TRACE_ROW_BYTES 16u
@@ -312,6 +313,9 @@ struct DarwinIOMFB {
     uint32_t swap_ids[IOMFB_SWAP_QUEUE_SIZE];
     uint32_t swap_head, swap_count;
     bool swap_active, swap_failed;
+    /* A408 remains outstanding until its same-slot D594 returns. */
+    bool swap_nested[IOMFB_TAGS];
+    uint32_t swap_nested_ids[IOMFB_TAGS];
 };
 
 static int darwin_iomfb_post_load(void *opaque, int version_id)
@@ -364,6 +368,38 @@ static const VMStateDescription vmstate_iomfb_swap = {
     },
 };
 
+static bool iomfb_nested_state_needed(void *opaque)
+{
+    DarwinIOMFB *m = opaque;
+    for (unsigned t = 0; t < IOMFB_TAGS; t++) {
+        if (m->swap_nested[t]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int iomfb_nested_post_load(void *opaque, int version_id)
+{
+    DarwinIOMFB *m = opaque;
+    return m->swap_enabled && m->heap_known ? 0 : -EINVAL;
+}
+
+/* Separate optional state keeps pre-fix checkpoints readable, including an
+ * old asynchronous D594 that must still retire through its ack-1 slot. */
+static const VMStateDescription vmstate_iomfb_nested = {
+    .name = "darwin-iomfb/nested-swap",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = iomfb_nested_state_needed,
+    .post_load = iomfb_nested_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL_ARRAY(swap_nested, DarwinIOMFB, IOMFB_TAGS),
+        VMSTATE_UINT32_ARRAY(swap_nested_ids, DarwinIOMFB, IOMFB_TAGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_darwin_iomfb = {
     .name = "darwin-iomfb",
     .version_id = 1,
@@ -384,6 +420,7 @@ static const VMStateDescription vmstate_darwin_iomfb = {
     },
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_iomfb_swap,
+        &vmstate_iomfb_nested,
         NULL
     },
 };
@@ -701,9 +738,11 @@ static void iomfb_send(DarwinIOMFB *m, uint8_t ep, uint64_t msg, const char *wha
  * The offset within the window is always 0: we have exactly one call
  * outstanding, so there is nothing to pack around.
  */
-static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback *cb)
+static bool iomfb_callback_send_slot(DarwinIOMFB *m, uint8_t ep,
+                                     const IOMFBCallback *cb,
+                                     unsigned ack, unsigned tag)
 {
-    const unsigned tag = 0;
+    uint32_t base = ack ? IOMFB_CB_REQ_BASE : IOMFB_AP_RX_BASE;
     uint32_t in_len = cb->in ? cb->in->len : 0;
     uint32_t size = (uint32_t)sizeof(IOMFBRpcHdr) + in_len + cb->out_len;
 
@@ -718,7 +757,7 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
         return false;
     }
 
-    uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE + (uint64_t)tag * IOMFB_WINDOW;
+    uint64_t dva = m->heap_dva + base + (uint64_t)tag * IOMFB_WINDOW;
     g_autofree uint8_t *buf = g_malloc0(size);
     IOMFBRpcHdr h = { .name = cb->name_be, .in_len = in_len,
                       .out_len = cb->out_len };
@@ -736,7 +775,7 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
     fprintf(stderr, "iomfb: ep 0x%02x callback #%" PRIu64 " '%s' (0x%08x) in %u "
             "out %u -> heap+0x%x (tag %u) size 0x%x\n",
             ep, m->cb_sent, cb->name, cb->name_be, in_len, cb->out_len,
-            IOMFB_CB_REQ_BASE + tag * IOMFB_WINDOW, tag, size);
+            base + tag * IOMFB_WINDOW, tag, size);
     if (m->debug && in_len) {
         iomfb_hexdump("cb in", buf + sizeof(h), in_len);
     }
@@ -753,7 +792,7 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
      * measurable rather than baked in.
      */
     uint64_t msg = 0x02ULL                       /* class 2, subkind 0      */
-                 | (1ULL << 8)                   /* ack bit -- see above    */
+                 | ((uint64_t)ack << 8)
                  | ((uint64_t)(m->cb_flag9 ? 1 : 0) << 9)
                  | ((uint64_t)tag << 10)
                  | (0ULL << 16)                  /* offset within the window */
@@ -761,8 +800,49 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
     char what[96];
     snprintf(what, sizeof(what), "class-2 callback '%s'", cb->name);
     iomfb_send(m, ep, msg, what);
+    return true;
+}
+
+static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback *cb)
+{
+    if (!iomfb_callback_send_slot(m, ep, cb, 1, 0)) {
+        return false;
+    }
     m->cb_busy = true;
     return true;
+}
+
+/* rpc_caller_gated handles incoming requests itself while awaiting a reply
+ * (24A5430a a0ce750-a0ce770). Use the A408 caller's ack-0 RX window, whose
+ * base is assigned at a0cf66c-a0cf67c. The native queue entry already exists
+ * before A408 (a0c3730 -> a0c4500), so D594 may retire it here.
+ *
+ * Replying first and sending D594 on a separate workloop permits a power
+ * lock inversion: SwapEnd owns IORecursiveLock while a0cf708 drains that
+ * workloop, and D594 surface release needs the same lock in a0d5b14.
+ * See docs/re/display-completion-deadlock.md for the measured cycle. */
+static bool iomfb_swap_send_nested(DarwinIOMFB *m, uint8_t ep, unsigned tag,
+                                   uint32_t id)
+{
+    uint8_t input[DARWIN_IOMFB_SWAP_COMPLETION_SIZE];
+    IOMFBCallback cb = { .name = "D594", .name_be = 0x44353934 };
+    bool sent;
+
+    if (m->swap_nested[tag]) {
+        fprintf(stderr, "iomfb: recursive A408 on occupied tag %u; stopped\n", tag);
+        return false;
+    }
+    darwin_iomfb_swap_completion(input, id);
+    cb.in = g_byte_array_new_take(g_memdup2(input, sizeof(input)), sizeof(input));
+    sent = iomfb_callback_send_slot(m, ep, &cb, 0, tag);
+    g_byte_array_unref(cb.in);
+    if (sent) {
+        m->swap_nested[tag] = true;
+        m->swap_nested_ids[tag] = id;
+        fprintf(stderr, "iomfb: swap id %u D594 nested on tag %u; A408 pending\n",
+                id, tag);
+    }
+    return sent;
 }
 
 static void iomfb_swap_pump(DarwinIOMFB *m, uint8_t ep)
@@ -854,6 +934,19 @@ static void iomfb_callback_barrier(DarwinIOMFB *m, uint8_t ep,
             "barrier @%s\n", name, item->name);
     m->cb_next++;
     iomfb_callback_pump(m, ep);
+}
+
+/* Run script gates only once the AP RPC has actually completed. */
+static void iomfb_after_rpc(DarwinIOMFB *m, uint8_t ep, const char name[5])
+{
+    iomfb_callback_barrier(m, ep, name);
+    if (m->cb_script && !m->cb_started && m->cb_after && *m->cb_after &&
+        !strcmp(name, m->cb_after)) {
+        m->cb_started = true;
+        fprintf(stderr, "iomfb: '%s' answered; starting the %u-entry callback "
+                "script\n", name, m->cb_script->len);
+        iomfb_callback_pump(m, ep);
+    }
 }
 
 /*
@@ -1048,6 +1141,18 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     uint32_t off = IOMFB_RPC_OFF(msg), size = IOMFB_RPC_SIZE(msg);
 
     if (subkind == 1) {
+        unsigned tag = IOMFB_TAG(msg);
+        if (IOMFB_ACK(msg) == 0 && tag < IOMFB_TAGS && m->swap_nested[tag]) {
+            uint32_t status = (uint32_t)(msg >> 16);
+            m->swap_nested[tag] = false;
+            fprintf(stderr, "iomfb: swap id %u D594 nested completed, status "
+                    "0x%x; releasing A408 tag %u\n",
+                    m->swap_nested_ids[tag], status, tag);
+            iomfb_send(m, ep, 0x42ULL | ((uint64_t)tag << 10) |
+                       ((uint64_t)status << 16), "A408 after nested D594");
+            iomfb_after_rpc(m, ep, "A408");
+            return;
+        }
         /*
          * A completion for a callback we sent. rpc_callee_gated builds it as
          * (our header & 0xff3e) | 0x40 with our tag and ack bit, so the only
@@ -1234,6 +1339,20 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
         }
     }
 
+    /* Copy before any completion can release the native surface mapping. */
+    if (m->scanout_enabled && h.name == 0x41343038) {
+        iomfb_scanout(buf + sizeof(h), h.in_len);
+    }
+    if (m->swap_enabled && h.name == 0x41343038 && !nested) {
+        uint32_t id;
+        if (darwin_iomfb_swap_id(buf + sizeof(h), h.in_len, h.out_len, &id)) {
+            if (!iomfb_swap_send_nested(m, ep, tag, id)) {
+                fprintf(stderr, "iomfb: A408 tag %u retained after D594 send failure\n", tag);
+            }
+            return;
+        }
+    }
+
     /*
      * class 2, subkind 1 (0x42 in the header, which is exactly what the
      * waiter masks for at 0xa0ce750-75c), the request's own tag and ack bit
@@ -1247,14 +1366,9 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     snprintf(what, sizeof(what), "class-2 completion for '%s', status 0, out %s", name, how);
     iomfb_send(m, ep, reply, what);
 
-    /* Copy before D594 releases the native surface mapping. */
-    if (m->scanout_enabled && h.name == 0x41343038) {
-        iomfb_scanout(buf + sizeof(h), h.in_len);
-    }
-
-    /* The AP inserts queue-item+0x3d4 before entering the A408 wrapper
-     * (a0c3730/a0c4500). Reply first, then use the native asynchronous
-     * completion path established by DISPLAY_COMPLETE_R25. */
+    /* Legacy callback-context A408 handling; normal ack-0 submissions use
+     * the caller's own slot above. Also retain the async queue for old
+     * checkpoints with a D594 already in flight. */
     if (m->swap_enabled && h.name == 0x41343038) {
         iomfb_swap_enqueue(m, buf + sizeof(h), h.in_len, h.out_len);
         if (!m->cb_script || m->cb_next == m->cb_script->len) {
@@ -1262,23 +1376,7 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
         }
     }
 
-    /* A script barrier observes a completed AP call, never merely its arrival. */
-    iomfb_callback_barrier(m, ep, name);
-
-    /*
-     * Start the outbound experiment script once the AP has asked for the
-     * thing DARWIN_DCP_IOMFB_CB_AFTER names (default 'A353', the last RPC of
-     * the boot before the AP goes quiet). Answering that one first means the
-     * callbacks land at the point real firmware would have the link to
-     * itself, rather than in the middle of IOMobileFramebufferAP::start().
-     */
-    if (m->cb_script && !m->cb_started && m->cb_after && *m->cb_after &&
-        !strcmp(name, m->cb_after)) {
-        m->cb_started = true;
-        fprintf(stderr, "iomfb: '%s' answered; starting the %u-entry callback "
-                "script\n", name, m->cb_script->len);
-        iomfb_callback_pump(m, ep);
-    }
+    iomfb_after_rpc(m, ep, name);
 }
 
 /* ------------------------------------------------------------- dispatch -- */

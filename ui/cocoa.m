@@ -951,6 +951,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) handleMouseEvent:(NSEvent *)event button:(InputButton)button down:(bool)down
 {
+    /* Absolute devices need the initial press too. Waiting for mouseUp to
+     * grab loses the first tap after focus/capture is regained. */
+    if (!isMouseGrabbed && isAbsoluteEnabled && down) {
+        [self grabMouse];
+    }
     if (!isMouseGrabbed) {
         return;
     }
@@ -970,12 +975,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     with_bql(^{
         if (isAbsoluteEnabled) {
-            CGFloat d = (CGFloat)screen.height / [self frame].size.height;
-            NSPoint p = [event locationInWindow];
+            /* Bounds are in guest pixels (updateBounds). Cocoa performs the
+             * view offset and resize transform, including fullscreen margins. */
+            NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 
             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x, 0, screen.width);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y, 0, screen.height);
         } else {
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);

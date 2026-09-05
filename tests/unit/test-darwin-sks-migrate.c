@@ -79,6 +79,65 @@ static const uint8_t captured_user_class1_request[] = {
     0x6d, 0x04, 0x00, 0x00,
 };
 
+/* Exact endpoint-18 capture from TOUCH_NATIVE3, before overwriting its
+ * failed VM: User protection-class transfer 2 -> 1. */
+static const uint8_t captured_user_2_to_1[] = {
+    0x48, 0x00, 0x00, 0x00, 0x4b, 0x42, 0xee, 0x63,
+    0xd3, 0x45, 0x43, 0x38, 0x76, 0xed, 0xe8, 0x2e,
+    0x41, 0xb4, 0xe4, 0x58, 0x01, 0x00, 0x00, 0x00,
+    0xf5, 0xae, 0x53, 0x12, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x72, 0xfb, 0x60, 0x46, 0xe6, 0xb0, 0x8d, 0x71,
+    0x87, 0xfb, 0x13, 0xfe, 0xc0, 0x6f, 0xe0, 0x67,
+    0xa0, 0x1c, 0x1b, 0xbf, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0x96, 0x9a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x02, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x04, 0x00, 0x00,
+};
+
+static void parse_captured_user_2_to_1(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        captured_user_2_to_1, sizeof(captured_user_2_to_1));
+    g_assert_cmpstr(digest, ==,
+        "5ff82948088905d0ae29bd4d2347e257cdcd059eb76f5e4f879990277d26bc81");
+    g_assert_true(darwin_sks_parse_migrate_request(captured_user_2_to_1,
+        sizeof(captured_user_2_to_1), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_USER);
+    g_assert_cmpuint(parsed.record_kind, ==, 2);
+    g_assert_cmpuint(parsed.target_class, ==, 1);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+    uint8_t bad[sizeof(captured_user_2_to_1) + 1];
+    const size_t offsets[] = {0, 0x14, 0x4c, 0x50, 0x6c, 0x70, 0x84, 0x90, 0x9b, 0xa1};
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        memcpy(bad, captured_user_2_to_1, sizeof(captured_user_2_to_1));
+        bad[offsets[i]] ^= 1;
+        g_assert_false(darwin_sks_parse_migrate_request(bad,
+            sizeof(captured_user_2_to_1), &parsed));
+    }
+    memcpy(bad, captured_user_2_to_1, sizeof(captured_user_2_to_1));
+    bad[sizeof(captured_user_2_to_1)] = 0;
+    for (size_t n = 0; n <= sizeof(bad); n++) {
+        if (n != sizeof(captured_user_2_to_1)) {
+            g_assert_false(darwin_sks_parse_migrate_request(bad, n, &parsed));
+        }
+    }
+    bad[0x68] = 8; /* unobserved source */
+    g_assert_false(darwin_sks_parse_migrate_request(bad,
+        sizeof(captured_user_2_to_1), &parsed));
+}
+
 static void parse_captured_user_class1(void)
 {
     DarwinSKSMigrateRequest parsed;
@@ -97,7 +156,7 @@ static void parse_captured_user_class1(void)
 
 static void reject_corrupt_user_class1(void)
 {
-    static const size_t offsets[] = { 0x00, 0x14, 0x4c, 0x50, 0x68,
+    static const size_t offsets[] = { 0x00, 0x14, 0x4c, 0x50,
                                       0x70, 0x84, 0x90, 0x9b, 0xa1 };
     DarwinSKSMigrateRequest parsed;
     for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
@@ -631,6 +690,7 @@ static void reject_corrupt_user_3_to_2(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/migrate/user-2-to-1", parse_captured_user_2_to_1);
     g_test_add_func("/darwin-sks/migrate/user-3-to-2", parse_captured_user_3_to_2);
     g_test_add_func("/darwin-sks/migrate/reject-user-3-to-2", reject_corrupt_user_3_to_2);
     g_test_add_func("/darwin-sks/unwrap/class13", parse_unwrap_class13);

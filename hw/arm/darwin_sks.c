@@ -200,7 +200,12 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
          * Dropping this exact tagged request caused R18's SKS timeout panic.
          * The native bridge uses +0x68/+0x6c as source/destination classes
          * (0xfffffff0095730a0..0x957311c); keep all other checks intact. */
-        (((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D ||
+        /* TOUCH_NATIVE3 captures User 2 -> 1 (SHA256 5ff82948088905d0).
+         * This is the same native class-transfer ABI and exact User tag;
+         * dropping it panics the guest before its first input can arrive. */
+        ((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_A &&
+          result.record_kind == SKS_MIGRATE_TAGGED_TARGET_CLASS_B) ||
+         ((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D ||
            result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_B ||
            result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_A) &&
           result.record_kind == SKS_MIGRATE_TAGGED_USER_RECORD_KIND) ||
