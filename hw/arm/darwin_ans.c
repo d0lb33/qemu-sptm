@@ -249,6 +249,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinANSState, DARWIN_ANS)
  * bodies; observed being issued twice per boot by the code the guest calls
  * ProcessTunnelCommand / GetSanitizeCounters. See ans_admin(). */
 #define ANS_ADM_VENDOR_TUNNEL 0xd8
+/* Tunnel sub-command at args+0xc; see ans_admin(). */
+#define ANS_TUNNEL_SET_TIME   6
 
 /* NVMe IO opcodes */
 #define NVME_IO_FLUSH       0x00
@@ -375,6 +377,23 @@ struct DarwinANSState {
     uint16_t iosq_size, iocq_size;
     uint16_t iocq_id, iosq_id;
     bool     iosq_live, iocq_live, iocq_ien;
+
+    /*
+     * AppleSART's power-gate word for this block. /arm-io/sart-ans reg[2]
+     * is the same physical window as our reg[3] (see the header), and the
+     * kext polls "sart-power-reg-offset" (0x13e8) inside it: on the last
+     * power release it writes 1 and sleeps 100 ms until it reads 1 back
+     * (0xfffffff0094e7ef8-0xfffffff0094e7f1c, IOCoastGuardSARTMapper), on
+     * power-up it writes 0 and waits for 0 (0xfffffff0094e7c24-0xfffffff0094e7c44).
+     * 0x13e8 is below ANS_INBAND_NVME_OFF, so without this it decoded as an
+     * NVMe register and never read back; with a native IORTC present,
+     * IONVMeFamily's SendTimeToDevice takes and drops a power assertion
+     * during controller start, the drop hit that poll, and the disk boot
+     * idled forever before "BSD root" (probe RTC_NATIVE_SYS3, postmortem
+     * thread at IONVMeFamily+0x4432c -> AppleSART+0xaa8).
+     */
+    uint32_t sart_power_off;    /* 0xffffffff: not present */
+    uint32_t sart_power_word;
 
     /* diagnostics */
     DeviceState *sart;
@@ -897,9 +916,51 @@ static uint16_t ans_admin(DarwinANSState *s, const ANSCmd *c, uint32_t *result)
          * zeroed buffer and say in the comment that the contents are a stub --
          * do not invent a layout.
          */
-        ans_log(s, "vendor tunnel command 0x%02x (CORE_DEBUG_EXPORT_STATS et al) "
-                "refused: the firmware statistics it wants are not modelled\n",
-                c->opcode);
+        /*
+         * 2026-09-05, native RTC.  The SQE carries no PRP; probe
+         * RTC_NATIVE_RESTORE5 dumped it as opcode d8, cid 6, cdw10 = 1,
+         * cdw11 = 0x1c370000, cdw12 = 0x00000100: cdw12:cdw11 is the guest
+         * physical address of the 4 KiB argument block (0x1001c370000, in
+         * DRAM), and both tunnel commands of a boot reuse the same block.
+         * AppleEmbeddedNVMeController::SendTimeToDevice (0xfffffff00a143d74)
+         * writes sub-command 6 at +0xc (0xfffffff00a143e50), four clock
+         * words at +0x1c..+0x33 (0xfffffff00a143e5c-0xfffffff00a143e64;
+         * their meaning was not traced), and afterwards requires the u32 at
+         * +0x4c to be zero (0xfffffff00a143e78) or it logs
+         * "CORE_DEBUG_SET_TIME failed" and controller start stops before
+         * AllocateNodes: probe RTC_NATIVE_SYS1 never reached "BSD root" with
+         * the refusal.  The call only happens once a real IORTC exists
+         * (0xfffffff00a143d9c/0xfffffff00a143da8), which is why the earlier
+         * PV-RTC boots never saw it.  SET_TIME carries data to the device,
+         * so completing it with status 0 invents nothing.
+         */
+        {
+            uint8_t args[0x50] = { 0 };
+            uint64_t args_pa = ((uint64_t)c->cdw12 << 32) | c->cdw11;
+            bool have_args = args_pa && ans_prp_rw(s, args_pa, 0, args, sizeof(args), false);
+            uint32_t sub = have_args ? ldl_le_p(args + 0xc) : 0xffffffff;
+            if (have_args && sub == ANS_TUNNEL_SET_TIME) {
+                stl_le_p(args + 0x4c, 0);
+                if (!ans_prp_rw(s, args_pa, 0, args, sizeof(args), true)) {
+                    return NVME_SC_DATA_XFER_ERR;
+                }
+                ans_log(s, "vendor tunnel command 0x%02x sub 6 (CORE_DEBUG_SET_TIME) accepted: "
+                        "args+0x1c %08x %08x +0x24 0x%" PRIx64 " +0x2c 0x%" PRIx64
+                        " (the driver's clock words; nothing here consumes them)\n",
+                        c->opcode, ldl_le_p(args + 0x1c), ldl_le_p(args + 0x20),
+                        ldq_le_p(args + 0x24), ldq_le_p(args + 0x2c));
+                return NVME_SC_SUCCESS;
+            }
+            ans_log(s, "vendor tunnel command 0x%02x sub %u (CORE_DEBUG_EXPORT_STATS et al) "
+                    "refused: the firmware statistics it wants are not modelled\n",
+                    c->opcode, sub);
+            if (s->debug) {
+                ans_hexdump(s, "vendor tunnel SQE", c->raw, ANS_SQE_SIZE);
+                if (have_args) {
+                    ans_hexdump(s, "vendor tunnel args", args, sizeof(args));
+                }
+            }
+        }
         return NVME_SC_INVALID_OPCODE;
     default:
         ans_log(s, "UNMODELLED admin opcode 0x%02x (cid %u nsid %u "
@@ -1512,8 +1573,16 @@ static uint64_t ans_mmio_read(void *opaque, hwaddr off, unsigned size, ANSWindow
 {
     DarwinANSState *s = opaque;
     hwaddr reg = 0;
-    ANSBlock blk = ans_decode(s, win, off, &reg);
     uint64_t val;
+
+    if (win == ANS_WIN_NVMMU && off == s->sart_power_off) {
+        if (s->debug) {
+            ans_log(s, "read  reg[3]+0x%05" HWADDR_PRIx " (SART power gate) -> 0x%x\n",
+                    off, s->sart_power_word);
+        }
+        return s->sart_power_word;
+    }
+    ANSBlock blk = ans_decode(s, win, off, &reg);
 
     if (blk == ANS_BLK_NONE) {
         uint32_t *store = win == ANS_WIN_NVME ? s->nvme_store : s->nvmmu_store;
@@ -1536,6 +1605,12 @@ static void ans_mmio_write(void *opaque, hwaddr off, uint64_t val, unsigned size
 {
     DarwinANSState *s = opaque;
     hwaddr reg = 0;
+
+    if (win == ANS_WIN_NVMMU && off == s->sart_power_off) {
+        ans_log(s, "SART power gate word <- 0x%" PRIx64 " (stored; AppleSART polls it back)\n", val);
+        s->sart_power_word = (uint32_t)val;
+        return;
+    }
     ANSBlock blk = ans_decode(s, win, off, &reg);
 
     /*
@@ -1878,6 +1953,25 @@ static int darwin_ans_post_load(void *opaque, int version_id)
     return 0;
 }
 
+/* Optional so that snapshots taken before the SART power word existed
+ * still restore; it only appears once the kext has written the word. */
+static bool ans_sart_power_needed(void *opaque)
+{
+    DarwinANSState *s = opaque;
+    return s->sart_power_word != 0;
+}
+
+static const VMStateDescription vmstate_darwin_ans_sart_power = {
+    .name = TYPE_DARWIN_ANS "/sart-power",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ans_sart_power_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(sart_power_word, DarwinANSState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_darwin_ans = {
     .name = TYPE_DARWIN_ANS,
     .version_id = 1,
@@ -1963,12 +2057,18 @@ static const VMStateDescription vmstate_darwin_ans = {
         VMSTATE_UINT64(n_sart_denied, DarwinANSState),
         VMSTATE_END_OF_LIST()
     },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_darwin_ans_sart_power,
+        NULL
+    },
 };
 
 static const Property darwin_ans_properties[] = {
     DEFINE_PROP_STRING("name", DarwinANSState, name),
     DEFINE_PROP_DRIVE("drive", DarwinANSState, blk),
     DEFINE_PROP_UINT32("nvmmu-size", DarwinANSState, nvmmu_size, 0),
+    /* /arm-io/sart-ans "sart-power-reg-offset"; see sart_power_off. */
+    DEFINE_PROP_UINT32("sart-power-reg-offset", DarwinANSState, sart_power_off, 0xffffffff),
     DEFINE_PROP_UINT32("nvme-size", DarwinANSState, nvme_size, 0),
     /* "nvme-queue-entries" from the device tree; 0x40 on t8140. */
     DEFINE_PROP_UINT32("queue-entries", DarwinANSState, queue_entries, 64),
@@ -2281,6 +2381,16 @@ DeviceState *darwin_ans_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     qdev_prop_set_string(dev, "name", name ? name : "ans");
     qdev_prop_set_uint32(dev, "nvmmu-size", nvmmu_size);
     qdev_prop_set_uint32(dev, "nvme-size", nvme_size);
+    {
+        struct dtree_node *sart_node = adt_find_node(dt_root, "arm-io/sart-ans");
+        uint32_t *pwr = sart_node ? adt_get_prop_val(sart_node, "sart-power-reg-offset") : NULL;
+        struct adt_io_reg *sreg = sart_node ? adt_get_prop_val(sart_node, "reg") : NULL;
+        size_t n_sreg = sreg ? adt_get_prop_len(sart_node, "reg") / sizeof(*sreg) : 0;
+        /* Only meaningful when sart-ans reg[2] really is our reg[3]. */
+        if (pwr && n_sreg >= 3 && sreg[2].base == reg[3].base && *pwr + 4 <= nvmmu_size) {
+            qdev_prop_set_uint32(dev, "sart-power-reg-offset", *pwr);
+        }
+    }
     if (qe && *qe) {
         qdev_prop_set_uint32(dev, "queue-entries", *qe);
     }
