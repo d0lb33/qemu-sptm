@@ -84,6 +84,7 @@ size_t darwin_sks_build_unlocked_device_state(uint8_t *payload, size_t capacity)
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_C    3
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_D    4
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_A    1
+#define SKS_MIGRATE_TAGGED_TARGET_CLASS_B    2
 #define SKS_MIGRATE_TAGGED_ZERO_TAIL_OFF     0x70
 #define SKS_MIGRATE_TAGGED_ZERO_TAIL_SIZE    20
 #define SKS_MIGRATE_TAGGED_RECORD_LEN_OFF    0x84
@@ -195,7 +196,12 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
          * exhausts the one-request buffer and ends in an SKS timeout.
          * Preserve the class in the existing variant-3 reply; do not infer
          * support for other classes or relax the record/framing checks. */
+        /* TOUCH_INPUT_R19 captures User 3 -> 2 (SHA256 4a03fd55ebd836a7).
+         * Dropping this exact tagged request caused R18's SKS timeout panic.
+         * The native bridge uses +0x68/+0x6c as source/destination classes
+         * (0xfffffff0095730a0..0x957311c); keep all other checks intact. */
         (((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D ||
+           result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_B ||
            result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_A) &&
           result.record_kind == SKS_MIGRATE_TAGGED_USER_RECORD_KIND) ||
          /* DISPLAY_NATIVE_R4 then captures the reverse 1 -> 3 transfer

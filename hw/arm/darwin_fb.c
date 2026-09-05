@@ -16,6 +16,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -48,6 +49,10 @@ struct DarwinFBState {
 
     DeviceState *uart;
     QemuInputHandlerState *kbd;
+    QemuInputHandlerState *touch;
+    int touch_fd;
+    int touch_x, touch_y;
+    bool touch_down, touch_sent_down, touch_dirty;
     bool shift, ctrl, alt, caps;
 };
 
@@ -270,6 +275,57 @@ static const QemuInputHandler darwin_kbd_handler = {
     .event = darwin_kbd_event,
 };
 
+/* Explicit host-to-debugger input bridge, not an Apple touch device model.
+ * Cocoa supplies absolute coordinates after window scaling (ui/cocoa.m).
+ * Commit at input sync: Cocoa queues the button before its current position.
+ * Each record is a complete state, so loss of a motion record cannot lose UP.
+ * Transient host input is intentionally not restored with guest checkpoints.
+ */
+static void darwin_touch_event(DeviceState *dev, QemuConsole *src,
+                               QemuInputEvent *evt)
+{
+    DarwinFBState *s = DARWIN_FB(dev);
+    if (evt->type == INPUT_EVENT_KIND_ABS) {
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            s->touch_x = CLAMP(evt->abs.value, 0, INPUT_EVENT_ABS_MAX);
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            s->touch_y = CLAMP(evt->abs.value, 0, INPUT_EVENT_ABS_MAX);
+        }
+        s->touch_dirty = true;
+    } else if (evt->type == INPUT_EVENT_KIND_BTN &&
+               evt->btn.button == INPUT_BUTTON_LEFT) {
+        s->touch_down = evt->btn.down;
+        s->touch_dirty = true;
+    }
+}
+
+static void darwin_touch_sync(DeviceState *dev)
+{
+    DarwinFBState *s = DARWIN_FB(dev);
+    char line[192];
+    int len;
+    if (!s->touch_dirty || (!s->touch_down && !s->touch_sent_down)) {
+        s->touch_dirty = false;
+        return;
+    }
+    len = snprintf(line, sizeof(line),
+                   "{\"t\":%" PRId64 ",\"x\":%d,\"y\":%d,\"down\":%s}\n",
+                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
+                   s->touch_x, s->touch_y, s->touch_down ? "true" : "false");
+    if (write(s->touch_fd, line, len) != len) {
+        fprintf(stderr, "darwin-touch: event write failed: %s\n", strerror(errno));
+    }
+    s->touch_sent_down = s->touch_down;
+    s->touch_dirty = false;
+}
+
+static const QemuInputHandler darwin_touch_handler = {
+    .name = "darwin single-touch debugger bridge",
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .event = darwin_touch_event,
+    .sync = darwin_touch_sync,
+};
+
 static int darwin_fb_post_load(void *opaque, int version_id)
 {
     DarwinFBState *s = opaque;
@@ -325,6 +381,7 @@ static const VMStateDescription vmstate_darwin_fb = {
 static void darwin_fb_realize(DeviceState *dev, Error **errp)
 {
     DarwinFBState *s = DARWIN_FB(dev);
+    const char *touch_path = getenv("DARWIN_TOUCH_EVENTS");
 
     if (!s->host || !s->width || !s->height) {
         error_setg(errp, "darwin-fb: no framebuffer memory configured");
@@ -344,6 +401,18 @@ static void darwin_fb_realize(DeviceState *dev, Error **errp)
                                                  PIXMAN_x8r8g8b8,
                                                  s->width * 4, s->host);
     s->con = qemu_graphic_console_create(dev, 0, &darwin_fb_ops, s);
+
+    s->touch_fd = -1;
+    if (touch_path && *touch_path) {
+        s->touch_fd = open(touch_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+        if (s->touch_fd < 0) {
+            error_setg_errno(errp, errno, "darwin-touch: cannot open event log");
+            return;
+        }
+        s->touch = qemu_input_handler_register(dev, &darwin_touch_handler);
+        qemu_input_handler_activate(s->touch);
+        fprintf(stderr, "darwin-touch: single-touch input -> %s\n", touch_path);
+    }
 
     if (s->uart) {
         s->kbd = qemu_input_handler_register(dev, &darwin_kbd_handler);

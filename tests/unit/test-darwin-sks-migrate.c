@@ -109,7 +109,7 @@ static void reject_corrupt_user_class1(void)
     }
     uint8_t request[sizeof(captured_user_class1_request)];
     memcpy(request, captured_user_class1_request, sizeof(request));
-    request[0x6c] = 2;
+    request[0x6c] = 5;
     g_assert_false(darwin_sks_parse_migrate_request(request,
                    sizeof(request), &parsed));
     g_assert_false(darwin_sks_parse_migrate_request(
@@ -573,9 +573,66 @@ static void reject_corrupt_data_2_to_3(void)
         sizeof(captured_data_2_to_3), &parsed));
 }
 
+/* TOUCH_INPUT_R19, exact request that froze the Home-screen run. */
+static const uint8_t captured_user_3_to_2[] = {
+    0x48,0x00,0x00,0x00,0x03,0xf7,0x06,0xee,0xdb,0xa9,0x4a,0x1d,0x09,0x76,0xc6,0x3e,
+    0x6d,0x2c,0xc6,0x43,0x01,0x00,0x00,0x00,0x76,0xdf,0x6a,0x2c,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xd2,0x02,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xba,0x82,0xb9,0xeb,0x1b,0x08,0x2a,0x4b,
+    0xbc,0x3a,0xea,0x4d,0x1e,0x05,0x6f,0x78,0xb7,0x8d,0x3c,0x17,0x03,0x00,0x00,0x00,
+    0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x03,0x00,0x00,0x00,0x02,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x1c,0x00,0x00,0x00,0x9e,0x79,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x01,0x00,0x61,0x70,0x66,0x73,0x75,0x75,0x69,0x64,0x00,0x02,0x76,0x6f,0x6c,0x75,
+    0x6d,0x04,0x00,0x00,
+};
+
+static void parse_captured_user_3_to_2(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        captured_user_3_to_2, sizeof(captured_user_3_to_2));
+    g_assert_cmpstr(digest, ==,
+        "4a03fd55ebd836a784a4cac798e288152bfcc604bdd2f0f7ca60ded3d721d9de");
+    g_assert_true(darwin_sks_parse_migrate_request(captured_user_3_to_2,
+        sizeof(captured_user_3_to_2), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_USER);
+    g_assert_cmpuint(parsed.record_kind, ==, 3);
+    g_assert_cmpuint(parsed.target_class, ==, 2);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+}
+
+static void reject_corrupt_user_3_to_2(void)
+{
+    static const size_t offsets[] = {
+        0x00,0x14,0x4c,0x50,0x54,0x58,0x5c,0x60,0x68,0x70,0x84,0x90,0x9b,0xa1,
+    };
+    DarwinSKSMigrateRequest parsed;
+    uint8_t request[sizeof(captured_user_3_to_2) + 1];
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        memcpy(request, captured_user_3_to_2, sizeof(captured_user_3_to_2));
+        request[offsets[i]] ^= 1;
+        g_assert_false(darwin_sks_parse_migrate_request(request,
+            sizeof(captured_user_3_to_2), &parsed));
+    }
+    memcpy(request, captured_user_3_to_2, sizeof(captured_user_3_to_2));
+    request[sizeof(captured_user_3_to_2)] = 0;
+    for (size_t size = 0; size <= sizeof(request); size++) {
+        if (size != sizeof(captured_user_3_to_2)) {
+            g_assert_false(darwin_sks_parse_migrate_request(request, size, &parsed));
+        }
+    }
+    request[0x6c] = 5;
+    g_assert_false(darwin_sks_parse_migrate_request(request,
+        sizeof(captured_user_3_to_2), &parsed));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/migrate/user-3-to-2", parse_captured_user_3_to_2);
+    g_test_add_func("/darwin-sks/migrate/reject-user-3-to-2", reject_corrupt_user_3_to_2);
     g_test_add_func("/darwin-sks/unwrap/class13", parse_unwrap_class13);
     g_test_add_func("/darwin-sks/unwrap/reject-class13-malformed", reject_unwrap_class13_malformed);
     g_test_add_func("/darwin-sks/migrate/data-2-to-3", parse_captured_data_2_to_3);
