@@ -34,6 +34,7 @@
 #include "xnu/darwin_smp.h"
 #include "xnu/darwin_spmi.h"
 #include "xnu/darwin_smc.h"
+#include "xnu/darwin_gpu_transport.h"
 #include "xnu/gxfstat.h"
 
 // See device tree specification section 2.3.8: ranges
@@ -400,6 +401,7 @@ static void darwin_init(MachineState *ms) {
     assert(0 == arm_io_ranges[0]); // child bus phys addr must be zero
 
     if (!getenv("DARWIN_NO_UNIMP")) darwin_unimp_init(dt_root, iobase);
+    darwin_gpu_transport_init(dt_root, iobase);
     DeviceState *aic = init_aic(dt_root, iobase, cpudev);
     DeviceState *uart = init_uart(dt_root, iobase, aic);
     darwin_darts_create(dt_root, iobase, aic);

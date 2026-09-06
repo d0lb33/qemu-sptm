@@ -1,0 +1,232 @@
+/* Owned shared RAM + MMIO doorbell. No storage path and no guest debugger.
+ * Echo first; optional socket notification backend forwards to host Metal.
+ * One outstanding request; completion is a polled MMIO register, not an IRQ.
+ */
+#include "qemu/osdep.h"
+#include "qemu/error-report.h"
+#include "qemu/bswap.h"
+#include "qemu/atomic.h"
+#include "qapi/error.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
+#include "migration/blocker.h"
+#include "chardev/char-fe.h"
+#include "xnu/apple_dtree.h"
+#include "xnu/darwin_gpu_transport.h"
+#include <zlib.h>
+
+typedef struct DVMGPUTransport {
+    MemoryRegion ram, regs;
+    uint8_t *bytes;
+    uint8_t session[16], rx[16];
+    unsigned rx_used;
+    uint64_t submitted, done;
+    uint32_t error;
+    bool external, ready, connected;
+    CharFrontend notify;
+    Error *migration_blocker;
+} DVMGPUTransport;
+
+static void failed(DVMGPUTransport *s, unsigned code)
+{
+    if (!s->error) {
+        s->error = code;
+        warn_report("dvm-gpu-shm: failed code=%u submitted=%" PRIu64
+                    " done=%" PRIu64, code, s->submitted, s->done);
+    }
+}
+
+static bool valid_header(DVMGPUTransport *s, unsigned offset, uint64_t seq)
+{
+    uint8_t *h = s->bytes + offset;
+    return !memcmp(h, s->session, 16) && ldq_le_p(h + 16) == seq &&
+           ldl_le_p(h + 24) <= DVM_GPU_MAX_BYTES;
+}
+
+static void completed(DVMGPUTransport *s, uint64_t seq)
+{
+    uint8_t *h = s->bytes + DVM_GPU_REPLY_HEADER;
+    if (s->error || !s->ready || !seq || seq != s->submitted ||
+        seq <= s->done || !valid_header(s, DVM_GPU_REPLY_HEADER, seq)) {
+        failed(s, 5);
+        return;
+    }
+    /* ldl_le_p returns signed int; widening it against zlib's unsigned long
+     * sign-extends CRCs with bit 31 set. The wire contract is uint32_t. */
+    uint32_t expected_crc = ldl_le_p(h + 28);
+    uint32_t actual_crc = crc32(0, s->bytes + DVM_GPU_REPLY_DATA,
+                               ldl_le_p(h + 24));
+    if (actual_crc != expected_crc) {
+        failed(s, 6);
+        return;
+    }
+    smp_wmb();
+    s->done = seq;
+}
+
+static int notify_can_read(void *opaque)
+{
+    DVMGPUTransport *s = opaque;
+    return sizeof(s->rx) - s->rx_used;
+}
+
+static void notify_read(void *opaque, const uint8_t *buf, int size)
+{
+    DVMGPUTransport *s = opaque;
+    for (int i = 0; i < size; i++) {
+        s->rx[s->rx_used++] = buf[i];
+        if (s->rx_used == sizeof(s->rx)) {
+            uint64_t seq = ldq_le_p(s->rx);
+            uint32_t status = ldl_le_p(s->rx + 8);
+            s->rx_used = 0;
+            if (status || ldl_le_p(s->rx + 12)) {
+                failed(s, 7);
+            } else if (!seq && !s->submitted && !s->ready && !s->error) {
+                /* Host sends READY only after initializing its GPU and data. */
+                smp_rmb();
+                s->ready = true;
+            } else {
+                completed(s, seq);
+            }
+        }
+    }
+}
+
+static void notify_event(void *opaque, QEMUChrEvent event)
+{
+    DVMGPUTransport *s = opaque;
+    if (event == CHR_EVENT_OPENED) {
+        s->connected = true;
+    } else if (event == CHR_EVENT_CLOSED && s->connected) {
+        s->ready = false;
+        failed(s, 8);
+    }
+}
+
+static uint64_t reg_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DVMGPUTransport *s = opaque;
+    switch (offset) {
+    case 0: return DVM_GPU_MAGIC;
+    case 8: return DVM_GPU_RAM_SIZE;
+    case DVM_GPU_REG_DONE: return s->done;
+    case DVM_GPU_REG_ERROR: return s->error;
+    case DVM_GPU_REG_MODE: return s->external ? 2 : 1;
+    case DVM_GPU_REG_SUBMITTED: return s->submitted;
+    case DVM_GPU_REG_READY: return s->ready;
+    default: return 0;
+    }
+}
+
+static void reg_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+{
+    DVMGPUTransport *s = opaque;
+    uint8_t *h = s->bytes + DVM_GPU_REQUEST_HEADER;
+    if (offset != DVM_GPU_REG_DOORBELL || size != 8 || s->error) {
+        failed(s, 1);
+        return;
+    }
+    smp_rmb();
+    if (!s->ready || !value || s->submitted != s->done ||
+        value != s->submitted + 1 ||
+        !valid_header(s, DVM_GPU_REQUEST_HEADER, value)) {
+        failed(s, 2);
+        return;
+    }
+    uint32_t length = ldl_le_p(h + 24), crc = ldl_le_p(h + 28);
+    if (crc32(0, s->bytes + DVM_GPU_REQUEST_DATA, length) != crc) {
+        failed(s, 3);
+        return;
+    }
+    s->submitted = value;
+    if (s->external) {
+        uint8_t packet[16];
+        stq_le_p(packet, value);
+        stl_le_p(packet + 8, length);
+        stl_le_p(packet + 12, crc);
+        if (qemu_chr_fe_write_all(&s->notify, packet, sizeof(packet)) !=
+            sizeof(packet)) {
+            failed(s, 4);
+        }
+    } else {
+        for (uint32_t i = 0; i < length; i++) {
+            s->bytes[DVM_GPU_REPLY_DATA + i] =
+                s->bytes[DVM_GPU_REQUEST_DATA + i] ^ 0xa5;
+        }
+        h = s->bytes + DVM_GPU_REPLY_HEADER;
+        memcpy(h, s->session, 16);
+        stq_le_p(h + 16, value);
+        stl_le_p(h + 24, length);
+        stl_le_p(h + 28, crc32(0, s->bytes + DVM_GPU_REPLY_DATA, length));
+        completed(s, value);
+    }
+}
+
+static const MemoryRegionOps reg_ops = {
+    .read = reg_read,
+    .write = reg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 8 },
+    .impl = { .min_access_size = 4, .max_access_size = 8 },
+};
+
+void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobase)
+{
+    const char *path = getenv("DARWIN_GPU_SHM_PATH");
+    struct dtree_node *node = adt_find_node(root, "arm-io/dvm-transport");
+    if (!path && !node) {
+        return;
+    }
+    struct adt_io_reg *ranges = node ? adt_get_prop_val(node, "reg") : NULL;
+    if (!path || !node || adt_get_prop_len(node, "reg") != 2 * sizeof(*ranges) ||
+        ranges[0].base + iobase != DVM_GPU_RAM_BASE ||
+        ranges[0].len != DVM_GPU_RAM_SIZE ||
+        ranges[1].base + iobase != DVM_GPU_REG_BASE ||
+        ranges[1].len != DVM_GPU_REG_SIZE) {
+        error_report("dvm-gpu-shm: requires paired owned RAM file and exact DT ranges");
+        exit(1);
+    }
+    int fd = open(path, O_RDWR | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+        st.st_size != DVM_GPU_RAM_SIZE) {
+        error_report("dvm-gpu-shm: RAM backend must be an existing 16 MiB regular file");
+        exit(1);
+    }
+    DVMGPUTransport *s = g_new0(DVMGPUTransport, 1);
+    if (!memory_region_init_ram_from_fd(&s->ram, NULL, "dvm-gpu-shared-ram",
+                                       DVM_GPU_RAM_SIZE, RAM_SHARED, fd, 0,
+                                       &error_fatal)) {
+        exit(1);
+    }
+    s->bytes = memory_region_get_ram_ptr(&s->ram);
+    memset(s->bytes, 0, DVM_GPU_RAM_SIZE);
+    stl_le_p(s->bytes, DVM_GPU_MAGIC);
+    stl_le_p(s->bytes + 4, 1);
+    for (unsigned i = 0; i < sizeof(s->session); i += 4) {
+        stl_le_p(s->session + i, g_random_int());
+    }
+    memcpy(s->bytes + 16, s->session, sizeof(s->session));
+    Chardev *chr = qemu_chr_find("dvm_gpu_notify");
+    s->external = chr != NULL;
+    s->ready = !s->external;
+    if (chr) {
+        qemu_chr_fe_init(&s->notify, chr, &error_fatal);
+        qemu_chr_fe_set_handlers(&s->notify, notify_can_read, notify_read,
+                                notify_event, NULL, s, NULL, true);
+    }
+    memory_region_init_io(&s->regs, NULL, &reg_ops, s, "dvm-gpu-doorbell",
+                          DVM_GPU_REG_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(), DVM_GPU_RAM_BASE,
+                                        &s->ram, 1);
+    memory_region_add_subregion_overlap(get_system_memory(), DVM_GPU_REG_BASE,
+                                        &s->regs, 1);
+    error_setg(&s->migration_blocker,
+               "DVM shared-memory transport needs a drain/reset checkpoint contract");
+    if (migrate_add_blocker(&s->migration_blocker, &error_fatal) < 0) {
+        exit(1);
+    }
+    info_report("dvm-gpu-shm: RAM=0x%llx bytes=0x%llx doorbell=0x%llx mode=%s migration=blocked",
+                DVM_GPU_RAM_BASE, DVM_GPU_RAM_SIZE, DVM_GPU_REG_BASE,
+                s->external ? "external" : "echo");
+}
