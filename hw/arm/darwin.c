@@ -33,6 +33,7 @@
 #include "xnu/darwin_unimp.h"
 #include "xnu/darwin_smp.h"
 #include "xnu/darwin_spmi.h"
+#include "xnu/darwin_smc.h"
 #include "xnu/gxfstat.h"
 
 // See device tree specification section 2.3.8: ranges
@@ -420,8 +421,12 @@ static void darwin_init(MachineState *ms) {
     // already exist, so in that mode we create nothing and leave "ans"
     // unclaimed. Delete this branch, and the scaffold, once the guarded path
     // has been boot-tested. ("ans" must stay last in the array for this.)
-    static const char *const claimed_ascs[] = { "dcp", "sep", "ans" };
+    // The SMC gets its key endpoint (darwin_smc.c) instead of the bare
+    // mailbox; it is claimed here so the generic pass skips it. It returns
+    // NULL and claims nothing when dt_fixup ran without -enable smc.
+    static const char *const claimed_ascs[] = { "dcp", "sep", "smc", "ans" };
     unsigned n_claimed = ARRAY_SIZE(claimed_ascs);
+    darwin_smc_create(dt_root, iobase, aic);
     if (getenv("DARWIN_ANS_SELFWIRE")) {
         n_claimed--;
     } else {
