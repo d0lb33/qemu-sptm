@@ -122,6 +122,15 @@ uint32_t exynos4210_get_irq(uint32_t grp, uint32_t bit);
  */
 int exynos4210_uart_inject(DeviceState *dev, const uint8_t *buf, int len);
 
+/* Observe every byte the guest transmits, before it reaches the chardev.
+ * Used by darwin-input to parse the native helper's ACK/readiness lines out
+ * of the console stream without touching the chardev backend. Not migrated. */
+typedef void (*Exynos4210UartTxObserver)(void *opaque, uint8_t ch);
+void exynos4210_uart_set_tx_observer(DeviceState *dev,
+                                     Exynos4210UartTxObserver fn, void *opaque);
+/* Free RX FIFO bytes as seen by the chardev backpressure path. */
+int exynos4210_uart_rx_space(DeviceState *dev);
+
 DeviceState *exynos4210_uart_create(hwaddr addr,
                                     int fifo_size,
                                     int channel,
