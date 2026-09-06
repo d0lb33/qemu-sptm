@@ -16,7 +16,7 @@
  *
  *   host event -> bounded queue -> UART FIFO -> guest helper -> HID system
  *
- * Wire format (host -> guest, one record per line, <= 56 bytes):
+ * Wire format (host -> guest, one record per line, < DARWIN_INPUT_WIRE bytes):
  *   DVMI2 <epoch> <seq> <K> <a> <b> <c> <host_ms>\n
  *     K = D down, M move, U up, C cancel (release any contact),
  *         P ping, B button (a = consumer usage, b = 1 down / 0 up),
@@ -52,12 +52,13 @@ typedef struct DarwinInputRecord {
     uint8_t kind;          /* 'D','M','U','C','P','B','W' */
     uint16_t a, b;
     int32_t c;             /* W: notches, positive = content scrolls up */
-    int64_t host_ms;       /* QEMU_CLOCK_REALTIME ms when the host produced it */
+    int64_t host_ms;       /* host monotonic QEMU_CLOCK_REALTIME ms when produced */
 } DarwinInputRecord;
 
 typedef struct DarwinInputInflight {
     uint32_t seq;
     uint8_t kind;
+    bool acked, dispatched;
     int64_t sent_vns;      /* virtual ns, for timeouts that pause with the guest */
     int64_t sent_rns;      /* realtime ns, for reported latency */
 } DarwinInputInflight;

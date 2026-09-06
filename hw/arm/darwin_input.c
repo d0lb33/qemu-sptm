@@ -19,6 +19,7 @@
 #include "xnu/darwin_input.h"
 
 #define ACK_TIMEOUT_NS      (10LL * NANOSECONDS_PER_SECOND)
+#define DISPATCH_TIMEOUT_NS (30LL * NANOSECONDS_PER_SECOND)
 #define PING_INTERVAL_NS    (2LL * NANOSECONDS_PER_SECOND)
 #define STATUS_INTERVAL_NS  (250LL * SCALE_MS)
 #define BUSY_TICK_NS        (1LL * SCALE_MS)
@@ -58,7 +59,7 @@ static void log_line(DarwinInputState *s, const char *fmt, ...)
 
 static bool guest_accepts_input(DarwinInputState *s)
 {
-    return s->guest_state == 'I' || s->guest_state == 'R';
+    return s->guest_state == 'R';
 }
 
 /* ---------------- queue ---------------- */
@@ -105,12 +106,19 @@ static void queue_clear(DarwinInputState *s)
 static void new_epoch(DarwinInputState *s, const char *why)
 {
     queue_clear(s);
-    s->wire_len = s->wire_pos = 0;
+    /* Terminate any prefix already delivered to the tty before the cancel.
+     * Dropping only our remaining bytes would splice two records together. */
+    s->wire[0] = '\n';
+    s->wire_len = 1;
+    s->wire_pos = 0;
     s->inflight_n = 0;
     s->contact_sent = false;
     s->wheel_notches = 0;
     s->wheel_deadline_vns = 0;
     s->cancel_pending = true;
+    s->btn_down = false;
+    s->dirty = false;
+    s->probe_sent_rns = s->probe_present_rns = 0;
     s->epoch++;
     s->c_epochs++;
     log_line(s, "new epoch (%s); cancelling any guest contact", why);
@@ -191,12 +199,19 @@ void darwin_input_wheel(DarwinInputState *s, int notches)
         return;
     }
     s->c_host_events++;
+    if (!guest_accepts_input(s)) {
+        s->c_overflow++;
+        s->status_dirty = true;
+        return;
+    }
     /* A wheel while a finger is down would fight the drag; ignore it. */
     if (s->btn_down || s->contact_sent) {
         return;
     }
     s->wheel_notches = CLAMP(s->wheel_notches + notches, -WHEEL_MAX_NOTCHES, WHEEL_MAX_NOTCHES);
-    if (!s->wheel_deadline_vns) {
+    if (!s->wheel_notches) {
+        s->wheel_deadline_vns = 0;
+    } else if (!s->wheel_deadline_vns) {
         s->wheel_deadline_vns = vnow() + WHEEL_BATCH_NS;
     }
     arm_timer(s);
@@ -252,6 +267,7 @@ static void wire_load(DarwinInputState *s, uint8_t kind, uint16_t a, uint16_t b,
         DarwinInputInflight *f = &s->inflight[s->inflight_n++];
         f->seq = seq;
         f->kind = kind;
+        f->acked = f->dispatched = false;
         f->sent_vns = vnow();
         f->sent_rns = rnow();
     }
@@ -282,7 +298,7 @@ static void darwin_input_pump(DarwinInputState *s)
 {
     DarwinInputRecord r;
 
-    if (!s->enabled) {
+    if (!s->enabled || !s->guest_state) {
         return;
     }
     for (;;) {
@@ -307,6 +323,18 @@ static void darwin_input_pump(DarwinInputState *s)
 
 /* ---------------- guest replies ---------------- */
 
+static bool needs_dispatch(uint8_t kind)
+{
+    return kind != 'P' && kind != 'C';
+}
+
+static void retire_record(DarwinInputState *s, uint32_t i)
+{
+    memmove(&s->inflight[i], &s->inflight[i + 1],
+            (s->inflight_n - i - 1) * sizeof(s->inflight[0]));
+    s->inflight_n--;
+}
+
 static void ack_line(DarwinInputState *s, const char *p)
 {
     unsigned epoch, seq;
@@ -314,48 +342,52 @@ static void ack_line(DarwinInputState *s, const char *p)
     long long guest_us, delivery_ms = -1;
     uint32_t i;
 
-    if (sscanf(p, "%u %u %c %c %lld %lld", &epoch, &seq, &code, &state, &guest_us,
-               &delivery_ms) < 5) {
+    if (sscanf(p, "%u %u %c %c %lld %lld", &epoch, &seq, &code, &state,
+               &guest_us, &delivery_ms) < 5 || guest_us < 0 ||
+        !strchr("SQFNE", code) || !strchr("IRL", state)) {
         s->c_parse_errors++;
         return;
     }
+    for (i = 0; i < s->inflight_n; i++) {
+        if (s->inflight[i].seq == seq) {
+            break;
+        }
+    }
+    /* A delayed/duplicate reply cannot revive a lost helper or retire a
+     * current record, and must never count as a successful submission. */
+    if (epoch != s->epoch || i == s->inflight_n || s->inflight[i].acked) {
+        s->c_ack_rejected++;
+        s->status_dirty = true;
+        return;
+    }
     s->last_guest_vns = vnow();
-    /* The guest wall clock is not aligned with the host's (values of
-     * ~1.7e12 ms were observed), so only plausible deltas are kept. */
     if (delivery_ms >= 0 && delivery_ms < 60000) {
         s->delivery_last_ms = delivery_ms;
         s->delivery_max_ms = MAX(s->delivery_max_ms, delivery_ms);
     }
-    if (state == 'I' || state == 'R' || state == 'L') {
-        if (s->guest_state != state) {
-            s->c_ready_changes++;
-            log_line(s, "guest state %c -> %c (ack)", s->guest_state ? s->guest_state : '?', state);
+    int64_t us = (rnow() - s->inflight[i].sent_rns) / SCALE_US;
+    s->last_ack_us = us;
+    s->max_ack_us = MAX(s->max_ack_us, us);
+    s->sum_ack_us += us;
+    s->n_ack_us++;
+    s->inflight[i].acked = true;
+    if (code == 'S' || code == 'Q') {
+        s->c_acked++;
+        if (!needs_dispatch(s->inflight[i].kind) || s->inflight[i].dispatched) {
+            retire_record(s, i);
+        }
+    } else {
+        if (code == 'F') s->c_ack_failed++;
+        else if (code == 'N') s->c_ack_not_ready++;
+        else s->c_ack_rejected++;
+        retire_record(s, i);
+    }
+    if (s->guest_state != state) {
+        s->c_ready_changes++;
+        if (s->guest_state == 'R' && state != 'R') {
+            new_epoch(s, "helper unavailable");
         }
         s->guest_state = state;
-    }
-    for (i = 0; i < s->inflight_n; i++) {
-        if (s->inflight[i].seq == seq) {
-            int64_t us = (rnow() - s->inflight[i].sent_rns) / SCALE_US;
-            s->last_ack_us = us;
-            s->max_ack_us = MAX(s->max_ack_us, us);
-            s->sum_ack_us += us;
-            s->n_ack_us++;
-            memmove(&s->inflight[i], &s->inflight[i + 1],
-                    (s->inflight_n - i - 1) * sizeof(s->inflight[0]));
-            s->inflight_n--;
-            break;
-        }
-    }
-    if (epoch != s->epoch) {
-        s->c_ack_rejected++;    /* a reply to a superseded epoch */
-    } else if (code == 'S' || code == 'Q') {
-        s->c_acked++;
-    } else if (code == 'F') {
-        s->c_ack_failed++;
-    } else if (code == 'N') {
-        s->c_ack_not_ready++;
-    } else {
-        s->c_ack_rejected++;
     }
     s->status_dirty = true;
     darwin_input_pump(s);
@@ -366,19 +398,28 @@ static void dispatch_line(DarwinInputState *s, const char *p)
     unsigned epoch, seq;
     char code;
     long long us;
+    uint32_t i;
 
-    if (sscanf(p, "%u %u %c %lld", &epoch, &seq, &code, &us) != 4) {
+    if (sscanf(p, "%u %u %c %lld", &epoch, &seq, &code, &us) != 4 ||
+        (code != 'S' && code != 'F') || us < 0) {
         s->c_parse_errors++;
         return;
     }
-    if (code == 'S') {
-        s->c_dispatched++;
-    } else {
-        s->c_dispatch_failed++;
+    for (i = 0; i < s->inflight_n; i++) {
+        if (s->inflight[i].seq == seq) break;
     }
+    if (epoch != s->epoch || i == s->inflight_n ||
+        !needs_dispatch(s->inflight[i].kind) || s->inflight[i].dispatched) {
+        return;
+    }
+    s->inflight[i].dispatched = true;
+    if (code == 'S') s->c_dispatched++;
+    else s->c_dispatch_failed++;
     s->dispatch_last_us = us;
     s->dispatch_max_us = MAX(s->dispatch_max_us, us);
+    if (s->inflight[i].acked) retire_record(s, i);
     s->status_dirty = true;
+    darwin_input_pump(s);
 }
 
 static void ready_line(DarwinInputState *s, const char *p)
@@ -392,10 +433,12 @@ static void ready_line(DarwinInputState *s, const char *p)
         return;
     }
     s->last_guest_vns = vnow();
-    if (state == 'I' && s->guest_pid && pid != s->guest_pid) {
+    if (s->guest_pid && pid != s->guest_pid) {
         s->c_guest_restarts++;
         log_line(s, "guest helper restarted (pid %u -> %u)", s->guest_pid, pid);
         new_epoch(s, "guest helper restart");
+    } else if (s->guest_state == 'R' && state != 'R') {
+        new_epoch(s, "helper unavailable");
     }
     if (s->guest_state != state) {
         s->c_ready_changes++;
@@ -451,21 +494,18 @@ static void check_timeouts(DarwinInputState *s)
     uint32_t i = 0;
 
     while (i < s->inflight_n) {
-        if (now - s->inflight[i].sent_vns > ACK_TIMEOUT_NS) {
+        int64_t deadline = s->inflight[i].acked ? DISPATCH_TIMEOUT_NS : ACK_TIMEOUT_NS;
+        if (now - s->inflight[i].sent_vns > deadline) {
             s->c_timeouts++;
-            log_line(s, "seq %u (%c) unacknowledged after %lld s of guest time",
-                     s->inflight[i].seq, s->inflight[i].kind,
-                     (long long)(ACK_TIMEOUT_NS / NANOSECONDS_PER_SECOND));
-            memmove(&s->inflight[i], &s->inflight[i + 1],
-                    (s->inflight_n - i - 1) * sizeof(s->inflight[0]));
-            s->inflight_n--;
-            if (s->guest_state != 'L') {
-                s->c_ready_changes++;
-                s->guest_state = 'L';
-            }
-        } else {
-            i++;
+            log_line(s, "seq %u (%c) %s timeout", s->inflight[i].seq,
+                     s->inflight[i].kind, s->inflight[i].acked ? "dispatch" : "ACK");
+            /* Nothing behind a timed-out edge can safely be replayed. */
+            new_epoch(s, "input timeout");
+            if (s->guest_state != 'L') s->c_ready_changes++;
+            s->guest_state = 'L';
+            return;
         }
+        i++;
     }
 }
 
@@ -563,8 +603,8 @@ char *darwin_input_status_json(DarwinInputState *s)
     g_string_append_printf(g, "\"contact_sent\":%s,\"btn_down\":%s,\"abs_x\":%d,\"abs_y\":%d,",
                            s->contact_sent ? "true" : "false", s->btn_down ? "true" : "false",
                            s->abs_x, s->abs_y);
-    g_string_append_printf(g, "\"queue_len\":%u,\"inflight\":%u,\"wire_pending\":%u,",
-                           s->q_len, s->inflight_n, s->wire_len - s->wire_pos);
+    g_string_append_printf(g, "\"wheel_pending\":%d,\"queue_len\":%u,\"inflight\":%u,\"wire_pending\":%u,",
+                           s->wheel_notches, s->q_len, s->inflight_n, s->wire_len - s->wire_pos);
     g_string_append_printf(g, "\"host_events\":%" PRIu64 ",\"coalesced\":%" PRIu64
                            ",\"overflow_or_not_ready_drops\":%" PRIu64 ",",
                            s->c_host_events, s->c_coalesced, s->c_overflow);

@@ -55,6 +55,7 @@ struct DarwinFBState {
     int touch_x, touch_y;
     bool touch_down, touch_sent_down, touch_dirty;
     bool shift, ctrl, alt, caps;
+    bool home_key_down, home_mouse_down, power_key_down;
     DarwinInputState input;   /* native UART transport, DARWIN_INPUT_UART=1 */
 };
 
@@ -211,7 +212,21 @@ static void darwin_kbd_event(DeviceState *dev, QemuConsole *src, QemuInputEvent 
      * buttons (consumer page 0x0c usages 0x40/0x30), both edges forwarded;
      * the right mouse button is Home as well (darwin_touch_event). */
     if (s->input.enabled && (key == KEY_F5 || key == KEY_F6)) {
-        darwin_input_consumer(&s->input, key == KEY_F5 ? 0x40 : 0x30, down);
+        if (key == KEY_F5) {
+            bool was_down = s->home_key_down || s->home_mouse_down;
+            s->home_key_down = down;
+            if (was_down != (down || s->home_mouse_down)) {
+                darwin_input_consumer(&s->input, 0x40, down || s->home_mouse_down);
+            }
+        } else if (s->power_key_down != down) {
+            s->power_key_down = down;
+            darwin_input_consumer(&s->input, 0x30, down);
+        }
+        return;
+    }
+    /* The native helper owns console RX. Raw keyboard bytes would splice
+     * into framed touch records (and can swallow the release). */
+    if (s->input.enabled) {
         return;
     }
 
@@ -313,7 +328,12 @@ static void darwin_touch_event(DeviceState *dev, QemuConsole *src,
     } else if (evt->type == INPUT_EVENT_KIND_BTN &&
                evt->btn.button == INPUT_BUTTON_RIGHT) {
         /* Right button = the guest's Home button, both edges forwarded. */
-        darwin_input_consumer(&s->input, 0x40, evt->btn.down);
+        bool was_down = s->home_key_down || s->home_mouse_down;
+        s->home_mouse_down = evt->btn.down;
+        if (was_down != (s->home_key_down || s->home_mouse_down)) {
+            darwin_input_consumer(&s->input, 0x40,
+                                  s->home_key_down || s->home_mouse_down);
+        }
     } else if (evt->type == INPUT_EVENT_KIND_BTN && evt->btn.down &&
                (evt->btn.button == INPUT_BUTTON_WHEEL_UP ||
                 evt->btn.button == INPUT_BUTTON_WHEEL_DOWN)) {
@@ -361,6 +381,7 @@ static int darwin_fb_post_load(void *opaque, int version_id)
     }
     qemu_console_update_full(s->con);
     /* Host pointer state did not travel with the snapshot; release. */
+    s->home_key_down = s->home_mouse_down = s->power_key_down = false;
     darwin_input_reset(&s->input, "migration restore");
     return 0;
 }
@@ -369,6 +390,7 @@ static void darwin_fb_reset(DeviceState *dev)
 {
     DarwinFBState *s = DARWIN_FB(dev);
 
+    s->home_key_down = s->home_mouse_down = s->power_key_down = false;
     darwin_input_reset(&s->input, "device reset");
 }
 
