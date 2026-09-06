@@ -140,7 +140,9 @@ static void fourcc_str(uint32_t v, char *out)
 static SMCKey *smc_add(DarwinSMC *s, const char *key, const char *type, unsigned size,
                        const void *data, bool writable, const char *why)
 {
-    g_assert(s->n_keys < SMC_MAX_KEYS && size <= sizeof(s->keys[0].data));
+    /* Keys larger than the stored payload are write-only sinks (the
+     * AppleSMC event-log records); their data is never read back. */
+    g_assert(s->n_keys < SMC_MAX_KEYS && (size <= sizeof(s->keys[0].data) || !data));
     SMCKey *k = &s->keys[s->n_keys++];
     memcpy(k->key, key, 4); k->key[4] = 0;
     memcpy(k->type, type, 4); k->type[4] = 0;
@@ -149,7 +151,7 @@ static SMCKey *smc_add(DarwinSMC *s, const char *key, const char *type, unsigned
      * bit 6 writable (Apple's SMC_FLAG_* in IOKit's SMC headers) */
     k->flags = 0x80 | (writable ? 0x40 : 0);
     k->writable = writable;
-    if (data) memcpy(k->data, data, size);
+    if (data) memcpy(k->data, data, MIN(size, sizeof(k->data)));
     k->why = why;
     return k;
 }
@@ -423,6 +425,15 @@ static void smc_populate_battery(DarwinSMC *s)
      * of 100, which is what the pack's own BUIC/StateOfCharge use. */
     smc_add_u(s, "B0UC", "ui8 ", 1, 0, false, "AppleSmartBattery cmd 0x0f CurrentCapacity");
     smc_add_u(s, "B0CM", "ui8 ", 1, 0, false, "AppleSmartBattery cmd 0x10 MaxCapacity");
+    /* Adapter / port / accessory counts, 1 byte each, polled every cycle
+     * (0xfffffff0096afdbc AC-N, 0xfffffff0096b0b44 AP-N, 0xfffffff0096b05c4
+     * AY-N).  A nonzero count makes the driver enumerate per-index records
+     * (`D<n>JQ`, 44 bytes, and 12-byte siblings) whose layout is unknown, so
+     * the counts are zero: no adapter details, the same AdapterDetails the
+     * driver published while the keys were absent. */
+    smc_add_u(s, "AC-N", "ui8 ", 1, 0, false, "AppleSmartBattery adapter count");
+    smc_add_u(s, "AP-N", "ui8 ", 1, 0, false, "AppleSmartBattery port count");
+    smc_add_u(s, "AY-N", "ui8 ", 1, 0, false, "AppleSmartBattery accessory count");
     /* pack-level keys with macsmc-power semantics, for AppleSmartBatteryPack */
     smc_add_u(s, "B0TF", "ui16", 2, 0, false, "time to full (macsmc-power)");
     smc_add_u(s, "B0RM", "ui16", 2, 0, false, "remaining capacity mAh (macsmc-power)");
@@ -505,6 +516,17 @@ static void smc_populate(DarwinSMC *s)
     smc_add_u(s, "MBSE", "ui32", 4, 0, true, "AppleSMC panic begin");
     smc_add_u(s, "MBSW", "ui64", 8, 0, false, "AppleSMC panic status");
     smc_add_u(s, "MESS", "ui8 ", 1, 0, false, "AppleSMC panic message");
+    /* AppleSMC's event-buffer log handler ("Created eventbuffer log
+     * handler") pushes records into SMC scratch keys: probe BATT_SYS5 saw
+     * 69 writes of 120 bytes to zEPE and a few to zETM / zETN (120), zEWi
+     * (32), zECm (64) and zEAO (32).  They are write-only sinks here;
+     * nothing reads them back. */
+    smc_add(s, "zEPE", "hex_", 120, NULL, true, "AppleSMC event log record");
+    smc_add(s, "zETM", "hex_", 120, NULL, true, "AppleSMC event log record");
+    smc_add(s, "zETN", "hex_", 120, NULL, true, "AppleSMC event log record");
+    smc_add(s, "zEWi", "hex_", 32, NULL, true, "AppleSMC event log record");
+    smc_add(s, "zECm", "hex_", 64, NULL, true, "AppleSMC event log record");
+    smc_add(s, "zEAO", "hex_", 32, NULL, true, "AppleSMC event log record");
 
     smc_populate_battery(s);
 
@@ -584,6 +606,11 @@ static bool smc_handle(void *opaque, uint8_t ep, uint64_t msg)
             smc_reply(s, reply | SMC_KEY_SIZE_MISMATCH);
             return true;
         }
+        if (k->size > sizeof(k->data)) {
+            fprintf(stderr, "smc: READ %s: write-only sink (0x85)\n", name);
+            smc_reply(s, reply | SMC_KEY_NOT_READABLE);
+            return true;
+        }
         if (s->debug) {
             fprintf(stderr, "smc: READ %s (%s) ->", name, k->type);
             for (unsigned i = 0; i < k->size; i++) fprintf(stderr, " %02x", k->data[i]);
@@ -604,7 +631,7 @@ static bool smc_handle(void *opaque, uint8_t ep, uint64_t msg)
 
     case SMC_WRITE_KEY: {
         SMCKey *k = smc_find(s, key);
-        uint8_t buf[64] = { 0 };
+        uint8_t buf[128] = { 0 };
         if (size <= sizeof(buf)) {
             smc_shmem_rw(s, buf, size, false);
         }
@@ -626,8 +653,8 @@ static bool smc_handle(void *opaque, uint8_t ep, uint64_t msg)
             smc_reply(s, reply | SMC_KEY_SIZE_MISMATCH);
             return true;
         }
-        memcpy(k->data, buf, size);
-        fprintf(stderr, " stored\n");
+        memcpy(k->data, buf, MIN(size, sizeof(k->data)));
+        fprintf(stderr, k->size > sizeof(k->data) ? " sunk\n" : " stored\n");
         smc_reply(s, reply | SMC_OK);
         return true;
     }
