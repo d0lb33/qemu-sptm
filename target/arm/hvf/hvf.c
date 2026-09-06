@@ -933,12 +933,22 @@ int hvf_arch_get_registers(CPUState *cpu)
     ret = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &val);
     assert_hvf_ok(ret);
     if (hvf_virtual_el2) {
-        if ((val & 0xc) != 4) {
+        /*
+         * Physical EL1 carries virtual EL2/GL2; physical EL0 carries
+         * virtual EL0, which is GL0 while CURRENTG is set (TXM after SPTM's
+         * bootstrap ERET at 0xfffffff02709ab80). PSTATE.SP selects the
+         * physical SP_EL1 bank, which holds the guarded or ordinary EL2
+         * stack according to CURRENTG.
+         */
+        if ((val & 0xc) == 4) {
+            pstate_write(env, (val & ~UINT64_C(0xc)) | 8);
+        } else if ((val & 0xc) == 0) {
+            pstate_write(env, val);
+        } else {
             error_report("Virtual EL2 unexpected physical PSTATE=0x%" PRIx64,
                          val);
             exit(EXIT_FAILURE);
         }
-        pstate_write(env, (val & ~UINT64_C(0xc)) | 8);
         assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL0,
                                           &env->sp_el[0]));
         assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
@@ -950,7 +960,7 @@ int hvf_arch_get_registers(CPUState *cpu)
                 g_assert_not_reached();
             }
         }
-        aarch64_restore_sp(env, 2);
+        aarch64_restore_sp(env, arm_current_el(env));
         return 0;
     }
     pstate_write(env, val);
@@ -1118,27 +1128,32 @@ int hvf_arch_put_registers(CPUState *cpu)
     assert_hvf_ok(ret);
 
     if (hvf_virtual_el2) {
-        if (arm_current_el(env) != 2 ||
+        unsigned el = arm_current_el(env);
+
+        if ((el != 2 && el != 0) || (el == 0 && !hvf_vsh.active) ||
             (env->cp15.sctlr_el[1] & SCTLR_M) ||
             (!!(env->cp15.sctlr_el[2] & SCTLR_M) != hvf_vsh.active)) {
-            error_report("Virtual EL2 context lacks shadow owner");
+            error_report("Virtual EL2 context lacks shadow owner (EL%u)", el);
             exit(EXIT_FAILURE);
         }
-        aarch64_save_sp(env, 2);
+        aarch64_save_sp(env, el);
         assert_hvf_ok(hv_vcpu_set_reg(cpu->accel->fd, HV_REG_CPSR,
-                                      (pstate_read(env) & ~UINT64_C(0xc)) | 4));
+                                      el == 2 ?
+                                      (pstate_read(env) & ~UINT64_C(0xc)) | 4 :
+                                      pstate_read(env)));
         assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL0,
                                           env->sp_el[0]));
         assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
                          arm_apple_is_gl(env) ? env->sp_gl[2] : env->sp_el[2]));
         /*
-         * Guest EL2 FP permissions do not follow physical EL1's CPACR.
-         * Use the architectural trap decision, including VHE CPTR format,
-         * before allowing native FP/SIMD. Keep physical EL0, SVE and SME
-         * disabled; those virtual execution contexts are not integrated.
+         * Guest FP permissions do not follow physical EL1's CPACR. Use the
+         * architectural trap decision for EL2 and EL0, including the VHE
+         * CPTR format, before allowing native FP/SIMD at each level. SVE
+         * and SME stay disabled; those contexts are not integrated.
          */
         uint64_t cpacr = FIELD_DP64(0, CPACR_EL1, FPEN,
-                                    fp_exception_el(env, 2) ? 0 : 1);
+                                    fp_exception_el(env, 2) ? 0 :
+                                    fp_exception_el(env, 0) ? 1 : 3);
         assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
                                           HV_SYS_REG_CPACR_EL1, cpacr));
         if (hvf_vsh.active) {

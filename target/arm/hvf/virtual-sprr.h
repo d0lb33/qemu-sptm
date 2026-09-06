@@ -40,8 +40,8 @@ static int hvf_virtual_sprr_write(CPUState *cpu, const ARMCPRegInfo *ri,
     if (!ri->writefn || env->sprr_config_el[1] ||
         (old_config != 0 && old_config != 1 &&
          old_config != 0xfb && old_config != 0xff) ||
-        env->gxf_config_el[2] > 1 ||
-        (arm_apple_is_gl(env) && env->gxf_config_el[2] != 1)) {
+        (env->gxf_config_el[2] && !hvf_virtual_gxf_config_ok(env)) ||
+        (arm_apple_is_gl(env) && !hvf_virtual_gxf_config_ok(env))) {
         error_report("Virtual SPRR unsupported configuration for %s "
                      "at 0x%" PRIx64, ri->name, env->pc);
         return -1;
@@ -90,6 +90,17 @@ static int hvf_virtual_sprr_write(CPUState *cpu, const ARMCPRegInfo *ri,
          */
         if (mask != 0x40010) {
             goto unsupported;
+        }
+        /*
+         * The user permission bank is rewritten from guarded EL2 after the
+         * configuration lock: SPTM 0xfffffff02709aaf0 installs TXM's GL0
+         * bank before its bootstrap ERET, and 0xfffffff0270e6be0 /
+         * 0xfffffff02709b03c swap it on each lower-context switch. Every
+         * accepted write discards the native aliases so EL0 permissions are
+         * rewalked under the new bank.
+         */
+        if (!strcmp(ri->name, "SPRR_UPERM_EL0") && arm_apple_is_gl(env)) {
+            return 1;
         }
         if (pperm && !((value ^ env->sprr_pperm_el[2]) &
                        ~UINT64_C(0x1000000100))) {

@@ -10,8 +10,8 @@
 #include "virtual-shadow.h"
 #include "virtual-counter.h"
 #include "virtual-protection.h"
-#include "virtual-sprr.h"
 #include "virtual-gxf.h"
+#include "virtual-sprr.h"
 #include "virtual-pmu.h"
 #include "virtual-vmsa.h"
 
@@ -67,6 +67,10 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
         *advance = false;
         return hvf_virtual_gxf_transition(cpu, word != 0x00201400, word & 15);
     }
+    if (word == 0xd69f03e0) {
+        *advance = false;
+        return hvf_virtual_eret(cpu);
+    }
     if (word == 0xd508751f && arm_current_el(env) == 2 && hvf_vsh.active) {
         hvf_vsh_icache(cpu);
         return true;
@@ -87,31 +91,30 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
         pstate_write(env, pstate_read(env) | (((word >> 8) & 15) << 6));
         return true;
     }
-    if (word == 0xd508871f && arm_current_el(env) == 2 &&
-        !(env->cp15.sctlr_el[1] & SCTLR_M) &&
+    /*
+     * TLBI: op0=1, CRn=8 (ordinary) or CRn=9 (nXS). The private helper
+     * performs a full TLBI VMALLE1 before resuming, which is a superset of
+     * every by-VA/by-ASID form. Guest table stores and accepted TCR/TTBR
+     * writes already discard aliases separately, so the remaining checked
+     * leaves stay valid; only the native TLB needs refreshing here.
+     */
+    bool tlbi = arm_current_el(env) == 2 &&
+                (word & 0xffc00000) == 0xd5000000 &&
+                ((word >> 19) & 3) == 1 &&
+                (((word >> 12) & 15) == 8 || ((word >> 12) & 15) == 9);
+    if (tlbi && !(env->cp15.sctlr_el[1] & SCTLR_M) &&
         !(env->cp15.sctlr_el[2] & SCTLR_M)) {
         /*
-         * VMALLE1 has no translations to invalidate in this initial mode.
-         * Native shadows are not installed until the guarded MMU handoff.
-         * Keep the software TLB empty for architectural register callbacks.
+         * No translations to invalidate in this initial mode. Native
+         * shadows are not installed until the guarded MMU handoff. Keep the
+         * software TLB empty for architectural register callbacks.
          */
         tlb_flush(cpu);
         error_report("Virtual EL2 TLBI VMALLE1, empty context pc=0x%" PRIx64,
                      env->pc);
         return true;
     }
-    if ((word == 0xd508871f || word == 0xd508971f ||
-         (word & ~31U) == 0xd50887e0 || /* VAALE1 */
-         (word & ~31U) == 0xd50897e0 || /* VAALE1NXS */
-         (word & ~31U) == 0xd50886e0 || /* RVAALE1 */
-         (word & ~31U) == 0xd50896e0) && /* RVAALE1NXS */
-        arm_current_el(env) == 2 && hvf_vsh.active) {
-        /*
-         * The helper performs a stronger full invalidation for these TLBIs.
-         * Protection changes still stop. Accepted TCR/TTBR writes and
-         * emulated table stores discard every alias separately, so the
-         * remaining checked leaves stay valid.
-         */
+    if (tlbi && hvf_vsh.active) {
         hvf_vsh.generation++;
         error_report("Virtual EL2 TLBI full native context pc=0x%" PRIx64,
                      env->pc);
@@ -186,12 +189,38 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
         }
         return ok;
     }
+    if ((ri->type & ARM_CP_SPECIAL_MASK) == ARM_CP_NOP && hvf_vsh.active &&
+        arm_current_el(env) == 2) {
+        /*
+         * Cache maintenance by VA (DC CIVAC/CVAC/CVAU/IVAC, IC IVAU). QEMU's
+         * architectural table types these ARM_CP_NOP: the emulated memory
+         * system is coherent, and native RAM aliases are host-coherent too.
+         * SPTM 0xfffffff0270a39b8 issues about two thousand DC CIVAC during
+         * bootstrap. Instruction-cache forms take the same path as IC IALLU
+         * so natively executed code observes any preceding checked store.
+         */
+        static unsigned logged;
+        if (!strncmp(ri->name, "IC", 2)) {
+            hvf_vsh_icache(cpu);
+        }
+        if (logged++ < 8) {
+            error_report("Virtual EL2 cache maintenance %s as no-op at 0x%"
+                         PRIx64, ri->name, env->pc);
+        }
+        return true;
+    }
     bool counter_read = read && hvf_virtual_counter_read(ri);
     bool counter_route = !read && (!strcmp(ri->name, "AGTCNTRDIR_EL2") ||
                                    !strcmp(ri->name, "AGTCNTRDIR_EL1"));
+    /*
+     * Redirection values 0..3 select among counter sources that are all the
+     * same 24 MHz zero-offset clock in the supported common-clock context
+     * (SPTM 0xfffffff02709ab10 writes 1 before entering TXM); any selection
+     * therefore reads the same value. Independent offsets remain unsupported.
+     */
     if ((counter_read || counter_route) &&
         (!hvf_virtual_counter_common(cpu) ||
-         (counter_route && value != 0 && value != 3))) {
+         (counter_route && value > 3))) {
         error_report("Virtual counter requires common 24 MHz zero-offset "
                      "disabled-timer context: %s at 0x%" PRIx64,
                      ri->name, env->pc);
@@ -212,21 +241,58 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                              (!strcmp(ri->name, "TCR_EL2") ||
                               !strcmp(ri->name, "TTBR0_EL2") ||
                               !strcmp(ri->name, "TTBR1_EL2"));
+    /*
+     * Any TCR/TTBR change is accepted while the layout stays one the shadow
+     * tables support; hvf_vsh_invalidate rebuilds the roots from the new
+     * register. SPTM 0xfffffff02709ab4c clears TCR.E0PD1 before entering
+     * TXM; the software walker applies such bits on each rewalk.
+     */
     if (translation_write &&
-        (!ri->writefn || env->sprr_config_el[2] || env->gxf_config_el[2] ||
+        (!ri->writefn ||
          !hvf_vsh_tcr_valid(!strcmp(ri->name, "TCR_EL2") ? value :
                            env->cp15.tcr_el[2]))) {
         error_report("Virtual shadow unsupported translation context: %s "
                      "at 0x%" PRIx64, ri->name, env->pc);
         return false;
     }
+    /*
+     * SCTLR_EL2 while the shadow is live: the MMU may not be turned off
+     * (VMSA_LOCK bit 63 already forbids it) and every other bit is carried
+     * to the physical SCTLR_EL1 by hvf_vsh_put after invalidation.
+     */
+    bool sctlr_write = !read && !strcmp(ri->name, "SCTLR_EL2");
+    if (sctlr_write && hvf_vsh.active && !(value & SCTLR_M)) {
+        error_report("Virtual EL2 MMU disable unsupported at 0x%" PRIx64,
+                     env->pc);
+        return false;
+    }
+    /*
+     * A write that stores exactly the current value changes no state; the
+     * lower-context save/restore blocks at SPTM 0xfffffff0270e6be0 and
+     * 0xfffffff02709b03c rewrite JCTL/BP_OBJC/SCTLR unchanged.
+     */
+    bool unchanged = !read && !(ri->type & ARM_CP_CONST) &&
+                     (ri->fieldoffset || ri->readfn || ri->raw_readfn) &&
+                     value == read_raw_cp_reg(env, ri);
     bool bank_write = translation_write || sprr_write > 0 || range_write > 0 ||
                       gxf_write > 0 || pmu_write > 0 || vmsa_write > 0 ||
-                      counter_route ||
+                      counter_route || unchanged ||
+                      (sctlr_write && hvf_vsh.active) ||
                       !strcmp(ri->name, "VBAR_EL2") ||
                       !strcmp(ri->name, "TPIDR_EL2") ||
+                      !strcmp(ri->name, "SP_EL0") ||
+                      !strcmp(ri->name, "DAIF") ||
                       (!strcmp(ri->name, "APL_INTENABLE_EL2") && value == 0) ||
-                      (!strcmp(ri->name, "ACFG_EL1") && value == 0x18) ||
+                      /*
+                       * ACFG[4:3] are cache-operation disables in the M5
+                       * field dump; SPTM toggles bit 3 around its DC CIVAC
+                       * loop (0xfffffff0270a39e4/3a04). Emulated cache ops
+                       * are no-ops either way. APCTL_EL2 is pointer-auth
+                       * control stored without semantics, as in TCG.
+                       */
+                      (!strncmp(ri->name, "ACFG_EL", 7) &&
+                       (value == 0x18 || value == 0x10)) ||
+                      !strncmp(ri->name, "APCTL_EL", 8) ||
                       (!strcmp(ri->name, "MDSCR_EL1") && value == 0x1000);
     if (!read && hvf_vsh.active && !bank_write) {
         error_report("Virtual shadow context change requires invalidation: "
@@ -235,7 +301,8 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
     }
     /* No native translation may run until the shadow context is installed. */
     if (!read && (strcmp(ri->name, "SCTLR_EL1") == 0 ||
-                  strcmp(ri->name, "SCTLR_EL2") == 0) && (value & SCTLR_M)) {
+                  strcmp(ri->name, "SCTLR_EL2") == 0) && (value & SCTLR_M) &&
+        !hvf_vsh.active) {
         if (!hvf_vsh_start(cpu, ri, value)) {
             error_report("Virtual EL2 MMU handoff at 0x%" PRIx64
                          " %s=0x%" PRIx64 " requires shadow context",
@@ -286,7 +353,8 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                      ri->name, env->pc);
         return false;
     }
-    if (translation_write || sprr_write > 0 || gxf_write > 0) {
+    if (translation_write || sprr_write > 0 || gxf_write > 0 ||
+        range_write > 0 || (sctlr_write && hvf_vsh.active && !unchanged)) {
         hvf_vsh_invalidate(cpu);
     }
     if (read && rt != 31) {
