@@ -140,7 +140,7 @@ static void fourcc_str(uint32_t v, char *out)
 static SMCKey *smc_add(DarwinSMC *s, const char *key, const char *type, unsigned size,
                        const void *data, bool writable, const char *why)
 {
-    /* Keys larger than the stored payload are write-only sinks (the
+    /* A NULL payload denotes a write-only sink (the
      * AppleSMC event-log records); their data is never read back. */
     g_assert(s->n_keys < SMC_MAX_KEYS && (size <= sizeof(s->keys[0].data) || !data));
     SMCKey *k = &s->keys[s->n_keys++];
@@ -149,7 +149,7 @@ static SMCKey *smc_add(DarwinSMC *s, const char *key, const char *type, unsigned
     k->size = size;
     /* flags byte as m1n1 decodes it from GET_KEY_INFO: bit 7 readable,
      * bit 6 writable (Apple's SMC_FLAG_* in IOKit's SMC headers) */
-    k->flags = 0x80 | (writable ? 0x40 : 0);
+    k->flags = (data ? 0x80 : 0) | (writable ? 0x40 : 0);
     k->writable = writable;
     if (data) memcpy(k->data, data, MIN(size, sizeof(k->data)));
     k->why = why;
@@ -606,7 +606,7 @@ static bool smc_handle(void *opaque, uint8_t ep, uint64_t msg)
             smc_reply(s, reply | SMC_KEY_SIZE_MISMATCH);
             return true;
         }
-        if (k->size > sizeof(k->data)) {
+        if (!(k->flags & 0x80) || k->size > sizeof(k->data)) {
             fprintf(stderr, "smc: READ %s: write-only sink (0x85)\n", name);
             smc_reply(s, reply | SMC_KEY_NOT_READABLE);
             return true;

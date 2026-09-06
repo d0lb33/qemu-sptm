@@ -420,17 +420,18 @@ static void darwin_init(MachineState *ms) {
     // the NVMe half at machine-init-done and expects the generic ASC to
     // already exist, so in that mode we create nothing and leave "ans"
     // unclaimed. Delete this branch, and the scaffold, once the guarded path
-    // has been boot-tested. ("ans" must stay last in the array for this.)
+    // has been boot-tested.
     // The SMC gets its key endpoint (darwin_smc.c) instead of the bare
     // mailbox; it is claimed here so the generic pass skips it. It returns
     // NULL and claims nothing when dt_fixup ran without -enable smc.
-    static const char *const claimed_ascs[] = { "dcp", "sep", "smc", "ans" };
-    unsigned n_claimed = ARRAY_SIZE(claimed_ascs);
-    darwin_smc_create(dt_root, iobase, aic);
-    if (getenv("DARWIN_ANS_SELFWIRE")) {
-        n_claimed--;
-    } else {
+    const char *claimed_ascs[4] = { "dcp", "sep" };
+    unsigned n_claimed = 2;
+    if (darwin_smc_create(dt_root, iobase, aic)) {
+        claimed_ascs[n_claimed++] = "smc";
+    }
+    if (!getenv("DARWIN_ANS_SELFWIRE")) {
         darwin_ans_create(dt_root, iobase, aic);
+        claimed_ascs[n_claimed++] = "ans";
     }
     darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, n_claimed);
     // SPMI controller + Dialog PMU (RTC). Created only when dt_fixup ran with
