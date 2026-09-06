@@ -32,6 +32,7 @@
 #include "xnu/darwin_ans.h"
 #include "xnu/darwin_unimp.h"
 #include "xnu/darwin_smp.h"
+#include "xnu/darwin_spmi.h"
 #include "xnu/gxfstat.h"
 
 // See device tree specification section 2.3.8: ranges
@@ -427,6 +428,10 @@ static void darwin_init(MachineState *ms) {
         darwin_ans_create(dt_root, iobase, aic);
     }
     darwin_ascs_create(dt_root, iobase, aic, claimed_ascs, n_claimed);
+    // SPMI controller + Dialog PMU (RTC). Created only when dt_fixup ran with
+    // -enable spmi; the PMU's IRQ goes into the controller, the controller's
+    // into the AIC. See darwin_spmi.c / darwin_pmu.c for the traced layout.
+    darwin_spmi_create(dt_root, iobase, aic);
     init_sep(dt_root);
     if (ms->smp.cpus == 1) {
         init_cpu_impl(dt_root);

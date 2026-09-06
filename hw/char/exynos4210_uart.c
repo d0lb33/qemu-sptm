@@ -137,6 +137,7 @@ typedef struct {
     uint8_t    *data;
     uint32_t    sp, rp; /* store and retrieve pointers */
     uint32_t    size;
+    bool        full;
 } Exynos4210UartFIFO;
 
 #define TYPE_EXYNOS4210_UART "exynos4210.uart"
@@ -160,6 +161,9 @@ struct Exynos4210UartState {
 
     uint32_t channel;
 
+    /* darwin-input TX tap; runtime only, never part of migration state. */
+    Exynos4210UartTxObserver tx_observer;
+    void *tx_observer_opaque;
 };
 
 
@@ -181,19 +185,31 @@ static const char *exynos4210_uart_regname(hwaddr  offset)
 
 static void fifo_store(Exynos4210UartFIFO *q, uint8_t ch)
 {
+    /* Equal cursors mean either empty or full. Without this bit, receiving
+     * exactly size bytes makes the entire buffer disappear (including when
+     * can_receive correctly applies chardev backpressure).
+     */
+    if (q->full) {
+        return;
+    }
     q->data[q->sp] = ch;
     q->sp = (q->sp + 1) % q->size;
+    q->full = q->sp == q->rp;
 }
 
 static uint8_t fifo_retrieve(Exynos4210UartFIFO *q)
 {
     uint8_t ret = q->data[q->rp];
     q->rp = (q->rp + 1) % q->size;
+    q->full = false;
     return  ret;
 }
 
 static int fifo_elements_number(const Exynos4210UartFIFO *q)
 {
+    if (q->full) {
+        return q->size;
+    }
     if (q->sp < q->rp) {
         return q->size - q->rp + q->sp;
     }
@@ -215,6 +231,7 @@ static void fifo_reset(Exynos4210UartFIFO *q)
 
     q->sp = 0;
     q->rp = 0;
+    q->full = false;
 }
 
 static uint32_t exynos4210_uart_FIFO_trigger_level(uint32_t channel,
@@ -436,6 +453,9 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
              * qemu_chr_fe_write and background I/O callbacks */
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
             trace_exynos_uart_tx(s->channel, ch);
+            if (s->tx_observer) {
+                s->tx_observer(s->tx_observer_opaque, ch);
+            }
             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
                     UTRSTAT_Tx_BUFFER_EMPTY;
             s->reg[I_(UINTSP)]  |= UINTSP_TXD;
@@ -624,16 +644,48 @@ static int exynos4210_uart_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool exynos4210_uart_fifo_full_needed(void *opaque)
+{
+    Exynos4210UartFIFO *q = opaque;
+    return q->full;
+}
+
+static int exynos4210_uart_fifo_pre_load(void *opaque)
+{
+    Exynos4210UartFIFO *q = opaque;
+    q->full = false;
+    return 0;
+}
+
+/* Preserve the v1 cursor/data layout so existing warm checkpoints load.
+ * Old streams omit this subsection and retain the reset empty/full bit.
+ */
+static const VMStateDescription vmstate_exynos4210_uart_fifo_full = {
+    .name = "exynos4210.uart.fifo/full",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = exynos4210_uart_fifo_full_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(full, Exynos4210UartFIFO),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_exynos4210_uart_fifo = {
     .name = "exynos4210.uart.fifo",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = exynos4210_uart_fifo_pre_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(sp, Exynos4210UartFIFO),
         VMSTATE_UINT32(rp, Exynos4210UartFIFO),
         VMSTATE_VBUFFER_UINT32(data, Exynos4210UartFIFO, 1, NULL, size),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_exynos4210_uart_fifo_full,
+        NULL
+    },
 };
 
 static const VMStateDescription vmstate_exynos4210_uart = {
@@ -668,6 +720,20 @@ int exynos4210_uart_inject(DeviceState *dev, const uint8_t *buf, int len)
     }
     exynos4210_uart_receive(s, buf, len);
     return len;
+}
+
+void exynos4210_uart_set_tx_observer(DeviceState *dev,
+                                     Exynos4210UartTxObserver fn, void *opaque)
+{
+    Exynos4210UartState *s = EXYNOS4210_UART(dev);
+
+    s->tx_observer = fn;
+    s->tx_observer_opaque = opaque;
+}
+
+int exynos4210_uart_rx_space(DeviceState *dev)
+{
+    return exynos4210_uart_can_receive(EXYNOS4210_UART(dev));
 }
 
 DeviceState *exynos4210_uart_create(hwaddr addr,

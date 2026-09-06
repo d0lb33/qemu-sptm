@@ -128,6 +128,7 @@ endif
 if have_system
   tests += {
     'test-darwin-afk-state': [],
+    'test-darwin-iomfb-swap': [meson.project_source_root() / 'hw/arm/darwin_iomfb_swap.c'],
     'test-darwin-sks-migrate': [meson.project_source_root() / 'hw/arm/darwin_sks.c'],
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
     'test-iov': [],

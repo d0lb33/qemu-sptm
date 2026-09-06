@@ -8,23 +8,30 @@
 #include "hw/arm/darwin_sks.h"
 
 /*
- * IPC selector 0, length 20, then DER SET OF SEQUENCE { UTF8 key, INTEGER }.
- * The native decoder at 0xfffffff009581144 writes "ss" to record+0 and
- * "bh" to record+0x2a. Public selector 7 returns record+0; MobileKeyBag's
- * MKBDeviceUnlockedSinceBoot tests its bit 2. This models the existing
- * deterministic, unlocked fake-key environment, not SEP keybag security.
+ * IPC selector 0, DER SET OF SEQUENCE { UTF8 key, INTEGER }. The native
+ * method-17 decoder at 0xfffffff009581144 maps descriptor
+ * 0xfffffff00b821868 ("ss") to record+0 and its adjacent descriptor
+ * 0xfffffff00b821870 ("sls") to record+4. _MKBGetDeviceLockState returns
+ * that +4 word unchanged (MobileKeyBag 0x1ae4da09c..0x1ae4da0cc), and
+ * SBFMobileKeyBag treats lock state 3 as no passcode. Conversely selector 7
+ * exposes record+0 and MKBDeviceUnlockedSinceBoot tests bit 2 there; retain
+ * ss=4 to preserve first-unlock semantics.
  *
  * The old SET { UTF8 "bh", INTEGER -6 } silently decoded as an empty record:
- * ccder's sequence iterator at 0xfffffff00a9d08e8 requires the nested 0x30.
- * DISPLAY_UNLOCK_R1 proves these exact bytes decode to ss=4 and bh=-6.
+ * ccder's sequence iterator at 0xfffffff00a9d08e8 requires nested 0x30.
+ * DISPLAY_UNLOCK_R1 proves bh=-6 and ss=4. The method-17 encoder/parser
+ * pairing and its adjacent "sls" DER descriptor prove the added field's
+ * spelling and record destination; a guest boot must validate acceptance.
  */
 size_t darwin_sks_build_unlocked_device_state(uint8_t *payload, size_t capacity)
 {
     static const uint8_t reply[DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE] = {
-        0, 0, 0, 0, 20, 0, 0, 0,
-        0x31, 0x12,
+        0, 0, 0, 0, 30, 0, 0, 0,
+        0x31, 0x1c,
         0x30, 0x07, 0x0c, 0x02, 'b', 'h', 0x02, 0x01, 0xfa,
         0x30, 0x07, 0x0c, 0x02, 's', 's', 0x02, 0x01, 0x04,
+        0x30, 0x08, 0x0c, 0x03, 's', 'l', 's', 0x02, 0x01, 0x03,
+        0, 0,
     };
 
     if (!payload || capacity < sizeof(reply)) {
@@ -84,6 +91,7 @@ size_t darwin_sks_build_unlocked_device_state(uint8_t *payload, size_t capacity)
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_C    3
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_D    4
 #define SKS_MIGRATE_TAGGED_TARGET_CLASS_A    1
+#define SKS_MIGRATE_TAGGED_TARGET_CLASS_B    2
 #define SKS_MIGRATE_TAGGED_ZERO_TAIL_OFF     0x70
 #define SKS_MIGRATE_TAGGED_ZERO_TAIL_SIZE    20
 #define SKS_MIGRATE_TAGGED_RECORD_LEN_OFF    0x84
@@ -195,7 +203,17 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
          * exhausts the one-request buffer and ends in an SKS timeout.
          * Preserve the class in the existing variant-3 reply; do not infer
          * support for other classes or relax the record/framing checks. */
-        (((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D ||
+        /* TOUCH_INPUT_R19 captures User 3 -> 2 (SHA256 4a03fd55ebd836a7).
+         * Dropping this exact tagged request caused R18's SKS timeout panic.
+         * The native bridge uses +0x68/+0x6c as source/destination classes
+         * (0xfffffff0095730a0..0x957311c); keep all other checks intact. */
+        /* TOUCH_NATIVE3 captures User 2 -> 1 (SHA256 5ff82948088905d0).
+         * This is the same native class-transfer ABI and exact User tag;
+         * dropping it panics the guest before its first input can arrive. */
+        ((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_A &&
+          result.record_kind == SKS_MIGRATE_TAGGED_TARGET_CLASS_B) ||
+         ((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D ||
+           result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_B ||
            result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_A) &&
           result.record_kind == SKS_MIGRATE_TAGGED_USER_RECORD_KIND) ||
          /* DISPLAY_NATIVE_R4 then captures the reverse 1 -> 3 transfer

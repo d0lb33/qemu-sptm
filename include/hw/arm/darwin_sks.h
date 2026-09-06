@@ -11,7 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE 28
+/* IPC header (8) + 30-byte DER SET, rounded up to four-byte framing. */
+#define DARWIN_SKS_DEVICE_STATE_PAYLOAD_SIZE 40
 
 size_t darwin_sks_build_unlocked_device_state(uint8_t *payload,
                                               size_t capacity);
