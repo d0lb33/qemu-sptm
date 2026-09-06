@@ -22,7 +22,7 @@ typedef struct DVMGPUTransport {
     unsigned rx_used;
     uint64_t submitted, done;
     uint32_t error;
-    bool external, ready, connected;
+    bool external, ready, connected, present;
     CharFrontend notify;
     Error *migration_blocker;
 } DVMGPUTransport;
@@ -40,7 +40,7 @@ static bool valid_header(DVMGPUTransport *s, unsigned offset, uint64_t seq)
 {
     uint8_t *h = s->bytes + offset;
     return !memcmp(h, s->session, 16) && ldq_le_p(h + 16) == seq &&
-           ldl_le_p(h + 24) <= DVM_GPU_MAX_BYTES;
+           ldl_le_p(h + 24) <= (s->present ? 0x10000 : DVM_GPU_MAX_BYTES);
 }
 
 static void completed(DVMGPUTransport *s, uint64_t seq)
@@ -54,7 +54,7 @@ static void completed(DVMGPUTransport *s, uint64_t seq)
     /* ldl_le_p returns signed int; widening it against zlib's unsigned long
      * sign-extends CRCs with bit 31 set. The wire contract is uint32_t. */
     uint32_t expected_crc = ldl_le_p(h + 28);
-    uint32_t actual_crc = crc32(0, s->bytes + DVM_GPU_REPLY_DATA,
+    uint32_t actual_crc = crc32(0, s->bytes + (s->present ? 0x200000 : DVM_GPU_REPLY_DATA),
                                ldl_le_p(h + 24));
     if (actual_crc != expected_crc) {
         failed(s, 6);
@@ -111,7 +111,7 @@ static uint64_t reg_read(void *opaque, hwaddr offset, unsigned size)
     case 8: return DVM_GPU_RAM_SIZE;
     case DVM_GPU_REG_DONE: return s->done;
     case DVM_GPU_REG_ERROR: return s->error;
-    case DVM_GPU_REG_MODE: return s->external ? 2 : 1;
+    case DVM_GPU_REG_MODE: return s->external ? (s->present ? 3 : 2) : 1;
     case DVM_GPU_REG_SUBMITTED: return s->submitted;
     case DVM_GPU_REG_READY: return s->ready;
     default: return 0;
@@ -209,6 +209,15 @@ void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobas
     memcpy(s->bytes + 16, s->session, sizeof(s->session));
     Chardev *chr = qemu_chr_find("dvm_gpu_notify");
     s->external = chr != NULL;
+    const char *present = getenv("DARWIN_GPU_PRESENT_TRANSPORT");
+    s->present = present && !strcmp(present, "1");
+    if (s->present && !s->external) {
+        error_report("dvm-gpu-shm: compact control layout requires external backend");
+        exit(1);
+    }
+    /* Mode 3 reserves [0x300000,16MiB) for GPU BGRA output. Control replies
+     * move to 0x200000; both control payloads are bounded to 64KiB. Mode 2
+     * and its existing 4MiB framed layout are unchanged. */
     s->ready = !s->external;
     if (chr) {
         qemu_chr_fe_init(&s->notify, chr, &error_fatal);

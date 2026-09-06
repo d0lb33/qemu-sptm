@@ -183,6 +183,9 @@
 
 #include "qemu/osdep.h"
 #include "xnu/darwin_fb.h"
+#include "system/runstate.h"
+#include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "hw/arm/darwin_iomfb_swap.h"
@@ -490,6 +493,40 @@ static bool iomfb_dma(DarwinIOMFB *m, uint64_t dva, void *buf, uint32_t len,
     return true;
 }
 
+/* Opt-in acceptance witness for our GPU-written four-pixel frame marker.
+ * Observe pixels already DMA-read for normal scanout; never alter the surface
+ * or console, and do no per-frame readback/hash/export for verification.
+ * Retain the latest owned frame allocation and export only when the VM stops,
+ * after the guest's timed batch. Not migration state or a presentation API. */
+static struct {
+    const char *directory;
+    uint8_t *pixels;
+    uint32_t size, frame, count;
+    bool exported;
+} gpu_present_witness;
+
+static void gpu_present_stopped(void *opaque, bool running, RunState state)
+{
+    (void)opaque; (void)state;
+    if (running || !gpu_present_witness.pixels || gpu_present_witness.exported) {
+        return;
+    }
+    g_autofree char *path = g_build_filename(gpu_present_witness.directory,
+                                            "last-presented.bgra", NULL);
+    FILE *file = fopen(path, "wx");
+    if (!file) {
+        error_report("gpu-present: exclusive final export failed");
+        return;
+    }
+    bool ok = fwrite(gpu_present_witness.pixels, 1,
+                     gpu_present_witness.size, file) == gpu_present_witness.size;
+    ok = fclose(file) == 0 && ok;
+    gpu_present_witness.exported = true;
+    fprintf(stderr, "iomfb: gpu-present-export frame=%u count=%u bytes=%u ok=%u\n",
+            gpu_present_witness.frame, gpu_present_witness.count,
+            gpu_present_witness.size, ok);
+}
+
 /* Pixel DMA is disp0/sid0, not the RPC heap's dcp/sid23. Proven by
  * a 1 MiB byte match against native IOSurface pixels in VISIBLE_R6. */
 static bool iomfb_scanout(const uint8_t *input, uint32_t len)
@@ -521,6 +558,23 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
     }
     fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
             surface.width, surface.height, surface.stride, surface.dva);
+    if (gpu_present_witness.directory && surface.width == 1179 &&
+        surface.height == 2556 && surface.stride == 4864 &&
+        surface.size == ((4864 * 2556 + 16383) & ~16383) && ldl_le_p(pixels) == 0xff44564dU &&
+        ldl_le_p(pixels + 4) == 0xff505253U &&
+        ldl_le_p(pixels + 8) == 0xff424c52U &&
+        (ldl_le_p(pixels + 12) & 0xffffff00U) == 0xff000000U) {
+        uint32_t frame = pixels[12];
+        fprintf(stderr, "iomfb: gpu-present frame=%u swap=%u dva=0x%" PRIx64
+                " monotonic_ns=%" PRId64 "\n", frame,
+                (uint32_t)ldl_le_p(input + 0x98), surface.dva,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        g_free(gpu_present_witness.pixels);
+        gpu_present_witness.pixels = g_steal_pointer(&pixels);
+        gpu_present_witness.size = 4864 * 2556;
+        gpu_present_witness.frame = frame;
+        gpu_present_witness.count++;
+    }
     return true;
 }
 
@@ -1432,6 +1486,11 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->dart = dart;
     m->sid = sid;
     m->level = level;
+    const char *witness = getenv("DARWIN_DCP_GPU_PRESENT_DIR");
+    if (witness && !gpu_present_witness.directory) {
+        gpu_present_witness.directory = witness;
+        qemu_add_vm_change_state_handler(gpu_present_stopped, NULL);
+    }
     const char *scanout = getenv("DARWIN_DCP_IOMFB_SCANOUT");
     m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
     const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
