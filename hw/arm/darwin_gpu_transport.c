@@ -16,7 +16,7 @@
 #include <zlib.h>
 
 typedef struct DVMGPUTransport {
-    MemoryRegion ram, regs;
+    MemoryRegion ram, regs, registration;
     uint8_t *bytes;
     uint8_t session[16], rx[16];
     unsigned rx_used;
@@ -25,7 +25,64 @@ typedef struct DVMGPUTransport {
     bool external, ready, connected, present;
     CharFrontend notify;
     Error *migration_blocker;
+    uint64_t managed_pages[759];
+    unsigned managed_count;
+    bool managed_started, managed_ready;
+    int managed_fd;
 } DVMGPUTransport;
+static void failed(DVMGPUTransport *s, unsigned code);
+
+/* DVM experimental kernel registration ABI, not Apple hardware semantics.
+ * This third DT aperture is never returned by clientMemoryForType. The boot
+ * service emits pages from its prepared, VM-lifetime retained descriptor.
+ * No page list or address is accepted by the userspace workload protocol. */
+static uint64_t managed_read(void *opaque, hwaddr off, unsigned size)
+{
+    DVMGPUTransport *s = opaque;
+    return off == 16 && size == 8 ? s->managed_ready : 0;
+}
+
+static void managed_write(void *opaque, hwaddr off, uint64_t value, unsigned size)
+{
+    DVMGPUTransport *s = opaque;
+    if (size != 8 || s->managed_ready || s->error) {
+        failed(s, 20); return;
+    }
+    if (off == 0 && !s->managed_started && value == 12435456) {
+        s->managed_started = true;
+    } else if (off == 8 && s->managed_started && s->managed_count < 759) {
+        if ((value & 16383) || value < 0x10000000000ULL ||
+            value >= 0x10300000000ULL) {
+            failed(s, 21); return;
+        }
+        for (unsigned i = 0; i < s->managed_count; i++) {
+            if (s->managed_pages[i] == value) { failed(s, 22); return; }
+        }
+        s->managed_pages[s->managed_count++] = value;
+    } else if (off == 16 && value == 1 && s->managed_count == 759) {
+        uint8_t record[32 + 759 * 8] = {0};
+        memcpy(record, s->session, 16);
+        stq_le_p(record + 16, 12435456);
+        stq_le_p(record + 24, 759);
+        for (unsigned i = 0; i < 759; i++) {
+            stq_le_p(record + 32 + i * 8, s->managed_pages[i] - 0x10000000000ULL);
+        }
+        if (pwrite(s->managed_fd, record, sizeof(record), 0) != sizeof(record)) {
+            failed(s, 23); return;
+        }
+        s->managed_ready = true;
+        info_report("dvm-managed: registered pages=759 bytes=12435456 lifetime=vm");
+    } else {
+        failed(s, 24);
+    }
+}
+
+static const MemoryRegionOps managed_ops = {
+    .read = managed_read, .write = managed_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 8, .max_access_size = 8 },
+    .impl = { .min_access_size = 8, .max_access_size = 8 },
+};
 
 static void failed(DVMGPUTransport *s, unsigned code)
 {
@@ -178,7 +235,9 @@ void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobas
         return;
     }
     struct adt_io_reg *ranges = node ? adt_get_prop_val(node, "reg") : NULL;
-    if (!path || !node || adt_get_prop_len(node, "reg") != 2 * sizeof(*ranges) ||
+    const char *managed_path = getenv("DARWIN_GPU_MANAGED_PAGES_PATH");
+    bool managed = managed_path != NULL;
+    if (!path || !node || adt_get_prop_len(node, "reg") != (managed ? 3 : 2) * sizeof(*ranges) ||
         ranges[0].base + iobase != DVM_GPU_RAM_BASE ||
         ranges[0].len != DVM_GPU_RAM_SIZE ||
         ranges[1].base + iobase != DVM_GPU_REG_BASE ||
@@ -194,6 +253,21 @@ void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobas
         exit(1);
     }
     DVMGPUTransport *s = g_new0(DVMGPUTransport, 1);
+    s->managed_fd = -1;
+    if (managed) {
+        if (!getenv("DARWIN_GPU_MANAGED_RAM_PATH") ||
+            ranges[2].base + iobase != DVM_GPU_REG_BASE + DVM_GPU_REG_SIZE ||
+            ranges[2].len != DVM_GPU_REG_SIZE) {
+            error_report("dvm-managed: exact kernel-only registration range required");
+            exit(1);
+        }
+        s->managed_fd = open(managed_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        if (s->managed_fd < 0) { error_report("dvm-managed: exclusive page manifest failed"); exit(1); }
+        memory_region_init_io(&s->registration, NULL, &managed_ops, s,
+                              "dvm-managed-registration", DVM_GPU_REG_SIZE);
+        memory_region_add_subregion_overlap(get_system_memory(),
+            DVM_GPU_REG_BASE + DVM_GPU_REG_SIZE, &s->registration, 1);
+    }
     if (!memory_region_init_ram_from_fd(&s->ram, NULL, "dvm-gpu-shared-ram",
                                        DVM_GPU_RAM_SIZE, RAM_SHARED, fd, 0,
                                        &error_fatal)) {

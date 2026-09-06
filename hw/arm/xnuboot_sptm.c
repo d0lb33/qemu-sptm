@@ -39,7 +39,27 @@
 static void alloc_ram(Object *cpuobj, struct xnu_boot_info *info, hwaddr base, size_t len) {
     MemoryRegion *ram_main = get_system_memory();
     MemoryRegion *ram_subreg = g_new(MemoryRegion, 1);
-    memory_region_init_ram(ram_subreg, NULL, "dram", len, &error_fatal);
+    const char *shared = getenv("DARWIN_GPU_MANAGED_RAM_PATH");
+    if (shared) {
+        /* Opt-in disposable VM backend. XNU still owns allocation of all
+         * ordinary DRAM pages; this only supplies shareable host backing. */
+        int fd = open(shared, O_RDWR | O_NOFOLLOW);
+        struct stat st;
+        if (base != 0x10000000000ULL || len != 0x300000000ULL ||
+            fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+            st.st_size != len || st.st_uid != getuid() ||
+            st.st_nlink != 1 || (st.st_mode & 077) ||
+            !getenv("DARWIN_GPU_SHM_PATH")) {
+            fprintf(stderr, "managed DRAM requires owned private exact-size backing\n");
+            exit(1);
+        }
+        if (!memory_region_init_ram_from_fd(ram_subreg, NULL, "dram", len,
+                                           RAM_SHARED, fd, 0, &error_fatal)) {
+            exit(1);
+        }
+    } else {
+        memory_region_init_ram(ram_subreg, NULL, "dram", len, &error_fatal);
+    }
     memory_region_add_subregion(ram_main, base, ram_subreg);
     info->dram_mr = ram_subreg;
 }
