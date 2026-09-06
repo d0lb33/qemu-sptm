@@ -14,4 +14,6 @@ typedef struct DarwinIOMFBSurface {
 } DarwinIOMFBSurface;
 bool darwin_iomfb_swap_surface(const uint8_t *input, size_t size,
                                DarwinIOMFBSurface *surface);
+bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
+                             const uint8_t *pixels, uint32_t *frame);
 #endif

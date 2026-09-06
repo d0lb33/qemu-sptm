@@ -313,6 +313,7 @@ struct DarwinIOMFB {
      * actual request; completion state is separate from the boot script. */
     bool swap_enabled;
     bool scanout_enabled;
+    bool display_state_enabled;
     uint32_t swap_ids[IOMFB_SWAP_QUEUE_SIZE];
     uint32_t swap_head, swap_count;
     bool swap_active, swap_failed;
@@ -558,13 +559,9 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
     }
     fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
             surface.width, surface.height, surface.stride, surface.dva);
-    if (gpu_present_witness.directory && surface.width == 1179 &&
-        surface.height == 2556 && surface.stride == 4864 &&
-        surface.size == ((4864 * 2556 + 16383) & ~16383) && ldl_le_p(pixels) == 0xff44564dU &&
-        ldl_le_p(pixels + 4) == 0xff505253U &&
-        ldl_le_p(pixels + 8) == 0xff424c52U &&
-        (ldl_le_p(pixels + 12) & 0xffffff00U) == 0xff000000U) {
-        uint32_t frame = pixels[12];
+    uint32_t frame;
+    if (gpu_present_witness.directory &&
+        darwin_iomfb_marked_frame(&surface, pixels, &frame)) {
         fprintf(stderr, "iomfb: gpu-present frame=%u swap=%u dva=0x%" PRIx64
                 " monotonic_ns=%" PRId64 "\n", frame,
                 (uint32_t)ldl_le_p(input + 0x98), surface.dva,
@@ -575,6 +572,40 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
         gpu_present_witness.frame = frame;
         gpu_present_witness.count++;
     }
+    return true;
+}
+
+/* Exact 24A5430a shared observer ABI, not an AP cached-field patch:
+ * a0cf6e4-f4 assigns heap+0x80000, length 0x40000 (7996770).
+ * a0ce3ac -> a0d4764 -> a0d4bc0 -> 9188768 returns this region to H17P.
+ * 9188ba4-bb4 registers two 4-byte observers, first destinations fb+58f4
+ * and fb+58f8. 9188ef4 allocates them consecutively. a0c710c tests the
+ * first for display availability; a0bbf3c compares the second (current
+ * displayed swap) to the waited ID after its queue item has retired.
+ * Equal IDs keep mode 0 waiting; mode 1 returns when no queue item remains
+ * (a0bbf44-f48). Publish only after actual console
+ * delivery, before D594 retires that item. A synchronous active scanout
+ * is our evidence for availability=1; full firmware power-state enums and
+ * sleep/blank transitions remain unmodelled. Hence this bounded contract
+ * is opt-in, not a claim to implement the complete DCP power protocol.
+ * Do not touch the remaining observers or fabricate a completion on DMA
+ * failure. The shared region lives in migrated guest RAM, but live state
+ * migration with this experiment is not validated. */
+static bool iomfb_publish_display_state(DarwinIOMFB *m, uint32_t id)
+{
+    uint8_t before[8], next[8];
+    uint64_t dva = m->heap_dva + 0x80000;
+    if (!m->heap_known || !iomfb_dma(m, dva, before, sizeof(before), false)) {
+        return false;
+    }
+    stl_le_p(next, 1);
+    stl_le_p(next + 4, id);
+    if (!iomfb_dma(m, dva, next, sizeof(next), true)) {
+        return false;
+    }
+    fprintf(stderr, "iomfb: display-state dva=0x%" PRIx64
+            " previous=%u/%u active=1 current=%u after-scanout before-D594\n",
+            dva, ldl_le_p(before), ldl_le_p(before + 4), id);
     return true;
 }
 
@@ -1395,7 +1426,16 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
 
     /* Copy before any completion can release the native surface mapping. */
     if (m->scanout_enabled && h.name == 0x41343038) {
-        iomfb_scanout(buf + sizeof(h), h.in_len);
+        bool displayed = iomfb_scanout(buf + sizeof(h), h.in_len);
+        if (m->display_state_enabled) {
+            uint32_t id;
+            if (!displayed || !darwin_iomfb_swap_id(buf + sizeof(h), h.in_len,
+                                                   h.out_len, &id) ||
+                !iomfb_publish_display_state(m, id)) {
+                fprintf(stderr, "iomfb: display-state failed; A408 retained, no D594\n");
+                return;
+            }
+        }
     }
     if (m->swap_enabled && h.name == 0x41343038 && !nested) {
         uint32_t id;
@@ -1495,6 +1535,12 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
     const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
     m->swap_enabled = level >= 3 && complete && !strcmp(complete, "1");
+    const char *display_state = getenv("DARWIN_DCP_IOMFB_DISPLAY_STATE");
+    m->display_state_enabled = m->scanout_enabled && m->swap_enabled &&
+                              display_state && !strcmp(display_state, "1");
+    if (m->display_state_enabled) {
+        fprintf(stderr, "iomfb: opt-in shared display-state producer enabled; active scanout only\n");
+    }
     if (m->swap_enabled) {
         fprintf(stderr, "iomfb: native A408/D594 swap completion enabled\n");
     }

@@ -2,6 +2,25 @@
 #include "qemu/bswap.h"
 #include "hw/arm/darwin_iomfb_swap.h"
 
+bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
+                             const uint8_t *pixels, uint32_t *frame)
+{
+    /* swap_surface.size is the DMA-visible row span, not padded IOSurface
+     * allocation size. The owned diagnostic writes these four BGRA pixels. */
+    if (!surface || !pixels || !frame || surface->width != 1179 ||
+        surface->height != 2556 || surface->stride != 4864 ||
+        surface->size != 4864 * 2556 ||
+        (uint32_t)ldl_le_p(pixels) != 0xff44564dU ||
+        (uint32_t)ldl_le_p(pixels + 4) != 0xff505253U ||
+        (uint32_t)ldl_le_p(pixels + 8) != 0xff424c52U ||
+        ((uint32_t)ldl_le_p(pixels + 12) & 0xffffff00U) != 0xff000000U ||
+        pixels[12] < 1 || pixels[12] > 33) {
+        return false;
+    }
+    *frame = pixels[12];
+    return true;
+}
+
 bool darwin_iomfb_swap_id(const uint8_t *input, size_t size,
                          size_t output_size, uint32_t *id)
 {

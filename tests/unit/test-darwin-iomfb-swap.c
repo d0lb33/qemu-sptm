@@ -56,6 +56,17 @@ static void scanout_contract(void)
     g_assert_cmpuint(v.size, ==, 12432384);
     g_assert_cmpuint(v.width, ==, 1179);
     g_assert_cmphex(v.dva, ==, 0x10000000000ULL);
+    /* A padded descriptor must still recognize the existing scanout bytes. */
+    uint8_t marker[16];
+    uint32_t frame;
+    stl_le_p(marker, 0xff44564d);
+    stl_le_p(marker + 4, 0xff505253);
+    stl_le_p(marker + 8, 0xff424c52);
+    stl_le_p(marker + 12, 0xff000021);
+    g_assert_true(darwin_iomfb_marked_frame(&v, marker, &frame));
+    g_assert_cmpuint(frame, ==, 33);
+    marker[0] ^= 1;
+    g_assert_false(darwin_iomfb_marked_frame(&v, marker, &frame));
     g_assert_false(darwin_iomfb_swap_surface(input, sizeof(input) - 1, &v));
     input[0xfec] = 0;
     g_assert_false(darwin_iomfb_swap_surface(input, sizeof(input), &v));
