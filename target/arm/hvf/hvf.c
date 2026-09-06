@@ -2480,6 +2480,10 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
 /* Must be called by the owning thread */
 static int hvf_inject_interrupts(CPUState *cpu)
 {
+    if (hvf_virtual_el2 && getenv("QEMU_HVF_VIRTUAL_NO_VIRQ")) {
+        /* Diagnostic: never deliver device/timer interrupts to the guest. */
+        return 0;
+    }
     if (hvf_virtual_el2) {
         /*
          * Virtual EL2 interrupt delivery. The machine wires the EL2 virtual

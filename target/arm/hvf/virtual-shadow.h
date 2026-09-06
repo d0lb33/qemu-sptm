@@ -58,6 +58,13 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word,
  */
 typedef struct {
     unsigned tables, pages;
+    /*
+     * Highest alias index whose stage-2 mapping may still exist. Invalidation
+     * clears the stage-1 tree (making stale mappings unreachable) but defers
+     * the per-alias hv_vm_unmap syscalls; a slot is unmapped only when its
+     * index is reused, which removes the bulk of the boot-time syscall storm.
+     */
+    unsigned mapped_high;
     uint64_t root[2];
     unsigned root_bits[2];
     HVFVirtualShadowPage page[VSH_PAGES];
@@ -219,8 +226,11 @@ static void hvf_vsh_destroy(void)
         return;
     }
     for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
-        for (unsigned i = 0; i < hvf_vsh.ctx[c].pages; i++) {
-            assert_hvf_ok(hv_vm_unmap(hvf_vsh.ctx[c].page[i].ipa, VSH_PAGE));
+        unsigned high = hvf_vsh.ctx[c].pages > hvf_vsh.ctx[c].mapped_high ?
+                        hvf_vsh.ctx[c].pages : hvf_vsh.ctx[c].mapped_high;
+        for (unsigned i = 0; i < high; i++) {
+            uint64_t ipa = VSH_ALIAS + (c * VSH_PAGES + i) * VSH_PAGE;
+            assert_hvf_ok(hv_vm_unmap(ipa, VSH_PAGE));
         }
     }
     assert_hvf_ok(hv_vm_unmap(VSH_BASE, (VSH_TABLES + 1) * VSH_PAGE));
@@ -339,11 +349,12 @@ static void hvf_vsh_invalidate(CPUState *cpu)
         error_report("Virtual shadow invalidate %u aliases at pc=0x%" PRIx64,
                      hvf_ctx->pages, cpu_env(cpu)->pc);
     }
-    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
-        assert_hvf_ok(hv_vm_unmap(hvf_ctx->page[i].ipa, VSH_PAGE));
+    if (hvf_ctx->pages > hvf_ctx->mapped_high) {
+        hvf_ctx->mapped_high = hvf_ctx->pages;
     }
+    /* Only the tables actually built need clearing; roots are rebuilt below. */
     memset(hvf_vsh.mem + (1 + hvf_vsh.current * VSH_CTX_TABLES) * VSH_PAGE,
-           0, VSH_CTX_TABLES * VSH_PAGE);
+           0, hvf_ctx->tables * VSH_PAGE);
     hvf_ctx->pages = hvf_ctx->tables = 0;
     hvf_vsh_roots(cpu_env(cpu)->cp15.tcr_el[2]);
     hvf_vsh.generation++;
@@ -628,6 +639,10 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
         return false;
     }
     ipa = VSH_ALIAS + (hvf_vsh.current * VSH_PAGES + hvf_ctx->pages) * VSH_PAGE;
+    /* Reused slot: its previous stage-2 mapping is still present, drop it. */
+    if (hvf_ctx->pages < hvf_ctx->mapped_high) {
+        assert_hvf_ok(hv_vm_unmap(ipa, VSH_PAGE));
+    }
     assert_hvf_ok(hv_vm_map(host, ipa, VSH_PAGE, flags));
     HVFVirtualShadowPage page = {
         .va = va, .pa = pa, .ipa = ipa, .flags = flags,

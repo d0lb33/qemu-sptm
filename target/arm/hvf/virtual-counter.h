@@ -60,6 +60,27 @@ static bool hvf_virtual_counter_read(const ARMCPRegInfo *ri)
 static uint64_t hvf_virtual_counter_value(CPUState *cpu)
 {
     /* Preserve fractional ticks; integer nanoseconds-per-tick loses 1.6%. */
-    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                    ARM_CPU(cpu)->gt_cntfrq_hz, NANOSECONDS_PER_SECOND);
+    uint64_t v = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                          ARM_CPU(cpu)->gt_cntfrq_hz, NANOSECONDS_PER_SECOND);
+    /*
+     * Under HVF QEMU_CLOCK_VIRTUAL tracks wall time, but the guest executes
+     * far slower than real time through the bridge, so it perceives the
+     * counter racing ahead and every software timer as perpetually expired
+     * (the timer-queue processor at XNU 0xfffffff02ab59e18 livelocks). The
+     * optional divisor slows the perceived rate to roughly guest-execution
+     * speed while staying monotonic and continuous from the first read.
+     */
+    static uint64_t base;
+    static unsigned div;
+    static bool inited;
+    if (!inited) {
+        const char *e = getenv("QEMU_HVF_VIRTUAL_TIME_DIV");
+        div = e ? atoi(e) : 1;
+        if (div < 1) {
+            div = 1;
+        }
+        base = v;
+        inited = true;
+    }
+    return div == 1 ? v : base + (v - base) / div;
 }
