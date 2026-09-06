@@ -31,6 +31,33 @@
 // are multiple processes; use this to straight up disable PAC for now
 #define QEMU_SPTM_DISABLE_PAC
 
+/*
+ * darwin-vm: inline fast path switch for the translator.  With
+ * QEMU_SPTM_DISABLE_PAC every pac* is the identity and every aut/xpac op is
+ * pauth_strip(), so when no trap is possible for the translation regime the
+ * translator can emit the strip directly (translate-a64.c:gen_pauth2).
+ * The helpers below stay the reference implementation and the slow path.
+ */
+bool arm_pauth_inline_enabled(void)
+{
+#ifndef QEMU_SPTM_DISABLE_PAC
+    return false;
+#else
+    /*
+     * Default on since 2026-09-06: restore-ramdisk boot to shell 3.9 s -> 3.5 s
+     * on top of O3/LTO, 1,024-case matrix and 300 s iOS boots clean
+     * (docs/re/tcg-idle-profile.md).  DARWIN_PAUTH_INLINE=0 (or off) keeps
+     * the helper-only path for A/B runs and bisection.
+     */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DARWIN_PAUTH_INLINE");
+        mode = e && (!strcmp(e, "0") || !strcmp(e, "off")) ? 0 : 1;
+    }
+    return mode == 1;
+#endif
+}
+
 static uint64_t pac_cell_shuffle(uint64_t i)
 {
     uint64_t o = 0;

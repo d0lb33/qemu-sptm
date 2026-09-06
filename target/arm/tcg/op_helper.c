@@ -27,6 +27,7 @@
 #include "accel/tcg/probe.h"
 #include "cpregs.h"
 #include "qemu/log.h"
+#include "exec/icount.h"
 
 // #define LOG_MSRS
 
@@ -1281,7 +1282,13 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
     const ARMCPRegInfo *ri = rip;
     uint64_t res;
 
-    if (ri->type & ARM_CP_IO) {
+    /*
+     * darwin-vm: counter reads (ARM_CP_LOCKLESS_READ) only consult the
+     * virtual clock's seqlock and per-CPU offsets, so they do not need the
+     * BQL unless icount is driving the clock.  See cpregs.h.
+     */
+    if ((ri->type & ARM_CP_IO) &&
+        !((ri->type & ARM_CP_LOCKLESS_READ) && !icount_enabled())) {
         bql_lock();
         res = ri->readfn(env, ri);
         bql_unlock();

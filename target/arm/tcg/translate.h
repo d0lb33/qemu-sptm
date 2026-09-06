@@ -138,6 +138,18 @@ typedef struct DisasContext {
     bool unpriv;
     /* True if v8.3-PAuth is active.  */
     bool pauth_active;
+    /*
+     * darwin-vm: disabled-PAC inline fast path (translate-a64.c:gen_pauth2).
+     * Valid only when pauth_inline; the masks are those of the regime at
+     * translation time and are guarded at run time by comparing the live
+     * TCR with pauth_tcr.
+     */
+    bool pauth_inline;
+    int pauth_tcr_off;
+    int pauth_sctlr_off;
+    uint64_t pauth_tcr;
+    uint64_t pauth_mask[2][2]; /* [data][bit55] */
+    TCGLabel *pauth_l_done;
     /* True if v8.5-MTE access to tags is enabled; index with is_unpriv.  */
     bool ata[2];
     /* True if v8.5-MTE tag checks affect the PE; index with is_unpriv.  */
