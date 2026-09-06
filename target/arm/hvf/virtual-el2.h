@@ -31,14 +31,10 @@ static int hvf_virtual_init(void)
         return 0;
     }
     hvf_virtual_quiet = g_strcmp0(getenv("QEMU_HVF_VIRTUAL_QUIET"), "1") == 0;
-    hvf_virtual_keep_aliases =
-        g_strcmp0(getenv("QEMU_HVF_VIRTUAL_KEEP_ALIASES"), "1") == 0;
     hvf_virtual_fastread =
         g_strcmp0(getenv("QEMU_HVF_VIRTUAL_FASTREAD"), "1") == 0;
-    if (hvf_virtual_keep_aliases) {
-        error_report("Virtual EL2 KEEP_ALIASES experiment: aliases survive "
-                     "GENTER/GEXIT; permission banks are NOT rewalked");
-    }
+    hvf_virtual_stop_on_fault =
+        g_strcmp0(getenv("QEMU_HVF_VIRTUAL_STOP_ON_FAULT"), "1") == 0;
     path = getenv("QEMU_HVF_VIRTUAL_LEDGER");
     if (hvf_nested_virt_enabled() || hvf_irqchip_in_kernel() || !path ||
         !g_file_get_contents(path, &data, &length, NULL) || length < 8 ||
@@ -58,6 +54,72 @@ static int hvf_virtual_init(void)
     error_setg(&hvf_virtual_migration_blocker,
                "Experimental virtual EL2 has no snapshot/migration state yet");
     return migrate_add_blocker(&hvf_virtual_migration_blocker, &error_fatal);
+}
+
+/*
+ * AT S1E{0,1,2}{R,W} for the virtual EL2 regime. The TCG implementation
+ * (tcg/cpregs-at.c:ats_write64) walks through probe_access, which needs
+ * the soft TLB and crashed under HVF (HVF_KC_BOOT7, tlb_read_idx at
+ * S1_ptw_translate). This uses the explicit-I/O walker the shadow already
+ * relies on and formats PAR_EL1 exactly as do_ats_write does for the
+ * 64-bit format: PA[47:12], NS, ATTR[63:56], SH[8:7], bit 11 set; faults
+ * carry F, FST[6:1] and PTW. Stage 2 never applies on this platform.
+ */
+static bool hvf_virtual_at(CPUState *cpu, const ARMCPRegInfo *ri,
+                           uint64_t va)
+{
+    static const ARMPTWMemoryOps ops = {
+        .read = hvf_vsh_plain_read,
+        .cmpxchg64 = hvf_vsh_cmpxchg,
+    };
+    CPUARMState *env = cpu_env(cpu);
+    HVFPTWProbe probe = { .cpu = cpu };
+    GetPhysAddrResult res = {};
+    ARMMMUFaultInfo fi = {};
+    ARMMMUIdx mmu_idx;
+    uint64_t par = 1 << 11;
+    bool write = ri->opc2 & 1;
+    bool regime_e20 = (env->cp15.hcr_el2 & (HCR_E2H | HCR_TGE)) ==
+                      (HCR_E2H | HCR_TGE);
+
+    if (!regime_e20 || ri->crn != 7 || ri->crm != 8) {
+        error_report("Virtual EL2 unsupported %s at 0x%" PRIx64,
+                     ri->name, env->pc);
+        return false;
+    }
+    if (ri->opc1 == 0 && ri->opc2 < 2) {
+        mmu_idx = ARMMMUIdx_E20_2;
+    } else if (ri->opc1 == 0 && ri->opc2 < 4) {
+        mmu_idx = ARMMMUIdx_E20_0;
+    } else if (ri->opc1 == 4 && ri->opc2 < 2) {
+        mmu_idx = ARMMMUIdx_E20_2;
+    } else {
+        error_report("Virtual EL2 unsupported %s at 0x%" PRIx64,
+                     ri->name, env->pc);
+        return false;
+    }
+    bool ok;
+    WITH_RCU_READ_LOCK_GUARD() {
+        ok = get_phys_addr_with_ops(env, va,
+                                    write ? MMU_DATA_STORE : MMU_DATA_LOAD,
+                                    0, mmu_idx, &res, &fi, &ops, &probe);
+    }
+    if (ok) {
+        unsigned sh = ((res.cacheattrs.attrs & 0xf0) == 0 ||
+                       res.cacheattrs.attrs == 0x44) ?
+                      2 : res.cacheattrs.shareability;
+        par |= res.f.phys_addr & ~UINT64_C(0xfff);
+        if (!res.f.attrs.secure) {
+            par |= 1 << 9;
+        }
+        par |= (uint64_t)res.cacheattrs.attrs << 56;
+        par |= (uint64_t)sh << 7;
+    } else {
+        par |= 1 | ((arm_fi_to_lfsc(&fi) & 0x3f) << 1) |
+               (fi.s1ptw ? 1 << 8 : 0);
+    }
+    env->cp15.par_el[1] = par;
+    return true;
 }
 
 static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
@@ -84,20 +146,49 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
         hvf_vsh_icache(cpu);
         return true;
     }
-    if (word == 0xd500409f && arm_current_el(env) == 2 && hvf_vsh.active) {
+    if (arm_current_el(env) == 2 && (word & 0xfff8f01f) == 0xd500401f) {
         /*
-         * SPTM ...a38d8 explicitly clears PAN after installing VBAR_GL2.
-         * Rewalk all mappings after the PSTATE change. PAN-setting and
-         * lower-EL user mappings still need their own protection model.
+         * MSR (immediate): op1 in [18:16], CRm holds the immediate, op2 in
+         * [7:5] (a64.decode "MSR_i_*"). Every field written here is carried
+         * to the physical PSTATE by hvf_arch_put_registers, so PAN, UAO,
+         * DIT, SSBS and TCO are enforced natively; no alias rewalk is
+         * needed. SPSel is normally never ledgered but is handled for
+         * completeness through update_spsel().
          */
-        pstate_write(env, pstate_read(env) & ~PSTATE_PAN);
-        hvf_vsh_invalidate(cpu);
-        return true;
-    }
-    if (arm_current_el(env) == 2 &&
-        (word & 0xfffff0ff) == 0xd50340df) {
-        /* DAIFSet, matching a64.decode and the architectural DAIF mask. */
-        pstate_write(env, pstate_read(env) | (((word >> 8) & 15) << 6));
+        unsigned op1 = (word >> 16) & 7, op2 = (word >> 5) & 7;
+        unsigned imm = (word >> 8) & 15;
+        uint32_t ps = pstate_read(env), bit = 0;
+        switch (op1 << 3 | op2) {
+        case 0 << 3 | 3:
+            bit = PSTATE_UAO;
+            break;
+        case 0 << 3 | 4:
+            bit = PSTATE_PAN;
+            break;
+        case 0 << 3 | 5:
+            update_spsel(env, imm & 1);
+            return true;
+        case 3 << 3 | 1:
+            bit = PSTATE_SSBS;
+            break;
+        case 3 << 3 | 2:
+            bit = PSTATE_DIT;
+            break;
+        case 3 << 3 | 4:
+            bit = PSTATE_TCO;
+            break;
+        case 3 << 3 | 6:
+            pstate_write(env, ps | (imm << 6));
+            return true;
+        case 3 << 3 | 7:
+            pstate_write(env, ps & ~(imm << 6));
+            return true;
+        default:
+            error_report("Virtual EL2 unsupported PSTATE immediate 0x%08x "
+                         "at 0x%" PRIx64, word, env->pc);
+            return false;
+        }
+        pstate_write(env, (imm & 1) ? ps | bit : ps & ~bit);
         return true;
     }
     /*
@@ -129,7 +220,8 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                      env->pc);
         return true;
     }
-    if (arm_current_el(env) != 2 ||
+    unsigned el = arm_current_el(env);
+    if ((el != 2 && el != 0) ||
         (word & 0xffc00000) != 0xd5000000 || !((word >> 19) & 3)) {
         error_report("Virtual EL2 unsupported instruction 0x%08x at 0x%" PRIx64,
                      word, env->pc);
@@ -140,26 +232,54 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                              (word >> 5) & 7);
     ri = get_arm_cp_reginfo(armcpu->cp_regs,
                            hvf_virtual_counter_key(key, read));
-    if (!ri || !cp_access_ok(2, ri, read)) {
+    if (!ri || !cp_access_ok(el, ri, read)) {
         error_report("Virtual EL2 unknown/denied sysreg 0x%08x at 0x%" PRIx64,
                      word, env->pc);
         return false;
     }
     /* Match the architectural VHE redirect order in translate-a64.c. */
-    if (ri->vhe_redir_to_el2 && (env->cp15.hcr_el2 & HCR_E2H)) {
+    if (el == 2 && ri->vhe_redir_to_el2 && (env->cp15.hcr_el2 & HCR_E2H)) {
         ri = get_arm_cp_reginfo(armcpu->cp_regs, ri->vhe_redir_to_el2);
-    } else if (ri->vhe_redir_to_el01) {
+    } else if (el == 2 && ri->vhe_redir_to_el01) {
         if (!(env->cp15.hcr_el2 & HCR_E2H)) {
             return false;
         }
         ri = get_arm_cp_reginfo(armcpu->cp_regs, ri->vhe_redir_to_el01);
     }
-    if (!ri || !cp_access_ok(2, ri, read) ||
+    /*
+     * The only EL0 system operation emulated here is the user permission
+     * bank; everything else an unprivileged instruction can do executes
+     * natively, and what it cannot do is delivered as its own exception.
+     */
+    if (el == 0 && (!ri || strcmp(ri->name, "SPRR_UPERM_EL0"))) {
+        error_report("Virtual EL0 unsupported sysreg 0x%08x at 0x%" PRIx64,
+                     word, env->pc);
+        return false;
+    }
+    /*
+     * AT S1E* store a translation result in PAR_EL1 and never raise for
+     * the translated address (faults are reported in PAR.F); their
+     * ARM_CP_RAISES_EXC covers only trap configurations we do not use.
+     */
+    bool at_op = ri && !strncmp(ri->name, "AT_", 3);
+    if (!ri || !cp_access_ok(el, ri, read) ||
         (ri->accessfn && ri->accessfn(env, ri, read) != CP_ACCESS_OK) ||
-        (ri->type & ARM_CP_RAISES_EXC)) {
+        ((ri->type & ARM_CP_RAISES_EXC) && !at_op)) {
         error_report("Virtual EL2 sysreg access needs exception handling "
                      "at 0x%" PRIx64, env->pc);
         return false;
+    }
+    if (at_op) {
+        if (read || !hvf_virtual_at(cpu, ri, rt == 31 ? 0 : env->xregs[rt])) {
+            return false;
+        }
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual EL2 %s va=0x%" PRIx64 " PAR=0x%" PRIx64
+                         " pc=0x%" PRIx64, ri->name,
+                         rt == 31 ? 0 : env->xregs[rt], env->cp15.par_el[1],
+                         env->pc);
+        }
+        return true;
     }
     /*
      * The generated register table has PL2 permissions but no GL accessfn.
@@ -182,8 +302,7 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
     int gxf_write = read ? 0 : hvf_virtual_gxf_write(cpu, ri, value);
     int pmu_write = read ? 0 : hvf_virtual_pmu_write(cpu, ri, value);
     bool pmu_read = read && hvf_virtual_pmu_counter(ri);
-    if (range_write < 0 || sprr_write < 0 || gxf_write < 0 || pmu_write < 0 ||
-        (pmu_read && !hvf_virtual_pmu_disabled(cpu))) {
+    if (range_write < 0 || sprr_write < 0 || gxf_write < 0 || pmu_write < 0) {
         return false;
     }
     if ((ri->type & ARM_CP_SPECIAL_MASK) == ARM_CP_DC_ZVA) {
@@ -303,11 +422,34 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                        (value == 0x18 || value == 0x10)) ||
                       !strncmp(ri->name, "APCTL_EL", 8) ||
                       (!strcmp(ri->name, "MDSCR_EL1") && value == 0x1000);
-    if (!read && hvf_vsh.active && !bank_write) {
-        error_report("Virtual shadow context change requires invalidation: "
-                     "%s at 0x%" PRIx64, ri->name, env->pc);
+    /*
+     * Storage policy for everything not handled by a module above. The TCG
+     * model stores Apple implementation-defined and ordinary EL2 registers
+     * without further semantics and boots to a home screen; the bridge
+     * does the same. Only registers whose change would silently break the
+     * bridge's own contract stop: HCR (E2H/TGE regime) and HCRX.
+     * MAIR/AMAIR feed the walker's attribute checks, so their change
+     * discards the aliases. Timer registers reach QEMU's timer model
+     * through their writefn; interrupt delivery is still separate.
+     */
+    bool attr_write = !read && (!strncmp(ri->name, "MAIR_", 5) ||
+                                !strncmp(ri->name, "AMAIR_", 6));
+    if (!read && hvf_vsh.active && !strcmp(ri->name, "HCR_EL2") &&
+        ((value ^ env->cp15.hcr_el2) &
+         (HCR_E2H | HCR_TGE | HCR_VM | HCR_DC | HCR_RW))) {
+        /* SPTM programs the regime once, before the MMU handoff (...a30c0). */
+        error_report("Virtual EL2 HCR regime change 0x%" PRIx64 " -> 0x%"
+                     PRIx64 " is outside the bridge contract at 0x%" PRIx64,
+                     env->cp15.hcr_el2, value, env->pc);
         return false;
     }
+    if (!read && hvf_vsh.active && !unchanged &&
+        !strcmp(ri->name, "HCRX_EL2")) {
+        error_report("Virtual EL2 HCRX write 0x%" PRIx64 " is outside the "
+                     "bridge contract at 0x%" PRIx64, value, env->pc);
+        return false;
+    }
+    (void)bank_write;
     /* No native translation may run until the shadow context is installed. */
     if (!read && (strcmp(ri->name, "SCTLR_EL1") == 0 ||
                   strcmp(ri->name, "SCTLR_EL2") == 0) && (value & SCTLR_M) &&
@@ -338,8 +480,20 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
             if (counter_read) {
                 value = hvf_virtual_counter_value(cpu);
             } else if (pmu_read) {
-                /* Disabled counts stay frozen; avoid synthetic random reads. */
+                /*
+                 * Disabled counters stay frozen. Once the kernel enables
+                 * PMCR0 (XNU 0xfffffff02ac34e7c.., then reads PMC0/PMC1 at
+                 * 0xfffffff02ab0c284/c288 for its cycle and instruction
+                 * statistics), report monotonic counts derived from the
+                 * virtual clock at a nominal 2 GHz cycle and 1 GHz
+                 * instruction rate. TCG's model returns synthetic
+                 * increments; no host PMU value is exposed either way.
+                 */
                 value = read_raw_cp_reg(env, ri);
+                if (!hvf_virtual_pmu_disabled(cpu)) {
+                    uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                    value += !strcmp(ri->name, "PMC0") ? ns * 2 : ns;
+                }
             } else if (ri->readfn) {
                 value = ri->readfn(env, ri);
             } else if (ri->fieldoffset) {
@@ -362,9 +516,10 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
                      ri->name, env->pc);
         return false;
     }
-    if (translation_write || sprr_write > 0 || gxf_write > 0 ||
-        range_write > 0 || (sctlr_write && hvf_vsh.active && !unchanged)) {
-        hvf_vsh_invalidate(cpu);
+    if (hvf_vsh.active && !unchanged &&
+        (translation_write || sprr_write > 0 || gxf_write > 0 ||
+         range_write > 0 || sctlr_write || attr_write)) {
+        hvf_vsh_invalidate_all(cpu);
     }
     if (read && rt != 31) {
         env->xregs[rt] = value;
@@ -415,8 +570,10 @@ static bool hvf_virtual_fast_read(CPUState *cpu, uint32_t word)
     if (ri->vhe_redir_to_el2 && (env->cp15.hcr_el2 & HCR_E2H)) {
         ri = get_arm_cp_reginfo(armcpu->cp_regs, ri->vhe_redir_to_el2);
     }
-    if (!ri || (strcmp(ri->name, "TPIDR_GL2") && strcmp(ri->name, "CURRENTG") &&
-                strcmp(ri->name, "TPIDR_EL2"))) {
+    if (!ri || (strcmp(ri->name, "TPIDR_GL2") &&
+                strcmp(ri->name, "CURRENTG") &&
+                strcmp(ri->name, "TPIDR_EL2") &&
+                strcmp(ri->name, "TPIDR_EL1"))) {
         return false;
     }
     if (!strcmp(ri->name, "TPIDR_GL2") && !arm_apple_is_gl(env)) {

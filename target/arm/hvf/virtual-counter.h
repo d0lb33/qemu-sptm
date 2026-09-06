@@ -32,15 +32,15 @@ static bool hvf_virtual_counter_common(CPUState *cpu)
     const ARMCPRegInfo *offset = get_arm_cp_reginfo(armcpu->cp_regs,
                                    ENCODE_AA64_CP_REG(3, 1, 15, 9, 4));
 
-    if (arm_current_el(env) != 2 || armcpu->gt_cntfrq_hz != 24000000 ||
+    /*
+     * Enabled timers no longer disqualify reads: the value is the same
+     * 24 MHz zero-offset clock whether or not a comparator is armed. Timer
+     * interrupt delivery is a separate, still unimplemented, path.
+     */
+    if (armcpu->gt_cntfrq_hz != 24000000 ||
         env->cp15.cntvoff_el2 || env->cp15.cntpoff_el2 || !offset ||
         !offset->readfn || offset->readfn(env, offset)) {
         return false;
-    }
-    for (unsigned i = 0; i < NUM_GTIMERS; i++) {
-        if (env->cp15.c14_timer[i].ctl & 1) {
-            return false;
-        }
     }
     return true;
 }

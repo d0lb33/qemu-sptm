@@ -953,6 +953,18 @@ int hvf_arch_get_registers(CPUState *cpu)
                                           &env->sp_el[0]));
         assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
                          arm_apple_is_gl(env) ? &env->sp_gl[2] : &env->sp_el[2]));
+        /*
+         * Thread pointers are written natively by unprivileged code and by
+         * unledgered kexts (TPIDR_EL0 at EL0; TPIDR_EL1 by corecrypto-style
+         * native EL1 code), and read natively by both. Keep the physical
+         * registers and the CPU env in step in both directions.
+         */
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDR_EL0,
+                                          &env->cp15.tpidr_el[0]));
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDRRO_EL0,
+                                          &env->cp15.tpidrro_el[0]));
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDR_EL1,
+                                          &env->cp15.tpidr_el[1]));
         if (cpu_isar_feature(aa64_sme, arm_cpu)) {
             if (__builtin_available(macOS 15.2, *)) {
                 hvf_arch_get_sme(cpu);
@@ -1145,6 +1157,12 @@ int hvf_arch_put_registers(CPUState *cpu)
                                           env->sp_el[0]));
         assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_SP_EL1,
                          arm_apple_is_gl(env) ? env->sp_gl[2] : env->sp_el[2]));
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDR_EL0,
+                                          env->cp15.tpidr_el[0]));
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDRRO_EL0,
+                                          env->cp15.tpidrro_el[0]));
+        assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_TPIDR_EL1,
+                                          env->cp15.tpidr_el[1]));
         /*
          * Guest FP permissions do not follow physical EL1's CPACR. Use the
          * architectural trap decision for EL2 and EL0, including the VHE
@@ -1154,6 +1172,35 @@ int hvf_arch_put_registers(CPUState *cpu)
         uint64_t cpacr = FIELD_DP64(0, CPACR_EL1, FPEN,
                                     fp_exception_el(env, 2) ? 0 :
                                     fp_exception_el(env, 0) ? 1 : 3);
+        /*
+         * SVE and SME follow the same architectural decisions. The kernel
+         * probes SME right after programming SMCR (XNU 0xfffffff02b341354
+         * then RDSVL at ...358, HVF_KC_BOOT5), so the physical SMCR_EL1 and
+         * PSTATE.{SM,ZA} mirror the guest's EL2 view; there is no ZCR
+         * register on this host (streaming SVE only).
+         */
+        if (cpu_isar_feature(aa64_sve, arm_cpu)) {
+            cpacr = FIELD_DP64(cpacr, CPACR_EL1, ZEN,
+                               sve_exception_el(env, 2) ? 0 :
+                               sve_exception_el(env, 0) ? 1 : 3);
+        }
+        if (cpu_isar_feature(aa64_sme, arm_cpu)) {
+            cpacr = FIELD_DP64(cpacr, CPACR_EL1, SMEN,
+                               sme_exception_el(env, 2) ? 0 :
+                               sme_exception_el(env, 0) ? 1 : 3);
+            if (__builtin_available(macOS 15.2, *)) {
+                /*
+                 * hvf_arch_get_sme() recorded SVCR in the cpreg list, so the
+                 * common put path restores PSTATE.{SM,ZA} and, in streaming
+                 * mode, the Z/P/ZA/ZT0 contents that Q-register sync does
+                 * not cover.
+                 */
+                hvf_arch_put_sme(cpu);
+                assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
+                                                  HV_SYS_REG_SMCR_EL1,
+                                                  env->vfp.smcr_el[2]));
+            }
+        }
         assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
                                           HV_SYS_REG_CPACR_EL1, cpacr));
         if (hvf_vsh.active) {
@@ -1162,6 +1209,18 @@ int hvf_arch_put_registers(CPUState *cpu)
             assert_hvf_ok(hv_vcpu_set_sys_reg(cpu->accel->fd,
                                               HV_SYS_REG_SCTLR_EL1, 0));
         }
+        /*
+         * Unprivileged code reads CNTVCT_EL0/CNTFRQ_EL0 natively (never
+         * ledgered), while ledgered reads are answered from QEMU's virtual
+         * clock. Pin the hardware virtual counter to that clock on every
+         * resume: mach_absolute_time() is the 24 MHz physical counter on
+         * Apple silicon, matching gt_cntfrq_hz, so the two views agree to
+         * within the exit latency.
+         */
+        uint64_t ticks = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                  arm_cpu->gt_cntfrq_hz, NANOSECONDS_PER_SECOND);
+        assert_hvf_ok(hv_vcpu_set_vtimer_offset(cpu->accel->fd,
+                                                mach_absolute_time() - ticks));
         /* Native PAC instructions must use the guest's architectural keys. */
         static const hv_sys_reg_t keys[] = {
             HV_SYS_REG_APIAKEYLO_EL1, HV_SYS_REG_APIAKEYHI_EL1,
@@ -2421,6 +2480,57 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
 /* Must be called by the owning thread */
 static int hvf_inject_interrupts(CPUState *cpu)
 {
+    if (hvf_virtual_el2) {
+        /*
+         * Virtual EL2 interrupt delivery. The machine wires the EL2 virtual
+         * timer (GTIMER_HYPVIRT, reached through the kernel's VHE-redirected
+         * CNTV writes) to FIQ and the AIC to IRQ (hw/arm/darwin.c). Both
+         * are QEMU device lines, so delivery goes through the guest's own
+         * vectors via arm_cpu_do_interrupt rather than the hardware
+         * injection below, which would land on the private physical-EL1
+         * vector. Level semantics are preserved: an unacknowledged line is
+         * delivered again on the next loop iteration. A vCPU running a
+         * long native stretch is forced out by hvf_kick_vcpu_thread.
+         */
+        CPUARMState *env = cpu_env(cpu);
+        bool fiq = cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ);
+        bool irq = cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD);
+        uint64_t ps;
+
+        if (!fiq && !irq) {
+            return 0;
+        }
+        /*
+         * Peek at the mask bits without synchronizing: a synchronized but
+         * unflushed env before hv_vcpu_run leaves every later exit handler
+         * reading stale registers (HVF_KC_BOOT12 logged ledger operations at
+         * PCs holding ordinary instructions for exactly this reason).
+         */
+        if (cpu->vcpu_dirty) {
+            ps = pstate_read(env);
+        } else {
+            assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &ps));
+        }
+        if (fiq && !(ps & PSTATE_F)) {
+            cpu->exception_index = EXCP_FIQ;
+        } else if (irq && !(ps & PSTATE_I)) {
+            cpu->exception_index = EXCP_IRQ;
+        } else {
+            return 0;
+        }
+        cpu_synchronize_state(cpu);
+        unsigned from_el = arm_current_el(env);
+        env->exception.target_el = 2;
+        env->exception.syndrome = 0;
+        arm_cpu_do_interrupt(cpu);
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual EL2 %s delivered from EL%u to 0x%" PRIx64,
+                         cpu->exception_index == EXCP_FIQ ? "FIQ" : "IRQ",
+                         from_el, env->pc);
+        }
+        flush_cpu_state(cpu);
+        return 0;
+    }
     if (cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ)) {
         trace_hvf_inject_fiq();
         hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ,
@@ -2509,6 +2619,16 @@ static int hvf_wfi(CPUState *cpu)
          * we would just wake up immediately.
          */
         return 0;
+    }
+
+    if (hvf_virtual_el2) {
+        /*
+         * The guest's timers are QEMU's emulated generic timers, whose
+         * callbacks raise the CPU interrupt lines and kick this vCPU; the
+         * hardware vtimer is not programmed by the virtual platform.
+         */
+        cpu->halted = 1;
+        return EXCP_HLT;
     }
 
     if (!hvf_irqchip_in_kernel()) {

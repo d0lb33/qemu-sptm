@@ -174,10 +174,7 @@ static bool hvf_virtual_gxf_transition(CPUState *cpu, bool enter, unsigned imm)
         pstate_write(env, spsr);
         aarch64_restore_sp(env, 2);
     }
-    /* Target fetch is rewalked in the new context; no old alias survives. */
-    if (!hvf_virtual_keep_aliases) {
-        hvf_vsh_invalidate(cpu);
-    }
+    /* The target world's aliases are selected at resume; none discarded. */
     if (!hvf_virtual_quiet) {
         error_report("Virtual GXF %s pc=0x%" PRIx64 " target=0x%" PRIx64
                      " pstate=0x%" PRIx64 " sp=0x%" PRIx64,
@@ -236,8 +233,7 @@ static bool hvf_virtual_eret(CPUState *cpu)
         new_pc = sextract64(new_pc, 0, 56);
     }
     env->pc = new_pc;
-    /* The target regime's permissions are rewalked; no old alias survives. */
-    hvf_vsh_invalidate(cpu);
+    /* Same permission world: EL0 aliases coexist with EL2 ones. */
     error_report("Virtual EL2 ERET pc=0x%" PRIx64 " target=0x%" PRIx64
                  " el=%u pstate=0x%" PRIx64 " currentg=%" PRIu64
                  " sp=0x%" PRIx64, old_pc, env->pc, new_el,

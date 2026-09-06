@@ -13,8 +13,8 @@
 #define VSH_PAGE 0x4000
 #define VSH_BASE UINT64_C(0xe00000000)
 #define VSH_ALIAS UINT64_C(0xe40000000)
-#define VSH_TABLES 128
-#define VSH_PAGES 2048
+#define VSH_TABLES 512
+#define VSH_PAGES 8192
 
 typedef struct HVFVirtualShadowPage {
     uint64_t va, pa, ipa;
@@ -25,26 +25,67 @@ typedef struct HVFVirtualShadowPage {
 } HVFVirtualShadowPage;
 
 /*
- * Experiment knobs, read once in hvf_virtual_init(). QUIET drops the
- * per-operation diagnostics from the hot paths (they are stderr writes on
- * every trap). KEEP_ALIASES retains native aliases across GENTER/GEXIT;
- * that is NOT permission-correct across the GL/EL permission banks and is
- * only for measuring the cost ceiling of a proper alias-reuse design.
- * See docs/re/hvf-fastpath-ceiling.md.
+ * Knobs read once in hvf_virtual_init(). QUIET drops the per-operation
+ * diagnostics from the hot paths (they are stderr writes on every trap).
+ * FASTREAD answers the hottest register reads without a vCPU sync. The
+ * earlier KEEP_ALIASES experiment (docs/re/hvf-fastpath-ceiling.md) is
+ * superseded by the per-world alias contexts below.
  */
-static bool hvf_virtual_quiet, hvf_virtual_keep_aliases, hvf_virtual_fastread;
+static bool hvf_virtual_quiet, hvf_virtual_fastread;
+/*
+ * STOP_ON_FAULT keeps the pre-kernel behaviour for the permission matrix:
+ * a guest-denied access stops the experiment at the faulting instruction
+ * instead of being delivered as the guest's own abort.
+ */
+static bool hvf_virtual_stop_on_fault;
+static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word,
+                                    bool *advance);
+
+/*
+ * One alias context per (permission world, exception level): EL2, EL0,
+ * GL2, GL0. All four share the guest's translation tables but each sees a
+ * different SPRR permission bank, and ARM's AP[2:1] cannot express the
+ * asymmetric combinations SPRR allows (a page writable at GL0 but read-only
+ * at GL2 stopped TXM at 0xfffffff01708406c in HVF_KC_BOOT20 when GL2 and
+ * GL0 shared one leaf). Each context keeps its own private table tree (a
+ * quarter of the pool) and alias set (a quarter of the IPA window). The
+ * context is selected on every resume from CURRENTG and the current level,
+ * so GENTER/GEXIT, ERET and exception entry switch trees instead of
+ * discarding aliases: the kernel makes thousands of guarded calls per
+ * second (docs/re/hvf-fastpath-ceiling.md) and each discard cost a full
+ * refault of its working set (HVF_KC_BOOT19: 209 identical 60-page cycles
+ * in 30,000 log lines). Table-page dependencies are shared.
+ */
+typedef struct {
+    unsigned tables, pages;
+    uint64_t root[2];
+    unsigned root_bits[2];
+    HVFVirtualShadowPage page[VSH_PAGES];
+} HVFVirtualShadowContext;
+
+#define VSH_CONTEXTS 4
+#define VSH_CTX_TABLES (VSH_TABLES / VSH_CONTEXTS)
 
 static struct {
     bool active, icache_pending;
     uint8_t *mem;
-    unsigned tables, pages, dependencies;
+    unsigned dependencies;
     unsigned generation, installed;
-    uint64_t root[2];
     uint64_t tcr;
-    unsigned root_bits[2];
+    unsigned current;
+    HVFVirtualShadowContext ctx[VSH_CONTEXTS];
     uint64_t dependency[VSH_PAGES];
-    HVFVirtualShadowPage page[VSH_PAGES];
+    /* Last guest walk denial, for delivery as the guest's own abort. */
+    ARMMMUFaultInfo fault;
+    bool fault_valid;
 } hvf_vsh;
+
+#define hvf_ctx (&hvf_vsh.ctx[hvf_vsh.current])
+
+static unsigned hvf_vsh_context_for(CPUARMState *env)
+{
+    return (arm_apple_is_gl(env) ? 2 : 0) + (arm_current_el(env) == 0 ? 1 : 0);
+}
 
 static bool hvf_vsh_depends(uint64_t pa)
 {
@@ -56,15 +97,52 @@ static bool hvf_vsh_depends(uint64_t pa)
     return false;
 }
 
+static uint64_t hvf_vsh_descriptor(const HVFVirtualShadowPage *p);
+static uint64_t *hvf_vsh_slot(uint64_t va);
+
 static void hvf_vsh_revoke_write(uint64_t pa)
 {
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        HVFVirtualShadowPage *p = &hvf_vsh.page[i];
-        if (p->pa == pa && (p->flags & HV_MEMORY_WRITE)) {
-            p->flags &= ~HV_MEMORY_WRITE;
-            assert_hvf_ok(hv_vm_protect(p->ipa, VSH_PAGE, p->flags));
+    unsigned saved = hvf_vsh.current;
+
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        HVFVirtualShadowContext *ctx = &hvf_vsh.ctx[c];
+        for (unsigned i = 0; i < ctx->pages; i++) {
+            HVFVirtualShadowPage *p = &ctx->page[i];
+            if (p->pa == pa && (p->flags & HV_MEMORY_WRITE)) {
+                p->flags &= ~HV_MEMORY_WRITE;
+                assert_hvf_ok(hv_vm_protect(p->ipa, VSH_PAGE, p->flags));
+                /*
+                 * The stage-1 leaf must agree with the stage-2 rights, or a
+                 * later store takes a stage-2 permission fault the bridge
+                 * cannot attribute (HVF_KC_BOOT21, ESR 0x9200004f at IPA
+                 * 0xe50090008). The next resume flushes the native TLB.
+                 */
+                hvf_vsh.current = c;
+                uint64_t *slot = hvf_vsh_slot(p->va);
+                if (slot) {
+                    stq_le_p(slot, hvf_vsh_descriptor(p) |
+                             (ldq_le_p(slot) & (UINT64_C(1) << 50)));
+                }
+                hvf_vsh.generation++;
+            }
         }
     }
+    hvf_vsh.current = saved;
+}
+
+/* True if any alias in either context executes from this backing page. */
+static bool hvf_vsh_pa_executable(uint64_t pa)
+{
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        HVFVirtualShadowContext *ctx = &hvf_vsh.ctx[c];
+        for (unsigned i = 0; i < ctx->pages; i++) {
+            if (ctx->page[i].pa == pa &&
+                (ctx->page[i].flags & HV_MEMORY_EXEC)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static MemTxResult hvf_vsh_read(void *opaque, hwaddr pa, MemTxAttrs attrs,
@@ -84,6 +162,14 @@ static MemTxResult hvf_vsh_read(void *opaque, hwaddr pa, MemTxAttrs attrs,
     return hvf_ptw_probe_read(probe, pa, attrs, size, be, value);
 }
 
+/* Table read without alias dependency tracking: for AT-style queries. */
+static MemTxResult hvf_vsh_plain_read(void *opaque, hwaddr pa,
+                                      MemTxAttrs attrs, unsigned size,
+                                      bool be, uint64_t *value)
+{
+    return hvf_ptw_probe_read(opaque, pa, attrs, size, be, value);
+}
+
 static MemTxResult hvf_vsh_cmpxchg(void *opaque, hwaddr pa, MemTxAttrs attrs,
                                    bool be, uint64_t old, uint64_t new,
                                    uint64_t *observed)
@@ -95,20 +181,21 @@ static MemTxResult hvf_vsh_cmpxchg(void *opaque, hwaddr pa, MemTxAttrs attrs,
 
 static uint64_t hvf_vsh_table(void)
 {
-    if (hvf_vsh.tables == VSH_TABLES) {
+    if (hvf_ctx->tables == VSH_CTX_TABLES) {
         return 0;
     }
-    return VSH_BASE + ++hvf_vsh.tables * VSH_PAGE;
+    return VSH_BASE + (hvf_vsh.current * VSH_CTX_TABLES + ++hvf_ctx->tables) *
+                      VSH_PAGE;
 }
 
 static uint64_t *hvf_vsh_slot(uint64_t va)
 {
     unsigned half = (va >> 55) & 1;
-    uint64_t table = hvf_vsh.root[half];
+    uint64_t table = hvf_ctx->root[half];
     const unsigned shifts[] = { 36, 25, 14 };
 
     for (unsigned i = 0; i < ARRAY_SIZE(shifts); i++) {
-        unsigned mask = i ? 0x7ff : (1 << hvf_vsh.root_bits[half]) - 1;
+        unsigned mask = i ? 0x7ff : (1 << hvf_ctx->root_bits[half]) - 1;
         uint64_t *slot = (uint64_t *)(hvf_vsh.mem + table - VSH_BASE) +
                          ((va >> shifts[i]) & mask);
         if (i == 2) {
@@ -131,8 +218,10 @@ static void hvf_vsh_destroy(void)
     if (!hvf_vsh.mem) {
         return;
     }
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        assert_hvf_ok(hv_vm_unmap(hvf_vsh.page[i].ipa, VSH_PAGE));
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        for (unsigned i = 0; i < hvf_vsh.ctx[c].pages; i++) {
+            assert_hvf_ok(hv_vm_unmap(hvf_vsh.ctx[c].page[i].ipa, VSH_PAGE));
+        }
     }
     assert_hvf_ok(hv_vm_unmap(VSH_BASE, (VSH_TABLES + 1) * VSH_PAGE));
     free(hvf_vsh.mem);
@@ -152,8 +241,8 @@ static void hvf_vsh_roots(uint64_t tcr)
 {
     uint64_t *slot;
 
-    hvf_vsh.root_bits[0] = 64 - (tcr & 63) - 36;
-    hvf_vsh.root_bits[1] = 64 - ((tcr >> 16) & 63) - 36;
+    hvf_ctx->root_bits[0] = 64 - (tcr & 63) - 36;
+    hvf_ctx->root_bits[1] = 64 - ((tcr >> 16) & 63) - 36;
     /*
      * Match VA widths and TBI/TBID for native pointer authentication. Other
      * translation controls apply in the software walker, while the private
@@ -162,8 +251,8 @@ static void hvf_vsh_roots(uint64_t tcr)
     uint64_t mask = 63 | (UINT64_C(63) << 16) |
                     (UINT64_C(3) << 37) | (UINT64_C(3) << 51);
     hvf_vsh.tcr = (UINT64_C(0x17519b519) & ~mask) | (tcr & mask);
-    hvf_vsh.root[0] = hvf_vsh_table();
-    hvf_vsh.root[1] = hvf_vsh_table();
+    hvf_ctx->root[0] = hvf_vsh_table();
+    hvf_ctx->root[1] = hvf_vsh_table();
     slot = hvf_vsh_slot(VSH_BASE);
     assert(slot);
     stq_le_p(slot, VSH_BASE | 0x783 | (UINT64_C(1) << 54));
@@ -181,7 +270,7 @@ static bool hvf_vsh_create(CPUState *cpu)
     for (unsigned i = 0; i < 2; i++) {
         overlap = memory_region_find(get_system_memory(),
                     i ? VSH_ALIAS : VSH_BASE,
-                    (i ? VSH_PAGES : VSH_TABLES + 1) * VSH_PAGE);
+                    (i ? VSH_CONTEXTS * VSH_PAGES : VSH_TABLES + 1) * VSH_PAGE);
         if (overlap.mr) {
             memory_region_unref(overlap.mr);
             return false;
@@ -207,6 +296,7 @@ static bool hvf_vsh_create(CPUState *cpu)
         stl_le_p(hvf_vsh.mem + 0x800 + i * 128,
                  0xd4000003 | (0xda01 << 5));
     }
+    hvf_vsh.current = hvf_vsh_context_for(cpu_env(cpu));
     hvf_vsh_roots(tcr);
     assert_hvf_ok(hv_vm_map(hvf_vsh.mem, VSH_BASE, VSH_PAGE,
                             HV_MEMORY_READ | HV_MEMORY_EXEC));
@@ -223,11 +313,14 @@ static void hvf_vsh_icache(CPUState *cpu)
      * guest execution resumes. Previously unmapped code is synchronized at
      * its next checked executable mapping. This remains a single-vCPU path.
      */
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        HVFVirtualShadowPage *p = &hvf_vsh.page[i];
-        if (p->flags & HV_MEMORY_EXEC) {
-            address_space_flush_icache_range(arm_addressspace(cpu, p->attrs),
-                                             p->pa, VSH_PAGE);
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        HVFVirtualShadowContext *ctx = &hvf_vsh.ctx[c];
+        for (unsigned i = 0; i < ctx->pages; i++) {
+            HVFVirtualShadowPage *p = &ctx->page[i];
+            if (p->flags & HV_MEMORY_EXEC) {
+                address_space_flush_icache_range(
+                    arm_addressspace(cpu, p->attrs), p->pa, VSH_PAGE);
+            }
         }
     }
     hvf_vsh.icache_pending = true;
@@ -244,15 +337,53 @@ static void hvf_vsh_invalidate(CPUState *cpu)
      */
     if (!hvf_virtual_quiet) {
         error_report("Virtual shadow invalidate %u aliases at pc=0x%" PRIx64,
-                     hvf_vsh.pages, cpu_env(cpu)->pc);
+                     hvf_ctx->pages, cpu_env(cpu)->pc);
     }
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        assert_hvf_ok(hv_vm_unmap(hvf_vsh.page[i].ipa, VSH_PAGE));
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        assert_hvf_ok(hv_vm_unmap(hvf_ctx->page[i].ipa, VSH_PAGE));
     }
-    memset(hvf_vsh.mem + VSH_PAGE, 0, VSH_TABLES * VSH_PAGE);
-    hvf_vsh.pages = hvf_vsh.dependencies = hvf_vsh.tables = 0;
+    memset(hvf_vsh.mem + (1 + hvf_vsh.current * VSH_CTX_TABLES) * VSH_PAGE,
+           0, VSH_CTX_TABLES * VSH_PAGE);
+    hvf_ctx->pages = hvf_ctx->tables = 0;
     hvf_vsh_roots(cpu_env(cpu)->cp15.tcr_el[2]);
     hvf_vsh.generation++;
+}
+
+/*
+ * Guest-visible translation or permission state changed (table store,
+ * TCR/TTBR/SCTLR/MAIR write, SPRR bank write): both worlds rewalk, and the
+ * shared table-page dependency list starts over.
+ */
+static void hvf_vsh_invalidate_all(CPUState *cpu)
+{
+    unsigned saved = hvf_vsh.current;
+
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        hvf_vsh.current = c;
+        if (hvf_ctx->root[0] || hvf_ctx->pages) {
+            hvf_vsh_invalidate(cpu);
+        }
+    }
+    hvf_vsh.current = saved;
+    hvf_vsh.dependencies = 0;
+}
+
+/* Select the alias context of the world and level about to execute. */
+static void hvf_vsh_switch(CPUState *cpu, unsigned ctx)
+{
+    if (!hvf_vsh.active || ctx == hvf_vsh.current) {
+        return;
+    }
+    hvf_vsh.current = ctx;
+    if (!hvf_ctx->root[0]) {
+        hvf_vsh_roots(cpu_env(cpu)->cp15.tcr_el[2]);
+    }
+    hvf_vsh.generation++;
+}
+
+static void hvf_vsh_select(CPUState *cpu)
+{
+    hvf_vsh_switch(cpu, hvf_vsh_context_for(cpu_env(cpu)));
 }
 
 static bool hvf_vsh_code_safe(const uint8_t *host)
@@ -267,6 +398,35 @@ static bool hvf_vsh_code_safe(const uint8_t *host)
          */
         if ((w & 0xffdfffe0) == 0xd51bd040) {
             continue;
+        }
+        /*
+         * DC ZVA (kernelcache only, native_sptm_patch.py --native-zva):
+         * zeroing through a writable alias is an ordinary store as far as
+         * the stage-1 rights go; an unmapped or read-only target faults to
+         * the private vector like any store. The kernel's page zeroing at
+         * XNU 0xfffffff02b34b348 issues one per 64-byte line.
+         */
+        if ((w & 0xffffffe0) == 0xd50b7420) {
+            continue;
+        }
+        /*
+         * Classes that execute correctly at physical EL1 without a ledger,
+         * needed by the unpatched corecrypto kext (HVF_KC_BOOT23 stopped on
+         * its MRS ID_AA64ISAR0_EL1): ID registers (op0=3 op1=0 CRn=0) trap
+         * to the host and reach the same dispatcher; the PSTATE group
+         * (op0=3 op1=3 CRn=4 CRm=2: NZCV, DAIF, DIT, SSBS, TCO, PAN, UAO)
+         * and the MSR-immediate forms act on the physical PSTATE, which the
+         * bridge mirrors in both directions.
+         */
+        if ((w & 0xfff80000) == 0xd5380000 && ((w >> 12) & 15) == 0 &&
+            ((w >> 16) & 7) == 0) {
+            continue;                       /* MRS Xt, ID_*_EL1 */
+        }
+        if ((w & 0xffdff000) == 0xd51b4000 && ((w >> 8) & 15) == 2) {
+            continue;                       /* MRS/MSR NZCV/DAIF/DIT/... */
+        }
+        if ((w & 0xfff8f01f) == 0xd500401f) {
+            continue;                       /* MSR (immediate) */
         }
         if (((w & 0xffc00000) == 0xd5000000 && ((w >> 19) & 3)) ||
             (w & 0xfffff000) == 0xd69f0000 ||
@@ -342,21 +502,40 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
         return false;
     }
     va &= ~(uint64_t)(VSH_PAGE - 1);
-    if (va == VSH_BASE || hvf_vsh.pages == VSH_PAGES) {
+    if (va == VSH_BASE) {
         return false;
+    }
+    if (hvf_ctx->pages == VSH_PAGES || hvf_ctx->tables + 3 > VSH_CTX_TABLES) {
+        /*
+         * Capacity eviction: drop every alias and rewalk, the same way a
+         * TLB flush would. The kernel's working set exceeded the original
+         * fixed pool within three seconds (HVF_KC_BOOT10, silent stop at
+         * 0xfffffff02ab54880 with the counters frozen).
+         */
+        static unsigned flushes;
+        hvf_vsh_invalidate(cpu);
+        if (flushes++ < 8 || !(flushes & 63)) {
+            error_report("Virtual shadow capacity flush #%u at pc=0x%" PRIx64,
+                         flushes, env->pc);
+        }
     }
     unsigned el = arm_current_el(env);
     HVFVirtualShadowPage *existing = NULL;
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        if (hvf_vsh.page[i].va == va) {
-            existing = &hvf_vsh.page[i];
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        if (hvf_ctx->page[i].va == va) {
+            existing = &hvf_ctx->page[i];
         }
     }
+    hvf_vsh.fault_valid = false;
     if (!get_phys_addr_with_ops(env, va, access, 0, arm_mmu_idx(env),
                                &result, &fi, &ops, &probe)) {
-        error_report("Virtual shadow guest walk denied va=0x%" PRIx64
-                     " el=%u access=%u FSC=0x%x", va, el, access,
-                     arm_fi_to_lfsc(&fi));
+        hvf_vsh.fault = fi;
+        hvf_vsh.fault_valid = true;
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual shadow guest walk denied va=0x%" PRIx64
+                         " el=%u access=%u FSC=0x%x", va, el, access,
+                         arm_fi_to_lfsc(&fi));
+        }
         return false;
     }
     if (existing) {
@@ -425,11 +604,8 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
                                          pa, VSH_PAGE);
     }
     /* An executable backing must remain immutable through every alias. */
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        if (hvf_vsh.page[i].pa == pa &&
-            (hvf_vsh.page[i].flags & HV_MEMORY_EXEC)) {
-            flags &= ~HV_MEMORY_WRITE;
-        }
+    if (hvf_vsh_pa_executable(pa)) {
+        flags &= ~HV_MEMORY_WRITE;
     }
     section = memory_region_find(arm_addressspace(cpu, result.f.attrs)->root,
                                  pa, VSH_PAGE);
@@ -440,16 +616,18 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
         flags &= ~HV_MEMORY_WRITE;
     }
     memory_region_unref(section.mr);
-    if (!hvf_vsh.pages &&
+    if (!hvf_ctx->pages &&
         g_strcmp0(getenv("QEMU_HVF_VIRTUAL_SHADOW_DENY_EXEC"), "1") == 0) {
         /* Diskless boot negative control: revoke, never grant, a right. */
         flags &= ~HV_MEMORY_EXEC;
     }
     slot = hvf_vsh_slot(va);
     if (!slot) {
+        error_report("Virtual shadow table pool exhausted at va=0x%" PRIx64,
+                     va);
         return false;
     }
-    ipa = VSH_ALIAS + hvf_vsh.pages * VSH_PAGE;
+    ipa = VSH_ALIAS + (hvf_vsh.current * VSH_PAGES + hvf_ctx->pages) * VSH_PAGE;
     assert_hvf_ok(hv_vm_map(host, ipa, VSH_PAGE, flags));
     HVFVirtualShadowPage page = {
         .va = va, .pa = pa, .ipa = ipa, .flags = flags,
@@ -462,7 +640,7 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
         descriptor |= UINT64_C(1) << 50; /* Preserve BTI's guarded-page bit. */
     }
     stq_le_p(slot, descriptor);
-    hvf_vsh.page[hvf_vsh.pages++] = page;
+    hvf_ctx->page[hvf_ctx->pages++] = page;
     hvf_vsh.generation++;
     if (!hvf_virtual_quiet) {
         error_report("Virtual shadow mapped va=0x%" PRIx64 " pa=0x%" PRIx64
@@ -491,9 +669,9 @@ static bool hvf_vsh_zero(CPUState *cpu, uint64_t address)
     va = param.tbi ? sextract64(address, 0, 56) : address;
     va &= ~(length - 1);
     uint64_t base = va & ~(uint64_t)(VSH_PAGE - 1);
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        if (hvf_vsh.page[i].va == base) {
-            page = &hvf_vsh.page[i];
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        if (hvf_ctx->page[i].va == base) {
+            page = &hvf_ctx->page[i];
             break;
         }
     }
@@ -501,7 +679,7 @@ static bool hvf_vsh_zero(CPUState *cpu, uint64_t address)
         if (!hvf_vsh_fill(cpu, address, MMU_DATA_STORE)) {
             return false;
         }
-        page = &hvf_vsh.page[hvf_vsh.pages - 1];
+        page = &hvf_ctx->page[hvf_ctx->pages - 1];
     }
     /*
      * The alias includes guest walk rights plus stricter code/table/ROM
@@ -565,6 +743,126 @@ static bool hvf_vsh_ctrr_write_allowed(CPUState *cpu, uint64_t pa)
     return true;
 }
 
+/*
+ * Write permission fault on an alias that lost WRITE because its backing
+ * was executable: the kernel reuses freed boot code as data (HVF_KC_BOOT25,
+ * STP at XNU 0xfffffff02b34b320 to 0xffffffe28a200000 right after a GEXIT).
+ * If the guest walk grants the store, executable aliases of that backing
+ * are demoted in every context (they re-validate on their next fetch) and
+ * this alias regains WRITE. Table-page dependencies keep the emulated path.
+ */
+static bool hvf_vsh_grant_write(CPUState *cpu, uint64_t far)
+{
+    static const ARMPTWMemoryOps ops = {
+        .read = hvf_vsh_read,
+        .cmpxchg64 = hvf_vsh_cmpxchg,
+    };
+    CPUARMState *env = cpu_env(cpu);
+    HVFPTWProbe probe = { .cpu = cpu };
+    GetPhysAddrResult result = {};
+    ARMMMUFaultInfo fi = {};
+    HVFVirtualShadowPage *p = NULL;
+    MemoryRegionSection section;
+    uint64_t va = far & ~(uint64_t)(VSH_PAGE - 1);
+    unsigned saved = hvf_vsh.current;
+
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        if (hvf_ctx->page[i].va == va) {
+            p = &hvf_ctx->page[i];
+        }
+    }
+    if (!p || (p->flags & HV_MEMORY_WRITE)) {
+        error_report("Virtual shadow grant: %s alias for va=0x%" PRIx64
+                     " (flags=%u)", p ? "writable" : "no", va,
+                     p ? (unsigned)p->flags : 0);
+        return false;
+    }
+    bool dependency = hvf_vsh_depends(p->pa);
+    if (!get_phys_addr_with_ops(env, va, MMU_DATA_STORE, 0, arm_mmu_idx(env),
+                               &result, &fi, &ops, &probe)) {
+        error_report("Virtual shadow grant: guest walk denies store at va=0x%"
+                     PRIx64 " FSC=0x%x", va, arm_fi_to_lfsc(&fi));
+        hvf_vsh.fault = fi;
+        hvf_vsh.fault_valid = true;
+        return false;
+    }
+    if (result.f.phys_addr != p->pa || !(result.f.prot & PAGE_WRITE)) {
+        error_report("Virtual shadow grant: va=0x%" PRIx64 " pa=0x%" PRIx64
+                     " alias pa=0x%" PRIx64 " prot=%u", va,
+                     (uint64_t)result.f.phys_addr, p->pa, result.f.prot);
+        return false;
+    }
+    if (dependency || hvf_vsh_depends(p->pa)) {
+        /*
+         * A page once used as a translation table is being written with a
+         * form the emulator does not handle (HVF_KC_BOOT26: STP at XNU
+         * 0xfffffff02b34b320 to 0xffffffe70d048000). Freed table pages are
+         * reused as data and the dependency list never retires entries, so
+         * start over: every alias and dependency is dropped, the retried
+         * store refaults as a translation fault and maps writable, and a
+         * page that is still a live table is rediscovered by the next walk.
+         * A page that keeps coming back here is a live table written with
+         * an unsupported form; stop instead of looping.
+         */
+        static uint64_t last_far;
+        static unsigned repeats;
+        repeats = far == last_far ? repeats + 1 : 0;
+        last_far = far;
+        if (repeats >= 3) {
+            error_report("Virtual shadow live table page written natively "
+                         "at 0x%" PRIx64 " pc=0x%" PRIx64, far, env->pc);
+            return false;
+        }
+        hvf_vsh_invalidate_all(cpu);
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual shadow table page reused as data at 0x%"
+                         PRIx64 ": aliases and dependencies restarted", va);
+        }
+        return true;
+    }
+    section = memory_region_find(arm_addressspace(cpu, p->attrs)->root,
+                                 p->pa, VSH_PAGE);
+    if (!section.mr) {
+        return false;
+    }
+    bool readonly = section.readonly || memory_region_is_rom(section.mr);
+    memory_region_unref(section.mr);
+    if (readonly) {
+        return false;
+    }
+    for (unsigned c = 0; c < VSH_CONTEXTS; c++) {
+        HVFVirtualShadowContext *ctx = &hvf_vsh.ctx[c];
+        for (unsigned i = 0; i < ctx->pages; i++) {
+            HVFVirtualShadowPage *q = &ctx->page[i];
+            if (q->pa == p->pa && (q->flags & HV_MEMORY_EXEC)) {
+                q->flags &= ~HV_MEMORY_EXEC;
+                q->exec0 = q->exec2 = false;
+                assert_hvf_ok(hv_vm_protect(q->ipa, VSH_PAGE, q->flags));
+                hvf_vsh.current = c;
+                uint64_t *slot = hvf_vsh_slot(q->va);
+                if (slot) {
+                    stq_le_p(slot, hvf_vsh_descriptor(q) |
+                             (ldq_le_p(slot) & (UINT64_C(1) << 50)));
+                }
+            }
+        }
+    }
+    hvf_vsh.current = saved;
+    p->flags |= HV_MEMORY_WRITE;
+    assert_hvf_ok(hv_vm_protect(p->ipa, VSH_PAGE, p->flags));
+    uint64_t *slot = hvf_vsh_slot(p->va);
+    assert(slot);
+    stq_le_p(slot, hvf_vsh_descriptor(p) |
+             (ldq_le_p(slot) & (UINT64_C(1) << 50)));
+    hvf_vsh.generation++;
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual shadow write granted va=0x%" PRIx64
+                     " pa=0x%" PRIx64 " (executable aliases demoted)",
+                     va, p->pa);
+    }
+    return true;
+}
+
 static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
 {
     static const ARMPTWMemoryOps ops = {
@@ -585,11 +883,8 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
     bool executable = false, table;
     g_autofree uint8_t *candidate = NULL;
 
-    if (far & 7) {
-        return false;
-    }
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        HVFVirtualShadowPage *p = &hvf_vsh.page[i];
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        HVFVirtualShadowPage *p = &hvf_ctx->page[i];
         if (p->va == (env->pc & ~(uint64_t)(VSH_PAGE - 1))) {
             source = p;
         }
@@ -601,10 +896,7 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
         (dest->flags & HV_MEMORY_WRITE)) {
         return false;
     }
-    for (unsigned i = 0; i < hvf_vsh.pages; i++) {
-        executable |= hvf_vsh.page[i].pa == dest->pa &&
-                      (hvf_vsh.page[i].flags & HV_MEMORY_EXEC);
-    }
+    executable = hvf_vsh_pa_executable(dest->pa);
     if (!executable && !hvf_vsh_depends(dest->pa)) {
         return false;
     }
@@ -614,11 +906,37 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
         return false;
     }
     word = ldl_le_p(host + env->pc - source->va);
-    /* STR Xt,[Xn|SP,#imm12*8], without writeback or exclusive semantics. */
-    if ((word & 0xffc00000) != 0xf9000000) {
+    /*
+     * Store forms the firmware uses on table and code pages:
+     *   STR  Xt, [Xn|SP, #imm12*8]           (SPTM 0xfffffff0270d5ce4)
+     *   STLR Xt, [Xn|SP]
+     *   CAS{A,L,AL} Xs, Xt, [Xn|SP]          (SPTM 0xfffffff0270edccc, PTE
+     *                                        compare-and-swap, HVF_KC_BOOT22)
+     * The compare-and-swap is atomic with respect to the guest because the
+     * single vCPU is stopped; on mismatch Xs receives the old word and no
+     * store happens.
+     */
+    unsigned rn = (word >> 5) & 31, rs = (word >> 16) & 31;
+    unsigned size = 1 << (word >> 30);            /* B/H/W/X from size bits */
+    bool cas = (word & 0x3fa07c00) == 0x08a07c00; /* CAS{A,L,AL}{B,H,,} */
+    bool stlr = (word & 0x3fffc00) == 0x089ffc00;  /* STLR{B,H,,} */
+    /*
+     * Atomic memory operations (LSE): LDADD/LDCLR/LDEOR/LDSET and SWP in
+     * every size and ordering (SPTM 0xfffffff0270eeb40 does LDADDAH on a
+     * table page, HVF_KC_BOOT30). Rt receives the old value; the stored
+     * value is computed here since the vCPU is stopped.
+     */
+    bool atomic = (word & 0x3f200c00) == 0x38200000 &&
+                  (((word >> 12) & 7) < 4 || (word & 0x8000));
+    if ((word & 0x3fc00000) == 0x39000000) {       /* STR{B,H,,} imm12 */
+        address = env->xregs[rn] + (((word >> 10) & 0xfff) * size);
+    } else if (cas || stlr || atomic) {
+        address = env->xregs[rn];
+    } else {
+        error_report("Virtual shadow unsupported store form 0x%08x at 0x%"
+                     PRIx64 " to 0x%" PRIx64, word, env->pc, far);
         return false;
     }
-    address = env->xregs[(word >> 5) & 31] + (((word >> 10) & 0xfff) * 8);
     if (address != far ||
         !get_phys_addr_with_ops(env, far, MMU_DATA_STORE, 0, arm_mmu_idx(env),
                                &result, &fi, &ops, &probe) ||
@@ -635,7 +953,7 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
         return false;
     }
     section = memory_region_find(arm_addressspace(cpu, result.f.attrs)->root,
-                                 result.f.phys_addr, 8);
+                                 result.f.phys_addr, size);
     if (!section.mr) {
         return false;
     }
@@ -649,12 +967,75 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
     if (!host) {
         return false;
     }
+    if (far & (size - 1)) {
+        return false;
+    }
     value = (word & 31) == 31 ? 0 : env->xregs[word & 31];
+    bool be = env->cp15.sctlr_el[2] & SCTLR_EE;
+    if (atomic) {
+        const uint8_t *at = host + far - dest->va;
+        uint64_t old = size == 8 ? (be ? ldq_be_p(at) : ldq_le_p(at)) :
+                       size == 4 ? (be ? ldl_be_p(at) : ldl_le_p(at)) :
+                       size == 2 ? (be ? lduw_be_p(at) : lduw_le_p(at)) :
+                       ldub_p(at);
+        uint64_t operand = rs == 31 ? 0 : env->xregs[rs];
+        unsigned opc = word & 0x8000 ? 8 : (word >> 12) & 7;
+        switch (opc) {
+        case 0:
+            value = old + operand;
+            break;
+        case 1:
+            value = old & ~operand;
+            break;
+        case 2:
+            value = old ^ operand;
+            break;
+        case 3:
+            value = old | operand;
+            break;
+        default:
+            value = operand;                     /* SWP */
+            break;
+        }
+        if ((word & 31) != 31) {
+            env->xregs[word & 31] = old;
+        }
+    }
+    if (cas) {
+        const uint8_t *at = host + far - dest->va;
+        uint64_t old = size == 8 ? (be ? ldq_be_p(at) : ldq_le_p(at)) :
+                       size == 4 ? (be ? ldl_be_p(at) : ldl_le_p(at)) :
+                       size == 2 ? (be ? lduw_be_p(at) : lduw_le_p(at)) :
+                       ldub_p(at);
+        uint64_t expected = rs == 31 ? 0 : env->xregs[rs];
+        if (size < 8) {
+            expected &= (UINT64_C(1) << (size * 8)) - 1;
+        }
+        if (rs != 31) {
+            env->xregs[rs] = old;
+        }
+        if (old != expected) {
+            env->pc += 4;
+            return true;
+        }
+    }
     candidate = g_memdup2(host, VSH_PAGE);
-    if (env->cp15.sctlr_el[2] & SCTLR_EE) {
-        stq_be_p(candidate + far - dest->va, value);
-    } else {
-        stq_le_p(candidate + far - dest->va, value);
+    {
+        uint8_t *at = candidate + far - dest->va;
+        switch (size) {
+        case 8:
+            be ? stq_be_p(at, value) : stq_le_p(at, value);
+            break;
+        case 4:
+            be ? stl_be_p(at, value) : stl_le_p(at, value);
+            break;
+        case 2:
+            be ? stw_be_p(at, value) : stw_le_p(at, value);
+            break;
+        default:
+            stb_p(at, value);
+            break;
+        }
     }
     if (executable && !hvf_vsh_code_safe(candidate)) {
         return false;
@@ -662,12 +1043,12 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
     table = hvf_vsh_depends(dest->pa);
     if (address_space_write(arm_addressspace(cpu, result.f.attrs),
                             result.f.phys_addr, result.f.attrs,
-                            candidate + far - dest->va, 8) != MEMTX_OK) {
+                            candidate + far - dest->va, size) != MEMTX_OK) {
         return false;
     }
     if (executable) {
         address_space_flush_icache_range(arm_addressspace(cpu, result.f.attrs),
-                                         result.f.phys_addr, 8);
+                                         result.f.phys_addr, size);
     }
     if (table) {
         /*
@@ -676,7 +1057,7 @@ static bool hvf_vsh_guarded_store(CPUState *cpu, uint64_t far)
          * all aliases and rewalk subsequent fetches/data accesses, including
          * self-referential table aliases, before any instruction can retire.
          */
-        hvf_vsh_invalidate(cpu);
+        hvf_vsh_invalidate_all(cpu);
     }
     error_report("Virtual shadow emulated STR64 pc=0x%" PRIx64
                  " va=0x%" PRIx64 " value=0x%" PRIx64 " table=%u",
@@ -723,8 +1104,11 @@ static void hvf_vsh_put(CPUState *cpu)
     bool timer_mask;
     hv_vcpu_exit_t exit = {};
 
-    if (!hvf_vsh.active || (hvf_vsh.installed == hvf_vsh.generation &&
-                            !hvf_vsh.icache_pending)) {
+    if (!hvf_vsh.active) {
+        return;
+    }
+    hvf_vsh_select(cpu);
+    if (hvf_vsh.installed == hvf_vsh.generation && !hvf_vsh.icache_pending) {
         return;
     }
     assert_hvf_ok(hv_vcpu_get_reg(fd, HV_REG_PC, &pc));
@@ -756,9 +1140,9 @@ static void hvf_vsh_put(CPUState *cpu)
     }
     assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_TCR_EL1, hvf_vsh.tcr));
     assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_TTBR0_EL1,
-                                      hvf_vsh.root[0]));
+                                      hvf_ctx->root[0]));
     assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_TTBR1_EL1,
-                                      hvf_vsh.root[1]));
+                                      hvf_ctx->root[1]));
     assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_MAIR_EL1, 0xff));
     assert_hvf_ok(hv_vcpu_set_sys_reg(fd, HV_SYS_REG_VBAR_EL1,
                                       VSH_BASE + 0x800));
@@ -904,6 +1288,85 @@ static bool hvf_vsh_mmio(CPUState *cpu, uint64_t far, uint64_t esr,
     return true;
 }
 
+/*
+ * Instruction permission fault on an alias installed for data. The guest
+ * walk is repeated for a fetch at the current level; if it grants execute,
+ * the stage-2 mapping gains EXEC (and loses WRITE, as executable backing is
+ * immutable through every alias), the code is validated for EL2, the
+ * host icache is synchronised, and the leaf's UXN/PXN reflect the level.
+ * The kernel reads kext text before executing it (HVF_KC_BOOT14 stopped
+ * on ESR 0x8600000f at 0xfffffff02ab08220 for exactly this pattern).
+ */
+static bool hvf_vsh_upgrade_exec(CPUState *cpu, uint64_t va)
+{
+    static const ARMPTWMemoryOps ops = {
+        .read = hvf_vsh_read,
+        .cmpxchg64 = hvf_vsh_cmpxchg,
+    };
+    CPUARMState *env = cpu_env(cpu);
+    HVFPTWProbe probe = { .cpu = cpu };
+    GetPhysAddrResult result = {};
+    ARMMMUFaultInfo fi = {};
+    HVFVirtualShadowPage *p = NULL;
+    MemoryRegion *mr;
+    hwaddr offset;
+    uint8_t *host;
+    unsigned el = arm_current_el(env);
+
+    va &= ~(uint64_t)(VSH_PAGE - 1);
+    for (unsigned i = 0; i < hvf_ctx->pages; i++) {
+        if (hvf_ctx->page[i].va == va) {
+            p = &hvf_ctx->page[i];
+        }
+    }
+    if (!p) {
+        return false;
+    }
+    hvf_vsh.fault_valid = false;
+    if (!get_phys_addr_with_ops(env, va, MMU_INST_FETCH, 0, arm_mmu_idx(env),
+                               &result, &fi, &ops, &probe)) {
+        hvf_vsh.fault = fi;
+        hvf_vsh.fault_valid = true;
+        return false;
+    }
+    if (result.f.phys_addr != p->pa || !(result.f.prot & PAGE_EXEC)) {
+        return false;
+    }
+    host = hvf_ptw_probe_ram(&probe, p->pa, p->attrs, VSH_PAGE, false, &mr,
+                             &offset);
+    if (!host) {
+        return false;
+    }
+    if (!(p->flags & HV_MEMORY_EXEC)) {
+        if (el == 2 && !hvf_vsh_code_safe(host)) {
+            return false;
+        }
+        p->flags = (p->flags & ~HV_MEMORY_WRITE) | HV_MEMORY_EXEC;
+        hvf_vsh_revoke_write(p->pa);
+        assert_hvf_ok(hv_vm_protect(p->ipa, VSH_PAGE, p->flags));
+        address_space_flush_icache_range(arm_addressspace(cpu, p->attrs),
+                                         p->pa, VSH_PAGE);
+    } else if (el == 2 && !p->exec2 && !hvf_vsh_code_safe(host)) {
+        return false;
+    }
+    if (el == 0) {
+        p->user = true;
+        p->exec0 = true;
+    } else {
+        p->exec2 = true;
+    }
+    uint64_t *slot = hvf_vsh_slot(va);
+    assert(slot);
+    stq_le_p(slot, hvf_vsh_descriptor(p) |
+             (ldq_le_p(slot) & (UINT64_C(1) << 50)));
+    hvf_vsh.generation++;
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual shadow exec upgrade va=0x%" PRIx64 " el=%u "
+                     "rights=%u", va, el, (unsigned)p->flags);
+    }
+    return true;
+}
+
 static bool hvf_vsh_exception(CPUState *cpu)
 {
     CPUARMState *env = cpu_env(cpu);
@@ -934,6 +1397,49 @@ static bool hvf_vsh_exception(CPUState *cpu)
     pstate_write(env, from_el == 1 ? (spsr & ~UINT64_C(0xc)) | 8 : spsr);
     aarch64_restore_sp(env, arm_current_el(env));
     unsigned ec = syn_get_ec(esr), fsc = esr & 0x3f;
+    if (from_el == 0 && ec == EC_UNCATEGORIZED) {
+        /*
+         * An unprivileged instruction the hardware refused. The one system
+         * operation user code legitimately performs on this platform is
+         * the SPRR user-bank access; try the dispatcher first and deliver
+         * the undefined-instruction exception only if it declines.
+         */
+        uint32_t word;
+        bool advance;
+        if (!cpu_memory_rw_debug(cpu, elr, &word, 4, false) &&
+            (word & 0xffc00000) == 0xd5000000 && ((word >> 19) & 3) &&
+            hvf_virtual_instruction(cpu, word, &advance)) {
+            env->pc = elr + (advance ? 4 : 0);
+            return true;
+        }
+    }
+    if (from_el == 1 && ec == EC_UNCATEGORIZED) {
+        /*
+         * Undefined instruction at virtual EL2. An unledgered system
+         * instruction (unpatched kext) is emulated like a ledgered one;
+         * otherwise the kernel's own trap opcodes (0xe7ffdeff at XNU
+         * 0xfffffff02aab2e44, HVF_KC_BOOT16) must reach its handler so
+         * the panic path can report itself. Same-EL delivery uses the
+         * vector at VBAR_EL2 + 0x200.
+         */
+        uint32_t word;
+        bool advance;
+        if (!cpu_memory_rw_debug(cpu, elr, &word, 4, false) &&
+            ((word & 0xffc00000) == 0xd5000000 || word == 0xd69f03e0) &&
+            hvf_virtual_instruction(cpu, word, &advance)) {
+            env->pc = elr + (advance ? 4 : 0);
+            return true;
+        }
+        cpu->exception_index = EXCP_UDEF;
+        env->exception.syndrome = esr;
+        env->exception.target_el = 2;
+        arm_cpu_do_interrupt(cpu);
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual EL2 undefined instruction at 0x%" PRIx64
+                         " delivered to 0x%" PRIx64, elr, env->pc);
+        }
+        return true;
+    }
     if (from_el == 0 && (ec == EC_AA64_SVC || ec == EC_UNCATEGORIZED)) {
         /*
          * Virtual EL0 (GL0 for TXM) exception into the guest's EL2 handler.
@@ -947,7 +1453,6 @@ static bool hvf_vsh_exception(CPUState *cpu)
         env->exception.syndrome = esr;
         env->exception.target_el = 2;
         arm_cpu_do_interrupt(cpu);
-        hvf_vsh_invalidate(cpu);
         if (!hvf_virtual_quiet) {
             error_report("Virtual EL0 exception EC=0x%x delivered from 0x%"
                          PRIx64 " to 0x%" PRIx64 " currentg=%" PRIu64,
@@ -971,10 +1476,84 @@ static bool hvf_vsh_exception(CPUState *cpu)
                 ok = hvf_vsh_fill(cpu, far, access);
             }
         }
+        if (!ok && hvf_vsh.fault_valid && !hvf_virtual_stop_on_fault &&
+            (hvf_vsh.fault.type == ARMFault_Translation ||
+             hvf_vsh.fault.type == ARMFault_Permission ||
+             hvf_vsh.fault.type == ARMFault_AccessFlag)) {
+            /*
+             * The guest's own tables refuse this access: deliver the abort
+             * the hardware would, with the long-format FSC, into the
+             * virtual EL2 vectors (same-EL offset 0x200 from EL2, lower-EL
+             * offset 0x400 from EL0). FAR comes from exception.vaddress in
+             * arm_cpu_do_interrupt. First needed by the kernel's
+             * demand-fault paths (1,251 data aborts in 6 s of HVF_KC_EXEC1).
+             */
+            ARMMMUFaultInfo *f = &hvf_vsh.fault;
+            unsigned fsc = arm_fi_to_lfsc(f);
+            bool same_el = from_el == 1;
+            cpu->exception_index = insn_abort ? EXCP_PREFETCH_ABORT :
+                                                EXCP_DATA_ABORT;
+            env->exception.vaddress = far;
+            env->exception.syndrome = insn_abort ?
+                syn_insn_abort(same_el, f->ea, f->s1ptw, fsc) :
+                syn_data_abort_no_iss(same_el, 0, f->ea, 0, f->s1ptw,
+                                      access == MMU_DATA_STORE, fsc);
+            env->exception.target_el = 2;
+            arm_cpu_do_interrupt(cpu);
+            if (!hvf_virtual_quiet) {
+                error_report("Virtual guest abort EC=0x%x FSC=0x%x va=0x%"
+                             PRIx64 " from EL%u pc=0x%" PRIx64 " to 0x%"
+                             PRIx64, syn_get_ec(env->exception.syndrome),
+                             fsc, far, from_el == 1 ? 2 : 0, elr, env->pc);
+            }
+            hvf_vsh.fault_valid = false;
+            return true;
+        }
     } else if (data_abort && (esr & (1 << 6)) &&
                fsc >= 13 && fsc <= 15) {
         WITH_RCU_READ_LOCK_GUARD() {
-            ok = hvf_vsh_guarded_store(cpu, far);
+            /* Emulated table/code stores first; grant is the fallback. */
+            ok = hvf_vsh_guarded_store(cpu, far) ||
+                 hvf_vsh_grant_write(cpu, far);
+        }
+        if (!ok && hvf_vsh.fault_valid && !hvf_virtual_stop_on_fault &&
+            hvf_vsh.fault.type == ARMFault_Permission) {
+            ARMMMUFaultInfo *f = &hvf_vsh.fault;
+            cpu->exception_index = EXCP_DATA_ABORT;
+            env->exception.vaddress = far;
+            env->exception.syndrome =
+                syn_data_abort_no_iss(from_el == 1, 0, f->ea, 0, f->s1ptw, 1,
+                                      arm_fi_to_lfsc(f));
+            env->exception.target_el = 2;
+            arm_cpu_do_interrupt(cpu);
+            hvf_vsh.fault_valid = false;
+            ok = true;
+        }
+        if (!ok) {
+            error_report("Virtual shadow write not granted at 0x%" PRIx64
+                         " pc=0x%" PRIx64 " el=%u", far, elr, from_el ? 2 : 0);
+        }
+    } else if (insn_abort && fsc >= 13 && fsc <= 15) {
+        WITH_RCU_READ_LOCK_GUARD() {
+            ok = hvf_vsh_upgrade_exec(cpu, far);
+        }
+        if (!ok && hvf_vsh.fault_valid && !hvf_virtual_stop_on_fault &&
+            hvf_vsh.fault.type == ARMFault_Permission) {
+            /* The guest really forbids execution here: its own abort. */
+            ARMMMUFaultInfo *f = &hvf_vsh.fault;
+            cpu->exception_index = EXCP_PREFETCH_ABORT;
+            env->exception.vaddress = far;
+            env->exception.syndrome = syn_insn_abort(from_el == 1, f->ea,
+                                                     f->s1ptw,
+                                                     arm_fi_to_lfsc(f));
+            env->exception.target_el = 2;
+            arm_cpu_do_interrupt(cpu);
+            hvf_vsh.fault_valid = false;
+            ok = true;
+        }
+        if (!ok) {
+            error_report("Virtual shadow execute permission at va=0x%" PRIx64
+                         " el=%u could not be granted", far, from_el ? 2 : 0);
         }
     }
     return ok;

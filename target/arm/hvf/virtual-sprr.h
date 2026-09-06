@@ -51,8 +51,16 @@ static int hvf_virtual_sprr_write(CPUState *cpu, const ARMCPRegInfo *ri,
         !hvf_virtual_sprr_raw(cpu, ENCODE_AA64_CP_REG(3, 6, 15, 3, 0),
                               &user_mask) ||
         !hvf_virtual_sprr_raw(cpu, ENCODE_AA64_CP_REG(3, 6, 15, 14, 3),
-                              &range) || user_mask || range ||
+                              &range) || range ||
         (mask && (mask != 0x40010 || !old_config))) {
+        /*
+         * UMPRR (the user-bank mask) is programmed by the kernel after the
+         * lock and is stored without further semantics, like PMPRR's
+         * observed value; AMRANGE remains unsupported.
+         */
+        error_report("Virtual SPRR unsupported state: PMPRR=0x%" PRIx64
+                     " UMPRR=0x%" PRIx64 " AMRANGE=0x%" PRIx64 " at 0x%" PRIx64,
+                     mask, user_mask, range, env->pc);
         goto unsupported;
     }
     if (arm_apple_is_gl(env) && old_config == 0xfb && mask == 0x40010) {
@@ -99,7 +107,13 @@ static int hvf_virtual_sprr_write(CPUState *cpu, const ARMCPRegInfo *ri,
          * accepted write discards the native aliases so EL0 permissions are
          * rewalked under the new bank.
          */
-        if (!strcmp(ri->name, "SPRR_UPERM_EL0") && arm_apple_is_gl(env)) {
+        if (!strcmp(ri->name, "SPRR_UPERM_EL0") &&
+            (arm_apple_is_gl(env) || arm_current_el(env) == 0)) {
+            /*
+             * EL0 rewrites its own bank too: kernelcache-hosted user code at
+             * 0x100d1c9d4 (HVF_KC_EXEC1) toggles it for JIT write/execute
+             * switching, which hardware permits from EL0.
+             */
             return 1;
         }
         if (pperm && !((value ^ env->sprr_pperm_el[2]) &

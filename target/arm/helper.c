@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/hvf.h"
 #include "qemu/log.h"
 #include "trace.h"
 #include "cpu.h"
@@ -6429,6 +6430,14 @@ void register_cp_regs_for_features(ARMCPU *cpu)
         define_tlb_insn_regs(cpu);
         define_at_insn_regs(cpu);
         define_gicv5_cpuif_regs(cpu);
+    } else if (hvf_enabled()) {
+        /*
+         * The virtual-EL2 HVF bridge emulates AT S1E* through the same
+         * ats_write64 callback (target/arm/hvf/virtual-el2.h); the walk
+         * uses get_phys_addr only, and the raise_exception paths concern
+         * stage-2 walks this platform never configures.
+         */
+        define_at_insn_regs(cpu);
     }
 #endif
 
