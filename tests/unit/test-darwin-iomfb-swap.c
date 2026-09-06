@@ -65,6 +65,14 @@ static void scanout_contract(void)
     stl_le_p(marker + 12, 0xff000021);
     g_assert_true(darwin_iomfb_marked_frame(&v, marker, &frame));
     g_assert_cmpuint(frame, ==, 33);
+    stl_le_p(marker + 12, 0xff001c21); /* 7201: must retain more than 8 bits. */
+    g_assert_true(darwin_iomfb_marked_frame(&v, marker, &frame));
+    g_assert_cmpuint(frame, ==, 7201);
+    stl_le_p(marker + 12, 0xff002001);
+    g_assert_false(darwin_iomfb_marked_frame(&v, marker, &frame));
+    stl_le_p(marker + 12, 0xff000000);
+    g_assert_false(darwin_iomfb_marked_frame(&v, marker, &frame));
+    stl_le_p(marker + 12, 0xff000021);
     marker[0] ^= 1;
     g_assert_false(darwin_iomfb_marked_frame(&v, marker, &frame));
     g_assert_false(darwin_iomfb_swap_surface(input, sizeof(input) - 1, &v));

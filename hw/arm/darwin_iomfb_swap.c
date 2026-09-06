@@ -13,11 +13,12 @@ bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
         (uint32_t)ldl_le_p(pixels) != 0xff44564dU ||
         (uint32_t)ldl_le_p(pixels + 4) != 0xff505253U ||
         (uint32_t)ldl_le_p(pixels + 8) != 0xff424c52U ||
-        ((uint32_t)ldl_le_p(pixels + 12) & 0xffffff00U) != 0xff000000U ||
-        pixels[12] < 1 || pixels[12] > 33) {
+        ((uint32_t)ldl_le_p(pixels + 12) & 0xff000000U) != 0xff000000U ||
+        (ldl_le_p(pixels + 12) & 0xffffffU) < 1 ||
+        (ldl_le_p(pixels + 12) & 0xffffffU) > 8192) {
         return false;
     }
-    *frame = pixels[12];
+    *frame = ldl_le_p(pixels + 12) & 0xffffffU;
     return true;
 }
 
