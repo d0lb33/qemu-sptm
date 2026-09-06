@@ -24,6 +24,16 @@ typedef struct HVFVirtualShadowPage {
     bool user, exec0, exec2;
 } HVFVirtualShadowPage;
 
+/*
+ * Experiment knobs, read once in hvf_virtual_init(). QUIET drops the
+ * per-operation diagnostics from the hot paths (they are stderr writes on
+ * every trap). KEEP_ALIASES retains native aliases across GENTER/GEXIT;
+ * that is NOT permission-correct across the GL/EL permission banks and is
+ * only for measuring the cost ceiling of a proper alias-reuse design.
+ * See docs/re/hvf-fastpath-ceiling.md.
+ */
+static bool hvf_virtual_quiet, hvf_virtual_keep_aliases, hvf_virtual_fastread;
+
 static struct {
     bool active, icache_pending;
     uint8_t *mem;
@@ -232,8 +242,10 @@ static void hvf_vsh_invalidate(CPUState *cpu)
      * derived from the old tables. hvf_vsh_put flushes native TLBs before
      * resuming, using the unchanged private helper page with the MMU off.
      */
-    error_report("Virtual shadow invalidate %u aliases at pc=0x%" PRIx64,
-                 hvf_vsh.pages, cpu_env(cpu)->pc);
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual shadow invalidate %u aliases at pc=0x%" PRIx64,
+                     hvf_vsh.pages, cpu_env(cpu)->pc);
+    }
     for (unsigned i = 0; i < hvf_vsh.pages; i++) {
         assert_hvf_ok(hv_vm_unmap(hvf_vsh.page[i].ipa, VSH_PAGE));
     }
@@ -247,6 +259,15 @@ static bool hvf_vsh_code_safe(const uint8_t *host)
 {
     for (unsigned i = 0; i < VSH_PAGE; i += 4) {
         uint32_t w = ldl_le_p(host + i);
+        /*
+         * TPIDR_EL0 (S3_3_C13_C0_2) is an unprivileged software-thread
+         * register: HVF never traps it and no permission or translation
+         * state depends on it, so it may execute natively at any level.
+         * The bridge benchmark uses it as the non-trapping read reference.
+         */
+        if ((w & 0xffdfffe0) == 0xd51bd040) {
+            continue;
+        }
         if (((w & 0xffc00000) == 0xd5000000 && ((w >> 19) & 3)) ||
             (w & 0xfffff000) == 0xd69f0000 ||
             /* Also reject the wider TCG decode's unverified bit-4 forms. */
@@ -365,9 +386,11 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
         assert(slot);
         stq_le_p(slot, hvf_vsh_descriptor(existing));
         hvf_vsh.generation++;
-        error_report("Virtual shadow widened va=0x%" PRIx64 " el=%u "
-                     "user=%u exec0=%u exec2=%u", va, el, existing->user,
-                     existing->exec0, existing->exec2);
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual shadow widened va=0x%" PRIx64 " el=%u "
+                         "user=%u exec0=%u exec2=%u", va, el, existing->user,
+                         existing->exec0, existing->exec2);
+        }
         return true;
     }
     if (result.f.lg_page_size < 14 || (result.f.phys_addr & (VSH_PAGE - 1)) ||
@@ -441,10 +464,12 @@ static bool hvf_vsh_fill(CPUState *cpu, uint64_t va, MMUAccessType access)
     stq_le_p(slot, descriptor);
     hvf_vsh.page[hvf_vsh.pages++] = page;
     hvf_vsh.generation++;
-    error_report("Virtual shadow mapped va=0x%" PRIx64 " pa=0x%" PRIx64
-                 " ipa=0x%" PRIx64 " rights=%u el=%u access=%u deps=%u",
-                 va, pa, ipa, (unsigned)flags, el, access,
-                 hvf_vsh.dependencies);
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual shadow mapped va=0x%" PRIx64 " pa=0x%" PRIx64
+                     " ipa=0x%" PRIx64 " rights=%u el=%u access=%u deps=%u",
+                     va, pa, ipa, (unsigned)flags, el, access,
+                     hvf_vsh.dependencies);
+    }
     return true;
 }
 
@@ -895,9 +920,11 @@ static bool hvf_vsh_exception(CPUState *cpu)
     assert_hvf_ok(hv_vcpu_get_sys_reg(fd, HV_SYS_REG_ELR_EL1, &elr));
     assert_hvf_ok(hv_vcpu_get_sys_reg(fd, HV_SYS_REG_FAR_EL1, &far));
     assert_hvf_ok(hv_vcpu_get_sys_reg(fd, HV_SYS_REG_SPSR_EL1, &spsr));
-    error_report("Virtual shadow native exception ESR=0x%" PRIx64
-                 " ELR=0x%" PRIx64 " FAR=0x%" PRIx64
-                 " SPSR=0x%" PRIx64, esr, elr, far, spsr);
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual shadow native exception ESR=0x%" PRIx64
+                     " ELR=0x%" PRIx64 " FAR=0x%" PRIx64
+                     " SPSR=0x%" PRIx64, esr, elr, far, spsr);
+    }
     /* Restore the interrupted virtual state even when the experiment stops. */
     unsigned from_el = (spsr >> 2) & 3;
     if (from_el != 1 && from_el != 0) {
@@ -921,9 +948,11 @@ static bool hvf_vsh_exception(CPUState *cpu)
         env->exception.target_el = 2;
         arm_cpu_do_interrupt(cpu);
         hvf_vsh_invalidate(cpu);
-        error_report("Virtual EL0 exception EC=0x%x delivered from 0x%"
-                     PRIx64 " to 0x%" PRIx64 " currentg=%" PRIu64,
-                     ec, elr, env->pc, env->currentg);
+        if (!hvf_virtual_quiet) {
+            error_report("Virtual EL0 exception EC=0x%x delivered from 0x%"
+                         PRIx64 " to 0x%" PRIx64 " currentg=%" PRIu64,
+                         ec, elr, env->pc, env->currentg);
+        }
         return true;
     }
     /* EC 0x20/0x24 are the lower-EL (EL0) forms of 0x21/0x25. */

@@ -30,6 +30,15 @@ static int hvf_virtual_init(void)
     if (!hvf_virtual_el2) {
         return 0;
     }
+    hvf_virtual_quiet = g_strcmp0(getenv("QEMU_HVF_VIRTUAL_QUIET"), "1") == 0;
+    hvf_virtual_keep_aliases =
+        g_strcmp0(getenv("QEMU_HVF_VIRTUAL_KEEP_ALIASES"), "1") == 0;
+    hvf_virtual_fastread =
+        g_strcmp0(getenv("QEMU_HVF_VIRTUAL_FASTREAD"), "1") == 0;
+    if (hvf_virtual_keep_aliases) {
+        error_report("Virtual EL2 KEEP_ALIASES experiment: aliases survive "
+                     "GENTER/GEXIT; permission banks are NOT rewalked");
+    }
     path = getenv("QEMU_HVF_VIRTUAL_LEDGER");
     if (hvf_nested_virt_enabled() || hvf_irqchip_in_kernel() || !path ||
         !g_file_get_contents(path, &data, &length, NULL) || length < 8 ||
@@ -360,6 +369,9 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
     if (read && rt != 31) {
         env->xregs[rt] = value;
     }
+    if (hvf_virtual_quiet) {
+        return true;
+    }
     if (!read && ri->fieldoffset) {
         error_report("Virtual EL2 write %s requested=0x%" PRIx64
                      " stored=0x%" PRIx64 " pc=0x%" PRIx64,
@@ -367,6 +379,52 @@ static bool hvf_virtual_instruction(CPUState *cpu, uint32_t word, bool *advance)
     } else {
         error_report("Virtual EL2 %s %s=0x%" PRIx64 " pc=0x%" PRIx64,
                      read ? "read" : "write-request", ri->name, value, env->pc);
+    }
+    return true;
+}
+
+/*
+ * Read fast path for the hottest bridge operations. TPIDR_GL2, CURRENTG and
+ * TPIDR_EL2 are software state that only emulated writes change, so the
+ * CPU env is authoritative without synchronizing the vCPU. The destination
+ * register is written directly and no other state is touched. Measured
+ * frequency: TPIDR_GL2 + CURRENTG are 66.79% of Apple register traffic
+ * (docs/re/hvf-migration-call-profile.md). Guarded-bank access still
+ * requires guarded execution; anything else takes the full path.
+ */
+static bool hvf_virtual_fast_read(CPUState *cpu, uint32_t word)
+{
+    ARMCPU *armcpu = ARM_CPU(cpu);
+    CPUARMState *env = &armcpu->env;
+    const ARMCPRegInfo *ri;
+    unsigned rt = word & 31;
+
+    if (!hvf_virtual_fastread || !(word & (1 << 21)) ||
+        (word & 0xffc00000) != 0xd5000000 || cpu->vcpu_dirty) {
+        return false;
+    }
+    ri = get_arm_cp_reginfo(armcpu->cp_regs,
+                            ENCODE_AA64_CP_REG((word >> 19) & 3,
+                                               (word >> 16) & 7,
+                                               (word >> 12) & 15,
+                                               (word >> 8) & 15,
+                                               (word >> 5) & 7));
+    if (!ri) {
+        return false;
+    }
+    if (ri->vhe_redir_to_el2 && (env->cp15.hcr_el2 & HCR_E2H)) {
+        ri = get_arm_cp_reginfo(armcpu->cp_regs, ri->vhe_redir_to_el2);
+    }
+    if (!ri || (strcmp(ri->name, "TPIDR_GL2") && strcmp(ri->name, "CURRENTG") &&
+                strcmp(ri->name, "TPIDR_EL2"))) {
+        return false;
+    }
+    if (!strcmp(ri->name, "TPIDR_GL2") && !arm_apple_is_gl(env)) {
+        return false;
+    }
+    if (rt != 31) {
+        assert_hvf_ok(hv_vcpu_set_reg(cpu->accel->fd, HV_REG_X0 + rt,
+                                      read_raw_cp_reg(env, ri)));
     }
     return true;
 }

@@ -175,11 +175,15 @@ static bool hvf_virtual_gxf_transition(CPUState *cpu, bool enter, unsigned imm)
         aarch64_restore_sp(env, 2);
     }
     /* Target fetch is rewalked in the new context; no old alias survives. */
-    hvf_vsh_invalidate(cpu);
-    error_report("Virtual GXF %s pc=0x%" PRIx64 " target=0x%" PRIx64
-                 " pstate=0x%" PRIx64 " sp=0x%" PRIx64,
-                 enter ? "GENTER" : "GEXIT", old_pc, env->pc,
-                 pstate_read(env), env->xregs[31]);
+    if (!hvf_virtual_keep_aliases) {
+        hvf_vsh_invalidate(cpu);
+    }
+    if (!hvf_virtual_quiet) {
+        error_report("Virtual GXF %s pc=0x%" PRIx64 " target=0x%" PRIx64
+                     " pstate=0x%" PRIx64 " sp=0x%" PRIx64,
+                     enter ? "GENTER" : "GEXIT", old_pc, env->pc,
+                     pstate_read(env), env->xregs[31]);
+    }
     return true;
 
 unsupported:

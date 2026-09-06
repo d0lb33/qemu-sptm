@@ -2783,6 +2783,11 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         if (hvf_virtual_el2 && (syndrome & 0xf000) == 0xe000) {
             unsigned index = syndrome & 0xfff;
+            if (index < hvf_virtual_word_count &&
+                hvf_virtual_fast_read(cpu, hvf_virtual_words[index])) {
+                advance_pc = true;
+                break;
+            }
             if (index >= hvf_virtual_word_count ||
                 !hvf_virtual_instruction(cpu, hvf_virtual_words[index],
                                           &advance_pc)) {
