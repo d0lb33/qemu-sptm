@@ -187,13 +187,21 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
     }
 
     tagged_data = request_size == SKS_MIGRATE_TAGGED_REQUEST_SIZE &&
-        result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_C &&
         /* SMP_SKS_CAPTURE6 captures Data 2 -> 3 during a warm-disk cold
          * boot (request SHA256 014e378d1667d4ae...). Like the existing
          * Data 4 -> 3 record, +0x68 is the source class, not a fixed volume
          * kind. Keep the exact Data tag, framing and destination checks. */
-        (result.record_kind == SKS_MIGRATE_TAGGED_DATA_RECORD_KIND ||
-         result.record_kind == SKS_MIGRATE_TAGGED_DATA_CLASS_B) &&
+        ((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_C &&
+          (result.record_kind == SKS_MIGRATE_TAGGED_DATA_RECORD_KIND ||
+           result.record_kind == SKS_MIGRATE_TAGGED_DATA_CLASS_B)) ||
+         /* APP_MIGRATION_R1 captures the reverse Data 3 -> 4 transfer
+          * during fresh LaunchServices migration (SHA256 ec1fd20016257e98).
+          * The native bridge at 0xfffffff0095730a0..0x957311c forwards
+          * source and destination classes and consumes the returned class.
+          * Dropping this request leaves Container Manager's writes waiting
+          * on the one-request SKS pool. Retain the exact Data record tag. */
+         (result.record_kind == SKS_MIGRATE_TAGGED_TARGET_CLASS_C &&
+          result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D)) &&
         !memcmp(request + SKS_MIGRATE_TAGGED_RECORD_FIXED_OFF,
                 sks_migrate_tagged_data_record_fixed,
                 sizeof(sks_migrate_tagged_data_record_fixed));

@@ -692,9 +692,80 @@ static void reject_corrupt_user_3_to_2(void)
         sizeof(captured_user_3_to_2), &parsed));
 }
 
+/* APP_MIGRATION_R1, exact Data 3 -> 4 request recovered through SEP DART. */
+static const uint8_t captured_data_3_to_4[] = {
+    0x48, 0x00, 0x00, 0x00, 0x05, 0x30, 0x63, 0xad,
+    0x16, 0x47, 0xa4, 0x13, 0xa5, 0x76, 0xfb, 0x81,
+    0xf6, 0x74, 0x9e, 0x19, 0x01, 0x00, 0x00, 0x00,
+    0xfd, 0x40, 0x29, 0x28, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x30, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x94, 0x4c, 0xf8, 0xa7, 0x50, 0xed, 0xf1, 0x04,
+    0x4d, 0x52, 0x2d, 0x0a, 0x3d, 0x1e, 0x6f, 0xbe,
+    0x00, 0xc4, 0x0e, 0x3e, 0x03, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0x03, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x61, 0x70, 0x66, 0x73, 0x75, 0x75,
+    0x69, 0x64, 0x00, 0x00, 0x76, 0x6f, 0x6c, 0x75,
+    0x6d, 0x01, 0x00, 0x00,
+};
+
+static void parse_captured_data_3_to_4(void)
+{
+    DarwinSKSMigrateRequest parsed;
+    g_autofree char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        captured_data_3_to_4, sizeof(captured_data_3_to_4));
+    g_assert_cmpstr(digest, ==,
+        "ec1fd20016257e9851cbf476238e58c687a5959b7b57a0429d179c662b026fe7");
+    g_assert_true(darwin_sks_parse_migrate_request(captured_data_3_to_4,
+        sizeof(captured_data_3_to_4), &parsed));
+    g_assert_cmpint(parsed.shape, ==, DARWIN_SKS_MIGRATE_TAGGED_DATA);
+    g_assert_cmpuint(parsed.record_kind, ==, 3);
+    g_assert_cmpuint(parsed.target_class, ==, 4);
+    g_assert_cmpuint(parsed.record_len, ==, 28);
+}
+
+static void reject_corrupt_data_3_to_4(void)
+{
+    static const size_t offsets[] = {
+        0, 0x14, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60,
+        0x68, 0x6c, 0x70, 0x84, 0x90, 0x9b, 0xa1,
+    };
+    uint8_t request[sizeof(captured_data_3_to_4) + 1];
+    DarwinSKSMigrateRequest parsed;
+    for (size_t i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        memcpy(request, captured_data_3_to_4, sizeof(captured_data_3_to_4));
+        request[offsets[i]] ^= 0x80;
+        g_assert_false(darwin_sks_parse_migrate_request(request,
+            sizeof(captured_data_3_to_4), &parsed));
+    }
+    memcpy(request, captured_data_3_to_4, sizeof(captured_data_3_to_4));
+    request[sizeof(captured_data_3_to_4)] = 0;
+    for (size_t n = 0; n <= sizeof(request); n++) {
+        if (n != sizeof(captured_data_3_to_4)) {
+            g_assert_false(darwin_sks_parse_migrate_request(request, n, &parsed));
+        }
+    }
+    /* Observing 3 -> 4 does not establish Data 3 -> 1 or 3 -> 2. */
+    for (uint32_t target = 1; target <= 2; target++) {
+        stl_le_p(request + 0x6c, target);
+        g_assert_false(darwin_sks_parse_migrate_request(request,
+            sizeof(captured_data_3_to_4), &parsed));
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/darwin-sks/migrate/data-3-to-4", parse_captured_data_3_to_4);
+    g_test_add_func("/darwin-sks/migrate/reject-data-3-to-4", reject_corrupt_data_3_to_4);
     g_test_add_func("/darwin-sks/migrate/user-2-to-1", parse_captured_user_2_to_1);
     g_test_add_func("/darwin-sks/migrate/user-3-to-2", parse_captured_user_3_to_2);
     g_test_add_func("/darwin-sks/migrate/reject-user-3-to-2", reject_corrupt_user_3_to_2);

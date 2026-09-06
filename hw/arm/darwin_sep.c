@@ -222,6 +222,9 @@
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_sep.h"
 #include "hw/arm/darwin_sks.h"
+#include "hw/arm/darwin_scrd.h"
+#include "hw/arm/darwin_xart_ap.h"
+#include "qemu/uuid.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
@@ -315,14 +318,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 
 // xART requests (AppleSEPXART, see the header). Only the three whose reply
 // shape was read out of the kext are named; the rest are acknowledged blind.
-#define XART_GET_EPOCH        0x15
+#define XART_GENERATE_AP_NONCE 0x15
 #define XART_COMMIT_EPOCHS    0x16
 #define XART_GET_FULL_EPOCHS  0x17
 #define XART_STATUS_OK        0
 #define XART_EPOCH_COUNT      8      // SEPEpoch::EPOCH_COUNT, cmp x2, 8 at 0x5a1db8
 #define XART_EPOCH_SLOT_SIZE  4      // lsl x20, x8, 2 at 0x5a1e5c
 #define XART_EPOCH_SIZE       2      // lsl x10, x10, 1 at 0x5a1d14
-#define XART_GET_EPOCH_LEN    8      // stp x8(8), xzr at 0x5a1c14
+#define XART_AP_NONCE_LEN     8      // stp x8(8), xzr at 0x5a1c14
 
 /*
  * AppleSEPCredentialManager endpoint-10 requests observed on iOS 27.0 beta 8.
@@ -669,6 +672,18 @@ typedef struct {
     uint32_t ool_in_size, ool_out_size;
 } SEPEndpointState;
 
+/* Host-generated opaque tokens represent empty contexts, never credentials.
+ * Tracking number: LocalAuthenticationCore _ACMContextGetTrackingNumber,
+ * 0x2062234ac..0x2062234b4. Token deletion contract: kext 0x952d9b4..d9d4.
+ * Experimental creation is opt-in until follow-on operations are captured.
+ */
+#define SCRD_CONTEXT_LIMIT 1024
+typedef struct SCRDContext {
+    uint8_t handle[16];
+    uint32_t owner;
+    uint32_t tracking;
+} SCRDContext;
+
 struct DarwinSEPState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -708,6 +723,12 @@ struct DarwinSEPState {
     uint64_t txm_size;       // dart-sep "txm-secure-channel-size"
     bool txm_published;
     SEPEndpointState ep[SEP_MAX_EPS];
+    SCRDContext scrd_contexts[SCRD_CONTEXT_LIMIT];
+    uint32_t scrd_context_count;
+    bool xart_ap_enabled;
+    bool xart_ap_loaded;
+    DarwinXARTAP xart_ap;
+    uint32_t scrd_next_tracking;
     const SEPEndpointDef *adv[ARRAY_SIZE(sep_all_eps)];
     int n_adv;
     bool debug;
@@ -1771,9 +1792,14 @@ static void sep_handle_scrd(DarwinSEPState *s, uint64_t m)
     SEPEndpointState *e = &s->ep[SEP_EP_CREDENTIALS];
     uint32_t request_size = (m >> 16) & 0xffff;
     g_autofree uint8_t *request = NULL;
-    uint8_t response[SCRD_RESPONSE_CMD25_LEN] = { 0 };
+    uint8_t response[33] = { 0 };
+    SCRDContext new_context = { 0 };
+    bool create_context = false;
+    unsigned create_slot = 0;
+    int delete_slot = -1;
     uint8_t command;
     uint32_t response_size = 0;
+    uint32_t response_status = 0;
 
     if (!request_size || request_size > e->ool_in_size || !e->ool_in_addr) {
         fprintf(stderr, "sep(%s): scrd tag %u has invalid OOL in size %u "
@@ -1814,7 +1840,83 @@ static void sep_handle_scrd(DarwinSEPState *s, uint64_t m)
     }
 
     command = request[SCRD_REQUEST_COMMAND_OFF];
+    if (!g_strcmp0(getenv("DARWIN_SCRD_UNSUPPORTED"), "1") &&
+        darwin_scrd_can_report_unsupported(request, request_size)) {
+        /* Diagnostic transport error, not an ACM policy result. The receive
+         * path still checks the v1 envelope/sequence before returning status
+         * (0x95291e4..0x9529310). Never supply fabricated success payloads.
+         * kIOReturnUnsupported = iokit_common_err(0x2c7).
+         */
+        response_status = 0xe00002c7;
+        response_size = SCRD_RESPONSE_HEADER_LEN;
+        goto send_reply;
+    }
     switch (command) {
+    case 0x02:
+    case 0x13:
+    case 0x28: {
+        uint32_t owner;
+        const uint8_t *handle;
+        if (g_strcmp0(getenv("DARWIN_SCRD_CONTEXTS"), "1") ||
+            !(command == 0x28 ?
+              darwin_scrd_parse_empty_data(request, request_size, &owner, &handle) :
+              darwin_scrd_parse_handle(request, request_size, command,
+                                       &owner, &handle))) {
+            break;
+        }
+        for (unsigned i = 0; i < s->scrd_context_count; i++) {
+            SCRDContext *ctx = &s->scrd_contexts[i];
+            if (ctx->tracking && ctx->owner == owner &&
+                !memcmp(ctx->handle, handle, 16)) {
+                /* _ACMContextGetExternalForm supplies no output buffer;
+                 * it exports its original token after this succeeds.
+                 * Only a token actually issued to this owner is accepted. */
+                /* Every issued context is empty: the model accepts no data
+                 * population or credential addition. Clearing type 5 is thus
+                 * idempotent. Extend stored state before accepting setters
+                 * with nonempty data; never turn this into generic success. */
+                response_size = SCRD_RESPONSE_HEADER_LEN;
+                if (command == 0x02) {
+                    /* LibCall_ACMContextDelete sends the 16-byte handle
+                     * and expects no payload: kext 0x952d9b4..0x952d9d4. */
+                    delete_slot = i;
+                }
+                goto send_reply;
+            }
+        }
+        break;
+    }
+    case 0x24:
+        if (g_strcmp0(getenv("DARWIN_SCRD_CONTEXTS"), "1") ||
+            !darwin_scrd_parse_create(request, request_size, &new_context.owner) ||
+            s->scrd_next_tracking == UINT32_MAX) {
+            break;
+        }
+        for (create_slot = 0; create_slot < s->scrd_context_count; create_slot++) {
+            if (!s->scrd_contexts[create_slot].tracking) {
+                break;
+            }
+        }
+        if (create_slot == SCRD_CONTEXT_LIMIT) {
+            break;
+        }
+        /* Capacity checked before creating any durable model state. */
+        if (!e->ool_out_addr || e->ool_out_size < sizeof(response)) {
+            break;
+        }
+        QemuUUID token;
+        qemu_uuid_generate(&token);
+        memcpy(new_context.handle, token.data, sizeof(new_context.handle));
+        new_context.tracking = s->scrd_next_tracking + 1;
+        memcpy(response + 12, new_context.handle, 16);
+        /* _ACMContextCreateWithFlags passes &__logLevel to LibCall at
+         * 0x2063940ec..0x206394114; payload byte 16 is stored there at
+         * 0x2063a804c..0x2063a8050. Use error-level logging (0x46). */
+        response[28] = 0x46;
+        stl_le_p(response + 29, new_context.tracking);
+        response_size = sizeof(response);
+        create_context = true;
+        goto send_reply;
     case SCRD_COMMAND_GET_STATE:
         if (request_size != SCRD_REQUEST_CMD10_LEN) {
             break;
@@ -1851,8 +1953,27 @@ send_reply:
         return;
     }
 
+    if (create_context) {
+        s->scrd_contexts[create_slot] = new_context;
+        s->scrd_context_count = MAX(s->scrd_context_count, create_slot + 1);
+        s->scrd_next_tracking = new_context.tracking;
+        fprintf(stderr, "sep(%s): scrd created empty context CS[%u] owner %u\n",
+                s->role, new_context.tracking, new_context.owner);
+    }
+    if (delete_slot >= 0) {
+        fprintf(stderr, "sep(%s): scrd deleted empty context CS[%u] owner %u\n",
+                s->role, s->scrd_contexts[delete_slot].tracking,
+                s->scrd_contexts[delete_slot].owner);
+        memset(&s->scrd_contexts[delete_slot], 0, sizeof(SCRDContext));
+    }
     sep_send_raw(s, frame(SEP_EP_CREDENTIALS, frame_tag(m),
-                          response_size & 0xff, response_size >> 8, 0));
+                          response_size & 0xff, response_size >> 8,
+                          response_status));
+    if (response_status) {
+        fprintf(stderr, "sep(%s): scrd cmd 0x%02x explicit unsupported transport"
+                " status 0x%08x, no success payload\n", s->role, command,
+                response_status);
+    }
     fprintf(stderr, "sep(%s): scrd v1 cmd 0x%02x seq 0x%08x tag %u replied "
             "with %u-byte OOL envelope at dva 0x%" PRIx64 "\n", s->role,
             command, ldl_le_p(request + 4), frame_tag(m), response_size,
@@ -1888,6 +2009,40 @@ static void sep_xart_reply_data(DarwinSEPState *s, uint64_t req, const void *buf
 static void sep_handle_xart(DarwinSEPState *s, uint64_t m) {
     uint8_t ep = frame_ep(m), op = frame_op(m);
 
+    if (s->xart_ap_enabled &&
+        (op == 0x15 || op == 0x18 || op == 0x19 || op == 0x1a)) {
+        uint8_t slot, code, nonce[8];
+        if (!darwin_xart_ap_request(m, &code, &slot)) {
+            fprintf(stderr, "sep(%s): xART AP malformed request; no reply\n", s->role);
+            return;
+        }
+        DarwinXARTAP next = s->xart_ap;
+        if (op == 0x15) {
+            qemu_guest_getrandom_nofail(nonce, sizeof(nonce));
+        }
+        if (op != 0x18 && !darwin_xart_ap_change(&next, code, slot,
+                                                 op == 0x15 ? nonce : NULL)) {
+            fprintf(stderr, "sep(%s): xART AP unsupported transition op%x slot%u state%u; no reply\n",
+                    s->role, op, slot, next.state[slot]);
+            return;
+        }
+        unsigned len = op == 0x18 ? 56 : op == 0x15 ? 8 : 0;
+        SEPEndpointState *e = &s->ep[ep];
+        if (len && (!e->ool_out_addr || len > e->ool_out_size ||
+                    !sep_dma(s, e->ool_out_addr, next.payload[slot], len, true))) {
+            fprintf(stderr, "sep(%s): xART AP output DMA failed; state unchanged, no reply\n", s->role);
+            return;
+        }
+        s->xart_ap = next;
+        /* Response byte6 is the slot STATE (95a2000), not the request's
+         * slot index. The status byte2 remains zero only after real DMA. */
+        sep_send(s, ep, frame_tag(m), 0, len,
+                 op == 0x18 ? (uint32_t)next.state[slot] << 16 : 0);
+        fprintf(stderr, "sep(%s): xART AP op%x slot%u state%u output%u\n",
+                s->role, op, slot, next.state[slot], len);
+        return;
+    }
+
     switch (op) {
     case XART_GET_FULL_EPOCHS: {
         // 8 x EpochSlot { u8 epoch; u8 pad[3]; }, all zero: a constant standing
@@ -1899,11 +2054,12 @@ static void sep_handle_xart(DarwinSEPState *s, uint64_t m) {
         sep_xart_reply_data(s, m, slots, sizeof(slots));
         return;
     }
-    case XART_GET_EPOCH: {
-        // One slot, 8 bytes, same zero constant. The slot index is byte 6 of
-        // the request (sturb at 0x5a1c0c writes [this+0x30] there).
-        uint8_t slot[XART_GET_EPOCH_LEN] = { 0 };
-        fprintf(stderr, "sep(%s): xART ep %u getEpoch(index %u): zero slot, %zu bytes\n",
+    case XART_GENERATE_AP_NONCE: {
+        // Historical compatibility fallback, formerly misidentified as
+        // getEpoch. Native AppleMobileApNonce917683c proves this generates
+        // an AP nonce. The opt-in stateful path above replaces this constant.
+        uint8_t slot[XART_AP_NONCE_LEN] = { 0 };
+        fprintf(stderr, "sep(%s): xART ep %u legacy AP nonce(index %u): zero placeholder, %zu bytes\n",
                 s->role, ep, (unsigned)((m >> 48) & 0xff), sizeof(slot));
         sep_xart_reply_data(s, m, slot, sizeof(slot));
         return;
@@ -2134,9 +2290,21 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     for (int i = 0; i < 4; i++) sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
 }
 
+static int darwin_sep_pre_load(void *opaque)
+{
+    ((DarwinSEPState *)opaque)->xart_ap_loaded = false;
+    return 0;
+}
+
 static int darwin_sep_post_load(void *opaque, int version_id)
 {
     DarwinSEPState *s = opaque;
+
+    /* Do not silently seed new nonce state when restoring a checkpoint
+     * captured before the opt-in AP slot model existed. */
+    if (s->xart_ap_enabled && !s->xart_ap_loaded) {
+        return -EINVAL;
+    }
 
     if (s->i2a_head < 0 || s->i2a_head >= MBOX_FIFO_DEPTH ||
         s->i2a_count < 0 || s->i2a_count > MBOX_FIFO_VISIBLE ||
@@ -2187,11 +2355,94 @@ static const VMStateDescription vmstate_sep_endpoint = {
     },
 };
 
+static const VMStateDescription vmstate_scrd_context = {
+    .name = "darwin-sep/scrd-context",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER(handle, SCRDContext),
+        VMSTATE_UINT32(owner, SCRDContext),
+        VMSTATE_UINT32(tracking, SCRDContext),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool scrd_contexts_needed(void *opaque)
+{
+    return ((DarwinSEPState *)opaque)->scrd_context_count != 0;
+}
+
+static int scrd_contexts_post_load(void *opaque, int version_id)
+{
+    DarwinSEPState *s = opaque;
+    if (s->scrd_context_count > SCRD_CONTEXT_LIMIT) {
+        return -EINVAL;
+    }
+    if (version_id == 1) {
+        /* v1 had append-only creation; each slot's tracking was index+1. */
+        s->scrd_next_tracking = s->scrd_context_count;
+    }
+    for (unsigned i = 0; i < s->scrd_context_count; i++) {
+        if (s->scrd_contexts[i].tracking > s->scrd_next_tracking) {
+            return -EINVAL;
+        }
+    }
+    fprintf(stderr, "sep(%s): restored SCRD context table: slots %u, last CS[%u]\n",
+            s->role, s->scrd_context_count, s->scrd_next_tracking);
+    return 0;
+}
+
+static const VMStateDescription vmstate_scrd_contexts = {
+    .name = TYPE_DARWIN_SEP "/scrd-contexts",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .needed = scrd_contexts_needed,
+    .post_load = scrd_contexts_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(scrd_context_count, DarwinSEPState),
+        VMSTATE_UINT32_V(scrd_next_tracking, DarwinSEPState, 2),
+        VMSTATE_STRUCT_ARRAY(scrd_contexts, DarwinSEPState, SCRD_CONTEXT_LIMIT,
+                             1, vmstate_scrd_context, SCRDContext),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool xart_ap_needed(void *opaque)
+{
+    return ((DarwinSEPState *)opaque)->xart_ap_enabled;
+}
+
+static int xart_ap_post_load(void *opaque, int version_id)
+{
+    DarwinSEPState *s = opaque;
+    if (!s->xart_ap_enabled || s->xart_ap.state[0] > 3 || s->xart_ap.state[1] > 3) {
+        return -EINVAL;
+    }
+    s->xart_ap_loaded = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_xart_ap = {
+    .name = TYPE_DARWIN_SEP "/xart-ap", .version_id = 1, .minimum_version_id = 1,
+    .needed = xart_ap_needed, .post_load = xart_ap_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_2DARRAY(xart_ap.payload, DarwinSEPState, 2, 56),
+        VMSTATE_BUFFER(xart_ap.state, DarwinSEPState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_darwin_sep = {
     .name = TYPE_DARWIN_SEP,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = darwin_sep_pre_load,
     .post_load = darwin_sep_post_load,
+    .subsections = (const VMStateDescription * const[]) {
+        &vmstate_scrd_contexts,
+        &vmstate_xart_ap,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_EQUAL(mmio_size, DarwinSEPState),
         VMSTATE_VBUFFER_UINT32(misc, DarwinSEPState, 1, NULL, mmio_size),
@@ -2286,6 +2537,18 @@ DeviceState *darwin_sep_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     qdev_prop_set_string(dev, "role", role ? role : name);
     qdev_prop_set_uint32(dev, "mmio-size", reg[0].len);
     DarwinSEPState *s = DARWIN_SEP(dev);
+    const char *ap_mode = getenv("DARWIN_XART_AP_SLOTS");
+    if (ap_mode && !strcmp(ap_mode, "1")) {
+        struct dtree_node *chosen = adt_find_node(dt_root, "chosen");
+        if (!chosen || adt_get_prop_len(chosen, "boot-nonce") != 8 ||
+            adt_get_prop_len(chosen, "sidp-rom-manifest-hash") != 48) {
+            fprintf(stderr, "xART AP slots require boot-nonce and sidp-rom-manifest-hash\n");
+            exit(1);
+        }
+        darwin_xart_ap_init(&s->xart_ap, adt_get_prop_val(chosen, "boot-nonce"),
+                            adt_get_prop_val(chosen, "sidp-rom-manifest-hash"));
+        s->xart_ap_enabled = true;
+    }
 
     /*
      * DMA geometry from the tree: "iommu-parent" lists one phandle per mapper

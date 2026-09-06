@@ -112,10 +112,12 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
 
 arm_common_ss.add(files('boot.c'))
 arm_common_ss.add(files('darwin_smp.c'))
+arm_common_ss.add(files('darwin_aes.c', 'darwin_aes_engine.c'))
+arm_common_ss.add(files('darwin_xart_ap.c'))
 
 hw_common_arch += {'arm': arm_common_ss}
 
-arm_common_ss.add(files('darwin.c', 'darwin_fb.c', 'darwin_input.c', 'darwin_aic.c', 'darwin_asc.c', 'darwin_afk.c', 'darwin_epic.c', 'darwin_dcp.c', 'darwin_iomfb.c', 'darwin_iomfb_swap.c', 'darwin_sep.c', 'darwin_sks.c', 'darwin_dart.c', 'darwin_sart.c', 'darwin_ans.c', 'darwin_unimp.c', 'darwin_spmi.c', 'darwin_pmu.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
+arm_common_ss.add(files('darwin.c', 'darwin_fb.c', 'darwin_input.c', 'darwin_aic.c', 'darwin_asc.c', 'darwin_afk.c', 'darwin_epic.c', 'darwin_dcp.c', 'darwin_iomfb.c', 'darwin_iomfb_swap.c', 'darwin_sep.c', 'darwin_sks.c', 'darwin_scrd.c', 'darwin_dart.c', 'darwin_sart.c', 'darwin_ans.c', 'darwin_unimp.c', 'darwin_spmi.c', 'darwin_pmu.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
 
 arm_common_ss.add(custom_target('apple_regs_autogen.h',
   output: 'apple_regs_autogen.h',

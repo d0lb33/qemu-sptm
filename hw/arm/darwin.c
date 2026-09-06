@@ -28,6 +28,7 @@
 #include "xnu/darwin_asc.h"
 #include "xnu/darwin_sart.h"
 #include "xnu/darwin_dart.h"
+#include "xnu/darwin_aes.h"
 #include "xnu/darwin_sep.h"
 #include "xnu/darwin_ans.h"
 #include "xnu/darwin_unimp.h"
@@ -402,6 +403,7 @@ static void darwin_init(MachineState *ms) {
     DeviceState *aic = init_aic(dt_root, iobase, cpudev);
     DeviceState *uart = init_uart(dt_root, iobase, aic);
     darwin_darts_create(dt_root, iobase, aic);
+    darwin_aes_create(dt_root, iobase, aic);
     darwin_sarts_create(dt_root, iobase, aic);
     darwin_dcp_create(dt_root, iobase, aic);
     // The SEP is an ASC wrapper too, but speaks its own protocol above the

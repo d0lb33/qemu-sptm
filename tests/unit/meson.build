@@ -2,6 +2,8 @@
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
 tests = {
+  'test-softfloat-minmax': [],
+  'test-softfloat-zero-mul': [],
   'check-block-qdict': [],
   'check-qdict': [],
   'check-qnum': [],
@@ -81,6 +83,7 @@ if have_block
     'test-crypto-hash': [crypto],
     'test-crypto-hmac': [crypto],
     'test-crypto-cipher': [crypto],
+    'test-darwin-aes-engine': [crypto, meson.project_source_root() / 'hw/arm/darwin_aes_engine.c'],
     'test-crypto-akcipher': [crypto],
     'test-crypto-secret': [crypto, keyutils],
     'test-crypto-der': [crypto],
@@ -129,6 +132,8 @@ if have_system
   tests += {
     'test-darwin-afk-state': [],
     'test-darwin-iomfb-swap': [meson.project_source_root() / 'hw/arm/darwin_iomfb_swap.c'],
+    'test-darwin-scrd': [meson.project_source_root() / 'hw/arm/darwin_scrd.c'],
+    'test-darwin-xart-ap': [meson.project_source_root() / 'hw/arm/darwin_xart_ap.c'],
     'test-darwin-sks-migrate': [meson.project_source_root() / 'hw/arm/darwin_sks.c'],
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
     'test-iov': [],

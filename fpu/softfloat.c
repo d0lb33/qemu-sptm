@@ -1858,6 +1858,16 @@ static double hard_f64_mul(double a, double b)
 float32 QEMU_FLATTEN
 float32_mul(float32 a, float32 b, float_status *s)
 {
+    uint32_t am = a & 0x7fffffffu, bm = b & 0x7fffffffu;
+
+    /* Zero times a finite normal (or zero) is exact under every rounding
+     * mode, with the XOR sign and no new exceptions. Leave subnormals and
+     * nonfinite operands to the generic path for input-flush/NaN handling.
+     */
+    if ((am == 0 && (bm == 0 || bm - 0x00800000u < 0x7f000000u)) ||
+        (bm == 0 && am - 0x00800000u < 0x7f000000u)) {
+        return (a ^ b) & 0x80000000u;
+    }
     return float32_gen2(a, b, s, hard_f32_mul, soft_f32_mul,
                         f32_is_zon2, f32_addsubmul_post);
 }
@@ -4081,6 +4091,21 @@ bfloat16 bfloat16_minmax(bfloat16 a, bfloat16 b, float_status *s, int flags)
 
 float32 float32_minmax(float32 a, float32 b, float_status *s, int flags)
 {
+    uint32_t am = a & 0x7fffffffu, bm = b & 0x7fffffffu;
+
+    /* Normal operands, zeros and infinities need no rounding. Order their
+     * encodings directly, preserving the selected operand's exact bits. Keep
+     * NaNs, subnormals and magnitude comparisons on the generic path,
+     * which supplies their status-dependent handling and tie rules.
+     */
+    if ((am == 0 || am - 0x00800000u <= 0x7f000000u) &&
+        (bm == 0 || bm - 0x00800000u <= 0x7f000000u) &&
+        !(flags & float_minmax_ismag)) {
+        uint32_t ak = a ^ ((a & 0x80000000u) ? UINT32_MAX : 0x80000000u);
+        uint32_t bk = b ^ ((b & 0x80000000u) ? UINT32_MAX : 0x80000000u);
+        return (flags & float_minmax_ismin) ? (ak < bk ? a : b)
+                                           : (ak > bk ? a : b);
+    }
     FloatParts64 pa = float32_unpack_canonical(a, s);
     FloatParts64 pb = float32_unpack_canonical(b, s);
     FloatParts64 *pr = parts64_minmax(&pa, &pb, s, flags);
