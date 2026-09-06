@@ -161,6 +161,9 @@ struct Exynos4210UartState {
 
     uint32_t channel;
 
+    /* darwin-input TX tap; runtime only, never part of migration state. */
+    Exynos4210UartTxObserver tx_observer;
+    void *tx_observer_opaque;
 };
 
 
@@ -450,6 +453,9 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
              * qemu_chr_fe_write and background I/O callbacks */
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
             trace_exynos_uart_tx(s->channel, ch);
+            if (s->tx_observer) {
+                s->tx_observer(s->tx_observer_opaque, ch);
+            }
             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
                     UTRSTAT_Tx_BUFFER_EMPTY;
             s->reg[I_(UINTSP)]  |= UINTSP_TXD;
@@ -714,6 +720,20 @@ int exynos4210_uart_inject(DeviceState *dev, const uint8_t *buf, int len)
     }
     exynos4210_uart_receive(s, buf, len);
     return len;
+}
+
+void exynos4210_uart_set_tx_observer(DeviceState *dev,
+                                     Exynos4210UartTxObserver fn, void *opaque)
+{
+    Exynos4210UartState *s = EXYNOS4210_UART(dev);
+
+    s->tx_observer = fn;
+    s->tx_observer_opaque = opaque;
+}
+
+int exynos4210_uart_rx_space(DeviceState *dev)
+{
+    return exynos4210_uart_can_receive(EXYNOS4210_UART(dev));
 }
 
 DeviceState *exynos4210_uart_create(hwaddr addr,
