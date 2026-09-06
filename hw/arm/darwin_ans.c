@@ -341,7 +341,7 @@ struct DarwinANSState {
      * Trace only the first eight auxiliary one-block reads at LBA0;
      * namespace discovery otherwise consumes the limit with earlier1MiB reads. */
     bool aux_trace, aux_trace_head_pending;
-    unsigned aux_trace_count;
+    unsigned aux_trace_count, aux_trace_limit;
     uint16_t aux_trace_cid;
     Error *aux_migration_blocker;
     uint32_t nvmmu_size, nvme_size;
@@ -1119,7 +1119,7 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
 
     bool trace = s->aux_trace && s->aux_blk && c->nsid == s->aux_nsid &&
                  c->opcode == NVME_IO_READ && c->cdw10 == 0 && c->cdw11 == 0 &&
-                 (c->cdw12 & 0xffff) == 0 && s->aux_trace_count <= 8;
+                 (c->cdw12 & 0xffff) == 0 && s->aux_trace_count <= s->aux_trace_limit;
     g_autofree uint8_t *buf = g_malloc(len);
     if (is_read) {
         if (trace) {
@@ -1251,7 +1251,7 @@ static void ans_submit(DarwinANSState *s, bool admin, uint32_t tag)
     bool aux_trace = !admin && s->aux_trace && s->aux_blk &&
                      c.nsid == s->aux_nsid && c.opcode == NVME_IO_READ &&
                      c.cdw10 == 0 && c.cdw11 == 0 && (c.cdw12 & 0xffff) == 0 &&
-                     ++s->aux_trace_count <= 8;
+                     ++s->aux_trace_count <= s->aux_trace_limit;
     if (aux_trace) {
         ans_log(s, "AUXTRACE stage=submit tag=%u cid=%u nsid=%u opcode=%u lba=%" PRIu64 " nlb=%u prp1=%" PRIx64 " prp2=%" PRIx64 " host_ns=%" PRId64 "\n",
                 tag, c.cid, c.nsid, c.opcode,
@@ -1902,6 +1902,15 @@ static void darwin_ans_realize(DeviceState *dev, Error **errp)
     s->debug = d ? (atoi(d) ? atoi(d) : 1) : 0;
     s->profile = getenv("DARWIN_ANS_PROFILE") != NULL;
     s->aux_trace = getenv("DARWIN_ANS_AUX_TRACE") != NULL;
+    s->aux_trace_limit = 8;
+    const char *trace_limit = getenv("DARWIN_ANS_AUX_TRACE_LIMIT");
+    if (trace_limit) {
+        char *end;
+        unsigned long n = strtoul(trace_limit, &end, 10);
+        if (*trace_limit && !*end && n >= 1 && n <= 65536) {
+            s->aux_trace_limit = n;
+        }
+    }
     s->profile_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     s->profile_last_ns = s->profile_start_ns;
     const char *env = getenv("DARWIN_ANS_SQE_STRIDE");
