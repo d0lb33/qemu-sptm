@@ -60,6 +60,9 @@
 #include "xnu/apple_dtree.h"
 #include "xnu/darwin_asc.h"
 #include "xnu/darwin_smc.h"
+#include "hw/core/qdev.h"
+#include "qapi/visitor.h"
+#include "qom/object.h"
 
 #define SMC_EP                 0x20
 
@@ -117,6 +120,7 @@ typedef struct {
 } DarwinSMC;
 
 static DarwinSMC *g_smc;
+static void smc_reply(DarwinSMC *s, uint64_t msg);
 
 static uint32_t fourcc(const char *s)
 {
@@ -262,6 +266,130 @@ static void smc_battery_apply(DarwinSMC *s)
     smc_set_u(s, "BCF0", 0);
     smc_set_u(s, "CH0V", b->external ? 5000 : 0);
     smc_set_u(s, "B0BL", BATT_VOLTAGE_MV);
+    smc_set_u(s, "B0UC", b->soc);
+    smc_set_u(s, "B0CM", 100);
+    smc_set_u(s, "UQK0", BATT_FULL_MAH);
+}
+
+/*
+ * IOP -> AP notification.  AppleSMCKeysEndpoint hands a type-0x18 message
+ * to AppleSMC, which reads byte 7 as the category (0x70 System State,
+ * 0x71 Power State, 0x72 HID Event, 0x73 Battery Auth, 0x74 GG Firmware
+ * Update, 0x76 Thermal Event; labels at 0xfffffff007728510-0xfffffff007728558,
+ * switch at 0xfffffff0095c9eec-0xfffffff0095c9fdc) and bytes 6, 5, 4 as
+ * three arguments it publishes to the callbacks registered for that
+ * category (0xfffffff0095ca244-0xfffffff0095ca2f4).  AppleSmartBattery's
+ * callback re-polls the battery for subtypes 1, 3, 6 and 0xb
+ * (0xfffffff0096b84f4-0xfffffff0096b8550), which is how a charger or
+ * capacity change reaches powerd without waiting for the periodic poll.
+ */
+#define SMC_NOTIFY_POWER_STATE 0x71
+
+static void smc_notify(DarwinSMC *s, uint8_t category, uint8_t subtype,
+                       uint8_t arg1, uint8_t arg2)
+{
+    SMCKey *ntap = smc_find(s, fourcc("NTAP"));
+    if (!s->initialized || !ntap || !ntap->data[0]) {
+        fprintf(stderr, "smc: notification 0x%02x/%u dropped (notifications not enabled)\n",
+                category, subtype);
+        return;
+    }
+    uint64_t msg = SMC_NOTIFICATION | ((uint64_t)arg2 << 32) | ((uint64_t)arg1 << 40) |
+                   ((uint64_t)subtype << 48) | ((uint64_t)category << 56);
+    fprintf(stderr, "smc: notification category 0x%02x subtype %u args %u %u\n",
+            category, subtype, arg1, arg2);
+    smc_reply(s, msg);
+}
+
+static void smc_battery_changed(DarwinSMC *s)
+{
+    smc_battery_apply(s);
+    fprintf(stderr, "smc: battery now soc=%u%% external=%d charging=%d\n",
+            s->batt.soc, s->batt.external, s->batt.charging);
+    smc_notify(s, SMC_NOTIFY_POWER_STATE, 1, s->batt.external, s->batt.soc);
+}
+
+/*
+ * Runtime control: /machine/smc-battery with properties soc, external and
+ * charging, settable through QMP/HMP qom-set while the guest runs, e.g.
+ *   qom-set /machine/smc-battery external false
+ * Each change rewrites the keys and raises a Power State notification.
+ */
+#define TYPE_DARWIN_SMC_BATTERY "darwin-smc-battery"
+OBJECT_DECLARE_SIMPLE_TYPE(DarwinSMCBattery, DARWIN_SMC_BATTERY)
+
+struct DarwinSMCBattery {
+    Object parent_obj;
+    DarwinSMC *s;
+};
+
+static void smc_batt_get_soc(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+{
+    DarwinSMCBattery *b = DARWIN_SMC_BATTERY(obj);
+    uint8_t val = b->s->batt.soc;
+    visit_type_uint8(v, name, &val, errp);
+}
+
+static void smc_batt_set_soc(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+{
+    DarwinSMCBattery *b = DARWIN_SMC_BATTERY(obj);
+    uint8_t val;
+    if (!visit_type_uint8(v, name, &val, errp)) return;
+    b->s->batt.soc = MIN(val, 100);
+    smc_battery_changed(b->s);
+}
+
+static bool smc_batt_get_external(Object *obj, Error **errp)
+{
+    return DARWIN_SMC_BATTERY(obj)->s->batt.external;
+}
+
+static void smc_batt_set_external(Object *obj, bool val, Error **errp)
+{
+    DarwinSMCBattery *b = DARWIN_SMC_BATTERY(obj);
+    b->s->batt.external = val;
+    smc_battery_changed(b->s);
+}
+
+static bool smc_batt_get_charging(Object *obj, Error **errp)
+{
+    return DARWIN_SMC_BATTERY(obj)->s->batt.charging;
+}
+
+static void smc_batt_set_charging(Object *obj, bool val, Error **errp)
+{
+    DarwinSMCBattery *b = DARWIN_SMC_BATTERY(obj);
+    b->s->batt.charging = val;
+    smc_battery_changed(b->s);
+}
+
+static void smc_batt_class_init(ObjectClass *klass, const void *data)
+{
+    object_class_property_add(klass, "soc", "uint8", smc_batt_get_soc, smc_batt_set_soc, NULL, NULL);
+    object_class_property_add_bool(klass, "external", smc_batt_get_external, smc_batt_set_external);
+    object_class_property_add_bool(klass, "charging", smc_batt_get_charging, smc_batt_set_charging);
+}
+
+static const TypeInfo smc_batt_info = {
+    .name = TYPE_DARWIN_SMC_BATTERY,
+    .parent = TYPE_OBJECT,
+    .instance_size = sizeof(DarwinSMCBattery),
+    .class_init = smc_batt_class_init,
+};
+
+static void smc_batt_register_types(void)
+{
+    type_register_static(&smc_batt_info);
+}
+
+type_init(smc_batt_register_types)
+
+static void smc_battery_expose(DarwinSMC *s)
+{
+    DarwinSMCBattery *b = DARWIN_SMC_BATTERY(object_new(TYPE_DARWIN_SMC_BATTERY));
+    b->s = s;
+    object_property_add_child(OBJECT(qdev_get_machine()), "smc-battery", OBJECT(b));
+    object_unref(OBJECT(b));
 }
 
 static void smc_populate_battery(DarwinSMC *s)
@@ -286,6 +414,15 @@ static void smc_populate_battery(DarwinSMC *s)
     smc_add_u(s, "B0BL", "ui16", 2, 0, false, "AppleSmartBattery cmd 0x1500 BootVoltage");
     smc_add_u(s, "B0CT", "ui16", 2, 0, false, "AppleSmartBattery cmd 0x17 cycle count");
     smc_add_u(s, "B0TE", "ui16", 2, 0, false, "AppleSmartBattery cmd 0x12 time to empty");
+    /* cmd 0x0f / 0x10 are the only feeders of IOPMPowerSource
+     * setCurrentCapacity / setMaxCapacity (0xfffffff0096b60b4 and
+     * 0xfffffff0096b60c4, reached from the cmd switch at 0xfffffff0096b5ccc-
+     * 0xfffffff0096b5cd8); with both keys absent the power source published
+     * CurrentCapacity 0 / MaxCapacity 0 while the pack's BatteryData carried
+     * 80 (BATT_SYS3 registry dump).  iOS reports capacity as a percentage
+     * of 100, which is what the pack's own BUIC/StateOfCharge use. */
+    smc_add_u(s, "B0UC", "ui8 ", 1, 0, false, "AppleSmartBattery cmd 0x0f CurrentCapacity");
+    smc_add_u(s, "B0CM", "ui8 ", 1, 0, false, "AppleSmartBattery cmd 0x10 MaxCapacity");
     /* pack-level keys with macsmc-power semantics, for AppleSmartBatteryPack */
     smc_add_u(s, "B0TF", "ui16", 2, 0, false, "time to full (macsmc-power)");
     smc_add_u(s, "B0RM", "ui16", 2, 0, false, "remaining capacity mAh (macsmc-power)");
@@ -303,6 +440,13 @@ static void smc_populate_battery(DarwinSMC *s)
      * 'UB'+pack+'C' to clear it.  No shutdown data is pending here. */
     smc_add_u(s, "UQd0", "ui16", 2, 0, false, "AppleSmartBatteryPack shutdown data flags");
     smc_add_u(s, "UB0C", "ui8 ", 1, 0, true, "AppleSmartBatteryPack shutdown data clear");
+    /* 'UQK'+pack (fallback UBNC), 2 bytes: shutdown nominal capacity
+     * (0xfffffff009699a94-0xfffffff009699ad0, "Failed to read shutdown
+     * nominal capacity" otherwise); 'YBU'+pack (fallback CHNC), 8 bytes:
+     * pack error-condition flags, top bits select an error string
+     * (0xfffffff00969b6b0-0xfffffff00969b79c); 0 = no error condition. */
+    smc_add_u(s, "UQK0", "ui16", 2, 0, false, "AppleSmartBatteryPack shutdown nominal capacity");
+    smc_add_u(s, "YBU0", "ui64", 8, 0, false, "AppleSmartBatteryPack error condition flags");
 
     s->batt.soc = 80;
     s->batt.external = true;
@@ -591,6 +735,7 @@ DeviceState *darwin_smc_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     memory_region_add_subregion(get_system_memory(), s->region_base, &s->region);
 
     smc_populate(s);
+    smc_battery_expose(s);
 
     static const uint8_t smc_eps[] = { SMC_EP };
     s->asc = darwin_asc_create(smc, iobase, aic, smc_eps, ARRAY_SIZE(smc_eps), &smc_asc_ops, s);
