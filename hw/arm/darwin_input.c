@@ -144,6 +144,19 @@ static void enqueue(DarwinInputState *s, uint8_t kind, uint16_t a, uint16_t b,
         s->c_coalesced++;
         return;
     }
+    if (kind == 'W' && tail && tail->kind == 'W') {
+        /* Trackpads can produce batches faster than iOS can perform the
+         * drag. Keep one bounded pending displacement, not seconds of
+         * scrolling after the user has stopped moving the wheel. */
+        tail->a = a;
+        tail->b = b;
+        tail->c = CLAMP(tail->c + c, -WHEEL_MAX_NOTCHES, WHEEL_MAX_NOTCHES);
+        tail->host_ms = rnow() / SCALE_MS;
+        if (!tail->c) s->q_len--;
+        s->c_coalesced++;
+        s->status_dirty = true;
+        return;
+    }
     if (s->q_len >= DARWIN_INPUT_QUEUE) {
         if (kind == 'M') {
             s->c_coalesced++;
@@ -313,6 +326,13 @@ static void darwin_input_pump(DarwinInputState *s)
             s->cancel_pending = false;
             wire_load(s, 'C', 0, 0, 0, rnow() / SCALE_MS);
             continue;
+        }
+        if (s->q_len && s->queue[s->q_head].kind == 'W') {
+            for (uint32_t i = 0; i < s->inflight_n; i++) {
+                if (s->inflight[i].kind == 'W' && !s->inflight[i].dispatched) {
+                    return; /* one active wheel drag plus one coalesced batch */
+                }
+            }
         }
         if (!queue_pop(s, &r)) {
             return;
