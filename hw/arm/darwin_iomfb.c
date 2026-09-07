@@ -524,13 +524,15 @@ static struct {
 
 /* Reuse the normal DMA/conversion allocations for a final-only compositor
  * witness. No additional readback/copy/hash in the frame loop; bounded to the
- * latest source/output plus 4084-byte request. Export on the first stop. */
+ * latest source/output plus 4084-byte request. Export on each stop; the
+ * snapshot manifest commits the group for a consumer copying while paused. */
 static struct {
     uint8_t *source, *output;
     uint8_t request[DARWIN_IOMFB_SWAP_INPUT_SIZE];
     DarwinIOMFBSurface surface;
     uint32_t count;
     bool exported;
+    uint64_t snapshot;
 } rgha_witness;
 
 /* Opt-in transition diagnostics: sample already-delivered CPU pixels, never
@@ -575,23 +577,26 @@ static void transition_capture(const uint8_t *pixels, uint32_t w, uint32_t h,
 static bool iomfb_export(const char *name, const void *bytes, size_t size)
 {
     g_autofree char *path = g_build_filename(gpu_present_witness.directory, name, NULL);
-    FILE *file = fopen(path, "wx");
-    if (!file) { return false; }
-    bool ok = fwrite(bytes, 1, size, file) == size;
-    return fclose(file) == 0 && ok;
+    /* Atomic replacement; a manifest published last commits the group. The
+     * consumer copies the complete group while the VM remains paused. */
+    return g_file_set_contents(path, bytes, size, NULL);
 }
 
 static void gpu_present_stopped(void *opaque, bool running, RunState state)
 {
     (void)opaque; (void)state;
-    if (!running && rgha_witness.source && !rgha_witness.exported) {
+    if (!running && rgha_witness.source) {
         DarwinIOMFBSurface *s = &rgha_witness.surface;
         bool ok = iomfb_export("last-scanout.rgha", rgha_witness.source, s->size);
         ok = iomfb_export("last-scanout.bgra", rgha_witness.output,
                            (size_t)s->width * s->height * 4) && ok;
         ok = iomfb_export("last-scanout.a408", rgha_witness.request,
                            sizeof(rgha_witness.request)) && ok;
-        rgha_witness.exported = true;
+        uint64_t snapshot = ++rgha_witness.snapshot;
+        g_autofree char *manifest = g_strdup_printf(
+            "{\"version\":1,\"snapshot\":%" PRIu64 ",\"frames\":%u,\"ok\":%s}\n",
+            snapshot, rgha_witness.count, ok ? "true" : "false");
+        ok = iomfb_export("last-scanout.json", manifest, strlen(manifest)) && ok;
         fprintf(stderr, "iomfb: RGhA final export swap=%u frames=%u source_bytes=%u ok=%u\n",
                 (uint32_t)ldl_le_p(rgha_witness.request + 0x98),
                 rgha_witness.count, s->size, ok);
