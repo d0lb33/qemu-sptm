@@ -289,6 +289,10 @@ static void wire_load(DarwinInputState *s, uint8_t kind, uint16_t a, uint16_t b,
         s->probe_present_rns = 0;
     }
     s->c_sent++;
+    if (kind != 'P' && kind != 'C' && getenv("DARWIN_INPUT_TIMING")) {
+        fprintf(stderr, "darwin-input: timing epoch=%u seq=%u kind=%c a=%u b=%u c=%d monotonic_ns=%" PRId64 "\n",
+                s->epoch, seq, kind, a, b, c, rnow());
+    }
     if (kind == 'P') {
         s->c_pings++;
     }

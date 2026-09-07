@@ -533,6 +533,45 @@ static struct {
     bool exported;
 } rgha_witness;
 
+/* Opt-in transition diagnostics: sample already-delivered CPU pixels, never
+ * read back the GPU. A host-created enable file arms at most 512 thumbnails.
+ * Export cost is logged separately; this is not a production pacing path. */
+static const char *transition_directory;
+static unsigned transition_frames;
+static void transition_capture(const uint8_t *pixels, uint32_t w, uint32_t h,
+                               uint32_t stride, int64_t presented)
+{
+    if (!transition_directory || transition_frames >= 512) {
+        return;
+    }
+    g_autofree char *enable = g_build_filename(transition_directory, "transition.enable", NULL);
+    if (!g_file_test(enable, G_FILE_TEST_EXISTS)) {
+        return;
+    }
+    int64_t started = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    unsigned tw = (w + 5) / 6, th = (h + 5) / 6;
+    g_autofree uint8_t *rgb = g_malloc((size_t)tw * th * 3);
+    for (unsigned y = 0; y < th; y++) {
+        for (unsigned x = 0; x < tw; x++) {
+            const uint8_t *p = pixels + (size_t)y * 6 * stride + x * 6 * 4;
+            uint8_t *d = rgb + ((size_t)y * tw + x) * 3;
+            d[0] = p[2]; d[1] = p[1]; d[2] = p[0];
+        }
+    }
+    g_autofree char *name = g_strdup_printf("transition-%04u.ppm", transition_frames++);
+    g_autofree char *path = g_build_filename(transition_directory, name, NULL);
+    FILE *f = fopen(path, "wb");
+    bool ok = false;
+    if (f) {
+        fprintf(f, "P6\n%u %u\n255\n", tw, th);
+        ok = fwrite(rgb, 3, (size_t)tw * th, f) == (size_t)tw * th;
+        ok = fclose(f) == 0 && ok;
+    }
+    fprintf(stderr, "iomfb: transition file=%s present_ns=%" PRId64
+            " capture_us=%" PRId64 " ok=%u\n", name, presented,
+            (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000, ok);
+}
+
 static bool iomfb_export(const char *name, const void *bytes, size_t size)
 {
     g_autofree char *path = g_build_filename(gpu_present_witness.directory, name, NULL);
@@ -642,12 +681,17 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
         fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
         return false;
     }
+    int64_t presented = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64
-            " source_format=0x%08x transfer=%u colorspace=%u source_stride=%u swap=%u scanout_us=%" PRId64 "\n",
+            " source_format=0x%08x transfer=%u colorspace=%u source_stride=%u swap=%u scanout_us=%" PRId64
+            " monotonic_ns=%" PRId64 "\n",
             surface.width, surface.height, display_stride, surface.dva,
             surface.format, surface.transfer, surface.colorspace, surface.stride,
             (uint32_t)ldl_le_p(input + 0x98),
-            (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000);
+            (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
+            presented);
+    transition_capture(display_pixels, surface.width, surface.height,
+                       display_stride, presented);
     scanout_last_w = surface.width;
     scanout_last_h = surface.height;
     scanout_last_stride = display_stride;
@@ -1213,8 +1257,9 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
     uint32_t status = (uint32_t)(msg >> 16);
 
     if (m->swap_active) {
-        fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x\n",
-                m->swap_ids[m->swap_head], status);
+        fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x monotonic_ns=%" PRId64 "\n",
+                m->swap_ids[m->swap_head], status,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
         m->cb_busy = m->swap_active = false;
         if (status) {
             m->swap_failed = true;
@@ -1398,8 +1443,9 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             uint32_t status = (uint32_t)(msg >> 16);
             m->swap_nested[tag] = false;
             fprintf(stderr, "iomfb: swap id %u D594 nested completed, status "
-                    "0x%x; releasing A408 tag %u\n",
-                    m->swap_nested_ids[tag], status, tag);
+                    "0x%x; releasing A408 tag %u monotonic_ns=%" PRId64 "\n",
+                    m->swap_nested_ids[tag], status, tag,
+                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
             iomfb_send(m, ep, 0x42ULL | ((uint64_t)tag << 10) |
                        ((uint64_t)status << 16), "A408 after nested D594");
             iomfb_after_rpc(m, ep, "A408");
@@ -1720,6 +1766,7 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->sid = sid;
     m->level = level;
     const char *witness = getenv("DARWIN_DCP_GPU_PRESENT_DIR");
+    transition_directory = getenv("DARWIN_DCP_TRANSITION_TRACE_DIR");
     if (witness && !gpu_present_witness.directory) {
         gpu_present_witness.directory = witness;
         qemu_add_vm_change_state_handler(gpu_present_stopped, NULL);
