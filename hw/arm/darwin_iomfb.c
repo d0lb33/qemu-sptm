@@ -1567,7 +1567,11 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
     const char *pwr = getenv("DARWIN_DCP_IOMFB_POWER");
     m->power_native = !(pwr && pwr[0] == '0');
-    m->display_power = 1;
+    /* DARWIN_DCP_IOMFB_POWER_INIT: what A485 reports before the first A484.
+     * 1 matches the AP's own initial +0x380; 0 is what the zero answers
+     * used to say and is what backboardd saw during the loop-era boots. */
+    const char *pinit = getenv("DARWIN_DCP_IOMFB_POWER_INIT");
+    m->display_power = pinit ? (uint32_t)strtoul(pinit, NULL, 0) : 1;
     const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
     m->swap_enabled = level >= 3 && complete && !strcmp(complete, "1");
     if (m->swap_enabled) {
