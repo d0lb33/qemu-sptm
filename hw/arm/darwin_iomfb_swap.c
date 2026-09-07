@@ -7,7 +7,8 @@ bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
 {
     /* swap_surface.size is the DMA-visible row span, not padded IOSurface
      * allocation size. The owned diagnostic writes these four BGRA pixels. */
-    if (!surface || !pixels || !frame || surface->width != 1179 ||
+    if (!surface || !pixels || !frame || surface->format != 0x42475241 ||
+        surface->width != 1179 ||
         surface->height != 2556 || surface->stride != 4864 ||
         surface->size != 4864 * 2556 ||
         (uint32_t)ldl_le_p(pixels) != 0xff44564dU ||
@@ -59,6 +60,9 @@ void darwin_iomfb_swap_completion(uint8_t output[DARWIN_IOMFB_SWAP_COMPLETION_SI
 }
 
 /* Measured packed primary BGRA profile from DISPLAY_SMP6_COMPLETE_R5 A408.
+ * CA_PURGEABILITY_GUEST1 also submits RGhA, row9472, transfer13/primaries1.
+ * Exact QuartzCore 18452bff8..18452c01c assigns tags (1,13) to sRGB and
+ * extended sRGB; IOSurface 1bffbf8dc[13] selects sRGB at 1bffbf888.
  * Descriptor fields match IOSurface accessors; wire+f90 follows a0c9128.
  * disp0/sid0 translation byte-matched the source IOSurface in VISIBLE_R6.
  * This is deliberately not a general multi-plane compositor. */
@@ -68,13 +72,29 @@ bool darwin_iomfb_swap_surface(const uint8_t *input, size_t size,
     const uint8_t *d;
     DarwinIOMFBSurface v;
     uint64_t bytes;
+    uint32_t bpp;
     if (!input || !surface || size != DARWIN_IOMFB_SWAP_INPUT_SIZE ||
         input[0xfea] || input[0xfeb] || input[0xfec] != 1 ||
         input[0xfed] != 1 || input[0xfee] != 1) {
         return false;
     }
     d = input + 0x6e0;
-    if ((uint32_t)ldl_le_p(d + 0xb) != 0x42475241) {
+    v.format = ldl_le_p(d + 0xb);
+    v.transfer = d[0x13];
+    v.colorspace = d[0x14];
+    bpp = v.format == 0x42475241 ? 4 : v.format == 0x52476841 ? 8 : 0;
+    if (!bpp) {
+        return false;
+    }
+    /* No tone-map/EDR-compensation implementation. _kern_SwapSetLayerEDR-
+     * Compensation stores enabled at object+564, corresponding to wire+54c
+     * (SwapEnd sends object+18). Preserve the existing BGRA profile separately.
+     * This RGhA extension covers the observed packed, nonplanar sRGB profile;
+     * other compression metadata and tone-map curves remain unmodelled. */
+    if (bpp == 8 && (v.transfer != 13 || v.colorspace != 1 ||
+                    lduw_le_p(d + 0x19) != 8 || d[0x1b] != 1 ||
+                    d[0x1c] != 1 || d[0] || ldl_le_p(d + 3) ||
+                    ldl_le_p(d + 7) || input[0x54c])) {
         return false;
     }
     v.width = ldl_le_p(d + 0x21);
@@ -83,12 +103,58 @@ bool darwin_iomfb_swap_surface(const uint8_t *input, size_t size,
     v.dva = ldq_le_p(input + 0xf90);
     bytes = (uint64_t)v.stride * v.height;
     if (!v.width || !v.height || v.width > 8192 || v.height > 8192 ||
-        v.stride < (uint64_t)v.width * 4 || (v.stride & 3) ||
+        v.stride < (uint64_t)v.width * bpp || (v.stride & (bpp - 1)) ||
         bytes > 64 * 1024 * 1024 || bytes > (uint32_t)ldl_le_p(d + 0x29) ||
         !v.dva || v.dva > UINT64_MAX - bytes) {
         return false;
     }
     v.size = bytes;
     *surface = v;
+    return true;
+}
+
+/* IEEE binary16 already carrying sRGB-encoded components -> SDR byte output.
+ * Integer quantization avoids host FP rounding modes and an extra sRGB OETF.
+ * Above-range finite values clip at the SDR output boundary; HDR display is
+ * not claimed. Nonfinite components reject the entire scanout before publish. */
+static uint8_t half_unorm8(uint16_t value)
+{
+    unsigned exponent = (value >> 10) & 31;
+    if (value & 0x8000 || !exponent) {
+        return 0;
+    }
+    if (exponent >= 15) {
+        return 255;
+    }
+    unsigned shift = 25 - exponent;
+    return (((value & 1023) + 1024) * 255 + (1U << (shift - 1))) >> shift;
+}
+
+bool darwin_iomfb_rgha_to_bgra(const DarwinIOMFBSurface *s,
+                              const uint8_t *source, size_t source_size,
+                              uint8_t *output, size_t output_size)
+{
+    if (!s || !source || !output || s->format != 0x52476841 ||
+        s->transfer != 13 || s->colorspace != 1 || !s->width || !s->height ||
+        s->width > 8192 || s->height > 8192 ||
+        s->stride < (uint64_t)s->width * 8 || (s->stride & 7) ||
+        (uint64_t)s->stride * s->height > source_size ||
+        (uint64_t)s->width * s->height * 4 > output_size) {
+        return false;
+    }
+    for (uint32_t y = 0; y < s->height; y++) {
+        const uint8_t *src = source + (size_t)y * s->stride;
+        uint8_t *dst = output + (size_t)y * s->width * 4;
+        for (uint32_t x = 0; x < s->width; x++, src += 8, dst += 4) {
+            uint16_t r = lduw_le_p(src), g = lduw_le_p(src + 2);
+            uint16_t b = lduw_le_p(src + 4), a = lduw_le_p(src + 6);
+            if ((r & 0x7c00) == 0x7c00 || (g & 0x7c00) == 0x7c00 ||
+                (b & 0x7c00) == 0x7c00 || (a & 0x7c00) == 0x7c00) {
+                return false;
+            }
+            dst[0] = half_unorm8(b); dst[1] = half_unorm8(g);
+            dst[2] = half_unorm8(r); dst[3] = half_unorm8(a);
+        }
+    }
     return true;
 }

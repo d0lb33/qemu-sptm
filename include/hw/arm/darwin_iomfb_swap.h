@@ -11,10 +11,15 @@ void darwin_iomfb_swap_completion(uint8_t output[DARWIN_IOMFB_SWAP_COMPLETION_SI
                                  uint32_t id);
 typedef struct DarwinIOMFBSurface {
     uint32_t width, height, stride, size;
+    uint32_t format;
+    uint8_t transfer, colorspace;
     uint64_t dva;
 } DarwinIOMFBSurface;
 bool darwin_iomfb_swap_surface(const uint8_t *input, size_t size,
                                DarwinIOMFBSurface *surface);
 bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
                              const uint8_t *pixels, uint32_t *frame);
+bool darwin_iomfb_rgha_to_bgra(const DarwinIOMFBSurface *surface,
+                              const uint8_t *source, size_t source_size,
+                              uint8_t *output, size_t output_size);
 #endif

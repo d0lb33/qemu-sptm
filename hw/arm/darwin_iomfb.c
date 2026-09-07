@@ -522,9 +522,41 @@ static struct {
     bool exported;
 } gpu_present_witness;
 
+/* Reuse the normal DMA/conversion allocations for a final-only compositor
+ * witness. No additional readback/copy/hash in the frame loop; bounded to the
+ * latest source/output plus 4084-byte request. Export on the first stop. */
+static struct {
+    uint8_t *source, *output;
+    uint8_t request[DARWIN_IOMFB_SWAP_INPUT_SIZE];
+    DarwinIOMFBSurface surface;
+    uint32_t count;
+    bool exported;
+} rgha_witness;
+
+static bool iomfb_export(const char *name, const void *bytes, size_t size)
+{
+    g_autofree char *path = g_build_filename(gpu_present_witness.directory, name, NULL);
+    FILE *file = fopen(path, "wx");
+    if (!file) { return false; }
+    bool ok = fwrite(bytes, 1, size, file) == size;
+    return fclose(file) == 0 && ok;
+}
+
 static void gpu_present_stopped(void *opaque, bool running, RunState state)
 {
     (void)opaque; (void)state;
+    if (!running && rgha_witness.source && !rgha_witness.exported) {
+        DarwinIOMFBSurface *s = &rgha_witness.surface;
+        bool ok = iomfb_export("last-scanout.rgha", rgha_witness.source, s->size);
+        ok = iomfb_export("last-scanout.bgra", rgha_witness.output,
+                           (size_t)s->width * s->height * 4) && ok;
+        ok = iomfb_export("last-scanout.a408", rgha_witness.request,
+                           sizeof(rgha_witness.request)) && ok;
+        rgha_witness.exported = true;
+        fprintf(stderr, "iomfb: RGhA final export swap=%u frames=%u source_bytes=%u ok=%u\n",
+                (uint32_t)ldl_le_p(rgha_witness.request + 0x98),
+                rgha_witness.count, s->size, ok);
+    }
     if (running || !gpu_present_witness.pixels || gpu_present_witness.exported) {
         return;
     }
@@ -570,11 +602,13 @@ static void iomfb_blank(void)
 
 static bool iomfb_scanout(const uint8_t *input, uint32_t len)
 {
+    int64_t started = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     DarwinIOMFBSurface surface;
     DeviceState *dart = darwin_dart_find("dart-disp0");
     g_autofree uint8_t *pixels = NULL;
+    g_autofree uint8_t *converted = NULL;
     if (!dart || !darwin_iomfb_swap_surface(input, len, &surface)) {
-        fprintf(stderr, "iomfb: scanout unsupported primary BGRA profile\n");
+        fprintf(stderr, "iomfb: scanout unsupported primary format/color profile\n");
         return false;
     }
     pixels = g_malloc(surface.size);
@@ -590,16 +624,40 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
         }
         off += chunk;
     }
-    if (!darwin_fb_present_bgra(pixels, surface.width, surface.height,
-                                surface.stride)) {
+    const uint8_t *display_pixels = pixels;
+    uint32_t display_stride = surface.stride;
+    if (surface.format == 0x52476841) {
+        display_stride = surface.width * 4;
+        size_t converted_size = (size_t)display_stride * surface.height;
+        converted = g_malloc(converted_size);
+        if (!darwin_iomfb_rgha_to_bgra(&surface, pixels, surface.size,
+                                      converted, converted_size)) {
+            fprintf(stderr, "iomfb: RGhA conversion rejected nonfinite/invalid pixels\n");
+            return false;
+        }
+        display_pixels = converted;
+    }
+    if (!darwin_fb_present_bgra(display_pixels, surface.width, surface.height,
+                                display_stride)) {
         fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
         return false;
     }
-    fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
-            surface.width, surface.height, surface.stride, surface.dva);
+    fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64
+            " source_format=0x%08x transfer=%u colorspace=%u source_stride=%u swap=%u scanout_us=%" PRId64 "\n",
+            surface.width, surface.height, display_stride, surface.dva,
+            surface.format, surface.transfer, surface.colorspace, surface.stride,
+            (uint32_t)ldl_le_p(input + 0x98),
+            (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000);
     scanout_last_w = surface.width;
     scanout_last_h = surface.height;
-    scanout_last_stride = surface.stride;
+    scanout_last_stride = display_stride;
+    if (gpu_present_witness.directory && surface.format == 0x52476841) {
+        g_free(rgha_witness.source); g_free(rgha_witness.output);
+        rgha_witness.source = g_steal_pointer(&pixels);
+        rgha_witness.output = g_steal_pointer(&converted);
+        memcpy(rgha_witness.request, input, sizeof(rgha_witness.request));
+        rgha_witness.surface = surface; rgha_witness.count++;
+    }
     uint32_t frame;
     if (gpu_present_witness.directory &&
         darwin_iomfb_marked_frame(&surface, pixels, &frame)) {
