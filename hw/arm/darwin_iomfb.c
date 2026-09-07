@@ -260,6 +260,22 @@ struct DarwinIOMFB {
     uint64_t rpcs;
 
     /*
+     * Display power path (docs/re/iomfb-power-path.md).
+     *
+     * display_power is the state the AP last requested with A484 and what
+     * A485 reports back. It starts at 1: iBoot hands over a lit panel, and
+     * the AP's own copy at IOMobileFramebufferAP+0x380 reads 1 before its
+     * first A484 (SYS_PWRBT5, gdb stop at 0xa0c6d60: w26 = 1).
+     * ap_power_on/changed are the two A500 bytes, kept so a later wake can
+     * be reasoned about; the firmware side keeps this across the RTKit
+     * IDLE/HELLO cycle by design (nothing here is reset on rtk restart).
+     */
+    bool power_native;          /* DARWIN_DCP_IOMFB_POWER != 0 (default on) */
+    uint32_t display_power;
+    uint8_t ap_power_on;
+    uint8_t ap_power_changed;
+
+    /*
      * Exact request signatures seen by DARWIN_DCP_IOMFB_RPC_TRACE. Keys are
      * {RPC header,input bytes}; values are occurrence counters. Exact keys
      * avoid a digest collision hiding a genuinely new body. The table lives
@@ -492,6 +508,28 @@ static bool iomfb_dma(DarwinIOMFB *m, uint64_t dva, void *buf, uint32_t len,
 
 /* Pixel DMA is disp0/sid0, not the RPC heap's dcp/sid23. Proven by
  * a 1 MiB byte match against native IOSurface pixels in VISIBLE_R6. */
+/* Geometry of the last presented surface, for the display-off blank. */
+static uint32_t scanout_last_w, scanout_last_h, scanout_last_stride;
+
+/*
+ * The panel goes dark when the AP turns the display off (A484 state 0):
+ * on hardware scanout stops and the DDIC shows black. Present one black
+ * frame of the last geometry so the window reflects that instead of
+ * freezing on the last swap. The next A408 after power-on repaints.
+ */
+static void iomfb_blank(void)
+{
+    if (!scanout_last_w) {
+        return;
+    }
+    g_autofree uint8_t *black = g_malloc0((size_t)scanout_last_stride * scanout_last_h);
+    if (darwin_fb_present_bgra(black, scanout_last_w, scanout_last_h,
+                               scanout_last_stride)) {
+        fprintf(stderr, "iomfb: display off, blanked %ux%u\n",
+                scanout_last_w, scanout_last_h);
+    }
+}
+
 static bool iomfb_scanout(const uint8_t *input, uint32_t len)
 {
     DarwinIOMFBSurface surface;
@@ -521,7 +559,78 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
     }
     fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
             surface.width, surface.height, surface.stride, surface.dva);
+    scanout_last_w = surface.width;
+    scanout_last_h = surface.height;
+    scanout_last_stride = surface.stride;
     return true;
+}
+
+/*
+ * Answer the display power RPCs with their measured meaning rather than
+ * zeros. All three layouts come from the AP's stubs in IOMobileGraphicsFamily
+ * (24A5430a, unslid):
+ *
+ *   A484  0xa0cc45c  in 16: u64 state, u8 flag_a, u8 flag_b, u8 flag_c,
+ *                          u8 flag_d, u8 (out ptr == NULL), 3 x 0xaa pad
+ *                    out 8: u32 state, u32 status
+ *         The caller stores out[0] into IOMobileFramebufferAP+0x380, the
+ *         display power state it consults everywhere else (0xa0cc4ec-4f0),
+ *         and converts out[1] with the status stub at 0xa0dc4a0.
+ *   A485  0xa0cc50c  in 0, out 4: the AP keeps only bit 0 (0xa0cc560-564),
+ *                    a "display is on" boolean.
+ *   A500  0xa0d41ec  in 4: u8 (ap_state == 1), u8 changed, u16 0xaaaa;
+ *                    out 0. Sent by DCPPowerManager::set_power_state just
+ *                    before the AP asks RTKit for IOP power state 0x201.
+ *
+ * Why it matters: with A484 answered as zeros the AP believed the ON request
+ * had left the display OFF (SYS_PWRBT5: [fb+0x380] went 1 -> 0 across the
+ * transition), and ten seconds later AppleDCP's BootComplete timer
+ * (0x89f2dac) released the last DCP power assertion. Every RPC after that
+ * powered the coprocessor up again, giving the 2.02 s sleep/wake loop.
+ */
+static bool iomfb_power_rpc(DarwinIOMFB *m, uint32_t name, const char *ascii,
+                            const uint8_t *in, uint32_t in_len,
+                            uint8_t *out, uint32_t out_len)
+{
+    if (!m->power_native) {
+        return false;
+    }
+    switch (name) {
+    case 0x41343834: /* A484 */
+        if (in_len < 8 || out_len < 8) {
+            return false;
+        }
+        {
+            uint32_t was = m->display_power;
+            m->display_power = ldl_le_p(in);
+            stl_le_p(out, m->display_power);
+            stl_le_p(out + 4, 0);
+            fprintf(stderr, "iomfb: %s display power %u -> %u (flags %02x %02x %02x %02x)\n",
+                    ascii, was, m->display_power,
+                    in_len > 8 ? in[8] : 0, in_len > 9 ? in[9] : 0,
+                    in_len > 10 ? in[10] : 0, in_len > 11 ? in[11] : 0);
+            if (was && !m->display_power && m->scanout_enabled) {
+                iomfb_blank();
+            }
+        }
+        return true;
+    case 0x41343835: /* A485 */
+        if (out_len < 4) {
+            return false;
+        }
+        stl_le_p(out, m->display_power ? 1 : 0);
+        return true;
+    case 0x41353030: /* A500 */
+        if (in_len >= 2) {
+            m->ap_power_on = in[0];
+            m->ap_power_changed = in[1];
+            fprintf(stderr, "iomfb: %s AP power state on=%u changed=%u (display power %u)\n",
+                    ascii, in[0], in[1], m->display_power);
+        }
+        return false; /* no output region to fill */
+    default:
+        return false;
+    }
 }
 
 static void iomfb_hexdump(const char *what, const uint8_t *p, uint32_t len) {
@@ -1247,11 +1356,26 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     }
 
     m->rpcs++;
+    char inhex[3 * 16 + 4] = "";
+    {
+        /* Short inputs inline: the power-path calls are 4-16 bytes and the
+         * value is the whole point (A484 state, A500 bytes). */
+        uint32_t n = h.in_len;
+        if (n > size - sizeof(h)) n = size - sizeof(h);
+        if (n && n <= 16) {
+            char *q = inhex;
+            *q++ = '[';
+            for (uint32_t i = 0; i < n; i++) {
+                q += sprintf(q, "%02x%s", buf[sizeof(h) + i], i + 1 < n ? " " : "");
+            }
+            *q++ = ']'; *q++ = ' '; *q = 0;
+        }
+    }
     fprintf(stderr, "iomfb: ep 0x%02x %sRPC #%" PRIu64
-            " '%s' (0x%08x) in %u out %u "
+            " '%s' (0x%08x) in %u %sout %u "
             "at heap+0x%x size 0x%x tag %u ack %u flag9 %u\n",
             ep, nested ? "nested callback-context AP " : "", m->rpcs,
-            name, h.name, h.in_len, h.out_len, off, size,
+            name, h.name, h.in_len, inhex, h.out_len, off, size,
             IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
 
     if (m->rpc_trace) {
@@ -1322,8 +1446,15 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
      * driver 0xaaaaaaaa rather than nothing.
      */
     const char *how = "zeroed";
+    if (!h.out_len && (uint64_t)sizeof(h) + h.in_len <= size) {
+        /* Input-only notifications still carry state (A500). */
+        iomfb_power_rpc(m, h.name, name, buf + sizeof(h), h.in_len, NULL, 0);
+    }
     if (h.out_len && (uint64_t)sizeof(h) + h.in_len + h.out_len <= size) {
         g_autofree uint8_t *out = g_malloc0(h.out_len);
+        if (iomfb_power_rpc(m, h.name, name, buf + sizeof(h), h.in_len, out, h.out_len)) {
+            how = "power path";
+        }
         GByteArray *ov = m->out_override ?
             g_hash_table_lookup(m->out_override, name) : NULL;
         if (ov) {
@@ -1434,6 +1565,9 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     m->level = level;
     const char *scanout = getenv("DARWIN_DCP_IOMFB_SCANOUT");
     m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
+    const char *pwr = getenv("DARWIN_DCP_IOMFB_POWER");
+    m->power_native = !(pwr && pwr[0] == '0');
+    m->display_power = 1;
     const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
     m->swap_enabled = level >= 3 && complete && !strcmp(complete, "1");
     if (m->swap_enabled) {
