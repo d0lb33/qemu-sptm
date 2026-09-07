@@ -13,6 +13,7 @@
 #include "chardev/char-fe.h"
 #include "xnu/apple_dtree.h"
 #include "xnu/darwin_gpu_transport.h"
+#include "xnu/dvm_surface_registry.h"
 #include <zlib.h>
 
 typedef struct DVMGPUTransport {
@@ -29,8 +30,111 @@ typedef struct DVMGPUTransport {
     unsigned managed_count;
     bool managed_started, managed_ready;
     int managed_fd;
+    int surface_dir;
+    DVMSurfaceRegistry *surfaces;
 } DVMGPUTransport;
 static void failed(DVMGPUTransport *s, unsigned code);
+
+static bool surface_publish(DVMGPUTransport *s, const DVMSurfaceRecord *r)
+{
+    g_autofree uint8_t *record = g_malloc0(64 + r->count * 8);
+    char name[40];
+    stq_le_p(record, DVM_SURFACE_MAGIC);
+    stq_le_p(record + 8, DVM_SURFACE_VERSION);
+    memcpy(record + 16, s->session, 16);
+    stq_le_p(record + 32, r->id);
+    stq_le_p(record + 40, r->length);
+    stq_le_p(record + 48, r->offset);
+    stq_le_p(record + 56, r->count);
+    for (unsigned i = 0; i < r->count; i++) {
+        stq_le_p(record + 64 + i * 8, r->pages[i] - DVM_SURFACE_DRAM_BASE);
+    }
+    snprintf(name, sizeof(name), "%016" PRIx64 ".pages", r->id);
+    int fd = openat(s->surface_dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = write(fd, record, 64 + r->count * 8) == 64 + r->count * 8;
+    close(fd);
+    if (!ok) {
+        unlinkat(s->surface_dir, name, 0);
+    }
+    return ok;
+}
+
+static unsigned surface_retire(DVMGPUTransport *s, uint64_t id)
+{
+    if (!dvm_surface_find(s->surfaces, id)) {
+        return DVM_SURFACE_STALE;
+    }
+    char name[40]; uint8_t record[32]; struct stat st;
+    snprintf(name, sizeof(name), "%016" PRIx64 ".retired", id);
+    int fd = openat(s->surface_dir, name, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        return DVM_SURFACE_BUSY;
+    }
+    bool ok = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == getuid() &&
+        !(st.st_mode & 077) && st.st_size == sizeof(record) &&
+        read(fd, record, sizeof(record)) == sizeof(record) &&
+        !memcmp(record, s->session, 16) && ldq_le_p(record + 16) == id &&
+        ldq_le_p(record + 24) == DVM_SURFACE_RETIRED_MAGIC;
+    close(fd);
+    /* Missing/partial/foreign acknowledgements never authorize kernel unpin. */
+    return ok ? dvm_surface_retire(s->surfaces, id) : DVM_SURFACE_BUSY;
+}
+
+static void surface_write(DVMGPUTransport *s, hwaddr off, uint64_t value)
+{
+    DVMSurfaceRegistry *r = s->surfaces;
+    if (r->poisoned) {
+        r->status = DVM_SURFACE_POISONED;
+        return;
+    }
+    switch (off) {
+    case 0x100:
+        dvm_surface_begin(r, value);
+        break;
+    case 0x108:
+        r->next_offset = value;
+        break;
+    case 0x110:
+        dvm_surface_page(r, value);
+        break;
+    case 0x118: {
+        if (value != 1) {
+            r->status = DVM_SURFACE_ARGUMENT;
+            break;
+        }
+        DVMSurfaceRecord *entry = dvm_surface_ready(r);
+        if (entry) {
+            if (surface_publish(s, entry)) {
+                dvm_surface_activate(r);
+                info_report("dvm-surface: registered id=%" PRIu64 " bytes=%" PRIu64
+                            " offset=%" PRIu64 " pages=%u", entry->id, entry->length, entry->offset, entry->count);
+            } else {
+                r->status = DVM_SURFACE_IO;
+            }
+        }
+        if (r->status) {
+            dvm_surface_abort(r);
+        }
+        break;
+    }
+    case 0x120:
+        r->status = surface_retire(s, value);
+        if (!r->status) {
+            info_report("dvm-surface: retired id=%" PRIu64 " host-ack=validated", value);
+        }
+        break;
+    case 0x130:
+        r->poisoned = true;
+        r->status = DVM_SURFACE_POISONED;
+        break;
+    default:
+        r->status = DVM_SURFACE_ARGUMENT;
+        break;
+    }
+}
 
 /* DVM experimental kernel registration ABI, not Apple hardware semantics.
  * This third DT aperture is never returned by clientMemoryForType. The boot
@@ -39,12 +143,28 @@ static void failed(DVMGPUTransport *s, unsigned code);
 static uint64_t managed_read(void *opaque, hwaddr off, unsigned size)
 {
     DVMGPUTransport *s = opaque;
+    if (size == 8 && s->surfaces && off >= 0x100) {
+        if (off == 0x118) {
+            return s->surfaces->last_id;
+        }
+        if (off == 0x128) {
+            return s->surfaces->status;
+        }
+        if (off == 0x138) {
+            return DVM_SURFACE_VERSION;
+        }
+        return 0;
+    }
     return off == 16 && size == 8 ? s->managed_ready : 0;
 }
 
 static void managed_write(void *opaque, hwaddr off, uint64_t value, unsigned size)
 {
     DVMGPUTransport *s = opaque;
+    if (size == 8 && s->surfaces && off >= 0x100 && !s->error) {
+        surface_write(s, off, value);
+        return;
+    }
     if (size != 8 || s->managed_ready || s->error) {
         failed(s, 20); return;
     }
@@ -58,6 +178,9 @@ static void managed_write(void *opaque, hwaddr off, uint64_t value, unsigned siz
         for (unsigned i = 0; i < s->managed_count; i++) {
             if (s->managed_pages[i] == value) { failed(s, 22); return; }
         }
+        unsigned page = (value - DVM_SURFACE_DRAM_BASE) / DVM_SURFACE_PAGE;
+        if (s->surfaces->owners[page]) { failed(s, 22); return; }
+        s->surfaces->owners[page] = DVM_SURFACE_LEGACY_OWNER;
         s->managed_pages[s->managed_count++] = value;
     } else if (off == 16 && value == 1 && s->managed_count == 759) {
         uint8_t record[32 + 759 * 8] = {0};
@@ -254,6 +377,7 @@ void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobas
     }
     DVMGPUTransport *s = g_new0(DVMGPUTransport, 1);
     s->managed_fd = -1;
+    s->surface_dir = -1;
     if (managed) {
         if (!getenv("DARWIN_GPU_MANAGED_RAM_PATH") ||
             ranges[2].base + iobase != DVM_GPU_REG_BASE + DVM_GPU_REG_SIZE ||
@@ -263,6 +387,12 @@ void darwin_gpu_transport_init(struct dtree_node *root, unsigned long long iobas
         }
         s->managed_fd = open(managed_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
         if (s->managed_fd < 0) { error_report("dvm-managed: exclusive page manifest failed"); exit(1); }
+        g_autofree char *surface_path = g_strconcat(managed_path, ".imports", NULL);
+        if (mkdir(surface_path, 0700) ||
+            (s->surface_dir = open(surface_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) < 0) {
+            error_report("dvm-surface: exclusive registry directory failed"); exit(1);
+        }
+        s->surfaces = g_new0(DVMSurfaceRegistry, 1);
         memory_region_init_io(&s->registration, NULL, &managed_ops, s,
                               "dvm-managed-registration", DVM_GPU_REG_SIZE);
         memory_region_add_subregion_overlap(get_system_memory(),
