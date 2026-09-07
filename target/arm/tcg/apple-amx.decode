@@ -1,0 +1,12 @@
+# Apple AMX (Apple Matrix eXtensions) instruction space.
+#
+# Encoding from corsix/amx aarch64.h: 0x00201000 | (op << 5) | operand.
+# op is the 5-bit AMX operation (0 ldx ... 22 genlut) and operand is the
+# general register whose value is the instruction's 64-bit operand, except
+# for op 17 where the field is an immediate: 0 = set, 1 = clr.
+#
+# Bit 10 is clear; the fork's GXF space (apple-gxf.decode, 0x00201400) has
+# it set, so the two never overlap.
+
+&amx           op rn
+AMX            0000 0000 0010 0000 0001 00 op:5 rn:5 &amx

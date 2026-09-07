@@ -36,6 +36,7 @@
 #include "target/arm/mmuidx.h"
 #include "hw/intc/arm_gicv5_types.h"
 #include "target/arm/vector-type.h"
+#include "target/arm/amx.h"
 
 #define EXCP_UDEF            1   /* undefined instruction */
 #define EXCP_SWI             2   /* software interrupt */
@@ -850,6 +851,14 @@ typedef struct CPUArchState {
     /* Linux syscall tagged address support */
     bool tagged_addr_enable;
 #endif /* CONFIG_USER_ONLY */
+
+    /*
+     * Apple AMX register file and control state (tcg/amx_helper.c). Kept at
+     * the very end: it is 5 KiB that no generated code touches, and putting
+     * it earlier moved every field after it (the first AMX build hung at
+     * kernel entry with no serial output, probe AMX0).
+     */
+    AMXState amx;
 } CPUARMState;
 
 static inline void set_feature(CPUARMState *env, int feature)

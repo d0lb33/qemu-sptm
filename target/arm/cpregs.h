@@ -154,6 +154,15 @@ enum {
      * ARM pseudocode function CheckFPMREnabled().
      */
     ARM_CP_FPMR                  = 1 << 23,
+    /*
+     * darwin-vm: an ARM_CP_IO register whose read hook touches only the
+     * virtual clock (a seqlock) and per-CPU state, so the read may skip the
+     * BQL when icount is off.  Used for CNTPCT/CNTVCT and their Apple
+     * aliases: XNU's mach_absolute_time reads them constantly, and
+     * helper_get_cp_reg64 accounted for ~10% of vCPU BQL waits on an idle
+     * iOS guest (docs/re/tcg-idle-profile.md).  Writes still take the lock.
+     */
+    ARM_CP_LOCKLESS_READ         = 1 << 24,
 };
 
 /*

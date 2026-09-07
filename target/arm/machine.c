@@ -369,6 +369,29 @@ static bool wfxt_timer_needed(void *opaque)
     return cpu->wfxt_timer;
 }
 
+/* darwin-vm: Apple AMX (target/arm/amx.h); present only on Apple machines. */
+static bool amx_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->env.amx.version != 0;
+}
+
+static const VMStateDescription vmstate_amx = {
+    .name = "cpu/amx",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = amx_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(env.amx.regs, ARMCPU, (8 + 8 + 64) * 64),
+        VMSTATE_UINT64(env.amx.config, ARMCPU),
+        VMSTATE_UINT64(env.amx.context, ARMCPU),
+        VMSTATE_UINT32(env.amx.active, ARMCPU),
+        VMSTATE_UINT32(env.amx.version, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_wfxt_timer = {
     .name = "cpu/wfxt-timer",
     .version_id = 1,
@@ -1341,6 +1364,7 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_serror,
         &vmstate_irq_line_state,
         &vmstate_wfxt_timer,
+        &vmstate_amx,
         &vmstate_syndrome64,
         &vmstate_pstate64,
         &vmstate_event,

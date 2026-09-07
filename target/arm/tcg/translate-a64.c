@@ -1943,6 +1943,122 @@ static bool trans_RET(DisasContext *s, arg_r *a)
     return true;
 }
 
+/*
+ * darwin-vm: disabled-PAC fast path (docs/re/tcg-idle-profile.md).
+ *
+ * pauth_helper.c defines QEMU_SPTM_DISABLE_PAC: signing returns its input and
+ * authentication returns pauth_strip() of it, after the key-enable and trap
+ * checks.  On an idle iOS guest the helper calls were 11% of busy-vCPU host
+ * samples, mostly call overhead, pauth_check_trap()/arm_hcr_el2_eff() and the
+ * mask-cache lookup.  When DisasContext.pauth_inline is set (see
+ * aarch64_tr_init_disas_context: no trap possible in this regime) we emit:
+ *
+ *   pac*:   rd = x                       (both key-enabled and disabled)
+ *   aut*:   if (live TCR != TCR at translation)  -> helper (slow path)
+ *           else if (!(SCTLR & EnXX))            -> rd = x
+ *           else rd = bit55 ? x | mask[data][1] : x & ~mask[data][0]
+ *   xpac*:  same strip, no key check
+ *
+ * The masks come from the same aa64_va_parameters()/pauth_ptr_mask() the
+ * helper uses; the TCR guard is the same invariant the helper's mask cache
+ * relies on.  The helpers remain the reference and the fallback.
+ */
+static const struct {
+    NeonGenTwo64OpEnvFn *fn;
+    bool is_pac;
+    bool data;
+    uint32_t sctlr_bit;
+} pauth2_ops[] = {
+    { gen_helper_pacia, true, false, SCTLR_EnIA },
+    { gen_helper_pacib, true, false, SCTLR_EnIB },
+    { gen_helper_pacda, true, true, SCTLR_EnDA },
+    { gen_helper_pacdb, true, true, SCTLR_EnDB },
+    { gen_helper_autia, false, false, SCTLR_EnIA },
+    { gen_helper_autib, false, false, SCTLR_EnIB },
+    { gen_helper_autda, false, true, SCTLR_EnDA },
+    { gen_helper_autdb, false, true, SCTLR_EnDB },
+    { gen_helper_autia_combined, false, false, SCTLR_EnIA },
+    { gen_helper_autib_combined, false, false, SCTLR_EnIB },
+    { gen_helper_autda_combined, false, true, SCTLR_EnDA },
+    { gen_helper_autdb_combined, false, true, SCTLR_EnDB },
+};
+
+static void gen_pauth_strip_inline(DisasContext *s, TCGv_i64 rd, TCGv_i64 x,
+                                   bool data, uint32_t sctlr_bit,
+                                   TCGLabel *l_slow)
+{
+    TCGLabel *l_done = gen_new_label();
+    TCGLabel *l_keyoff = NULL;
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 lo = tcg_temp_new_i64();
+    TCGv_i64 hi = tcg_temp_new_i64();
+    TCGv_i64 bit = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(t, tcg_env, s->pauth_tcr_off);
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, s->pauth_tcr, l_slow);
+    if (sctlr_bit) {
+        l_keyoff = gen_new_label();
+        tcg_gen_ld_i64(t, tcg_env, s->pauth_sctlr_off);
+        tcg_gen_andi_i64(t, t, sctlr_bit);
+        tcg_gen_brcondi_i64(TCG_COND_EQ, t, 0, l_keyoff);
+    }
+    tcg_gen_extract_i64(bit, x, 55, 1);
+    tcg_gen_andi_i64(lo, x, ~s->pauth_mask[data][0]);
+    tcg_gen_ori_i64(hi, x, s->pauth_mask[data][1]);
+    tcg_gen_movcond_i64(TCG_COND_NE, rd, bit, tcg_constant_i64(0), hi, lo);
+    tcg_gen_br(l_done);
+    if (l_keyoff) {
+        gen_set_label(l_keyoff);
+        if (rd != x) {
+            tcg_gen_mov_i64(rd, x);
+        }
+        tcg_gen_br(l_done);
+    }
+    gen_set_label(l_slow);
+    /* caller emits the helper here, then l_done */
+    s->pauth_l_done = l_done;
+}
+
+/* pac and aut ops: rd = op(x, modifier). */
+static void gen_pauth2(DisasContext *s, TCGv_i64 rd, TCGv_i64 x,
+                       TCGv_i64 modifier, NeonGenTwo64OpEnvFn *fn)
+{
+    if (s->pauth_inline) {
+        for (size_t i = 0; i < ARRAY_SIZE(pauth2_ops); i++) {
+            if (pauth2_ops[i].fn != fn) {
+                continue;
+            }
+            if (pauth2_ops[i].is_pac) {
+                if (rd != x) {
+                    tcg_gen_mov_i64(rd, x);
+                }
+                return;
+            }
+            TCGLabel *l_slow = gen_new_label();
+            gen_pauth_strip_inline(s, rd, x, pauth2_ops[i].data,
+                                   pauth2_ops[i].sctlr_bit, l_slow);
+            fn(rd, tcg_env, x, modifier);
+            gen_set_label(s->pauth_l_done);
+            return;
+        }
+    }
+    fn(rd, tcg_env, x, modifier);
+}
+
+/* xpaci/xpacd: rd = strip(x). */
+static void gen_pauth1(DisasContext *s, TCGv_i64 rd, TCGv_i64 x,
+                       NeonGenOne64OpEnvFn *fn)
+{
+    if (s->pauth_inline && (fn == gen_helper_xpaci || fn == gen_helper_xpacd)) {
+        TCGLabel *l_slow = gen_new_label();
+        gen_pauth_strip_inline(s, rd, x, fn == gen_helper_xpacd, 0, l_slow);
+        fn(rd, tcg_env, x);
+        gen_set_label(s->pauth_l_done);
+        return;
+    }
+    fn(rd, tcg_env, x);
+}
+
 static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
                                    TCGv_i64 modifier, bool use_key_a)
 {
@@ -1958,9 +2074,9 @@ static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
 
     truedst = tcg_temp_new_i64();
     if (use_key_a) {
-        gen_helper_autia_combined(truedst, tcg_env, dst, modifier);
+        gen_pauth2(s, truedst, dst, modifier, gen_helper_autia_combined);
     } else {
-        gen_helper_autib_combined(truedst, tcg_env, dst, modifier);
+        gen_pauth2(s, truedst, dst, modifier, gen_helper_autib_combined);
     }
     return truedst;
 }
@@ -2210,7 +2326,7 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
 static bool trans_XPACLRI(DisasContext *s, arg_XPACLRI *a)
 {
     if (s->pauth_active) {
-        gen_helper_xpaci(cpu_X[30], tcg_env, cpu_X[30]);
+        gen_pauth1(s, cpu_X[30], cpu_X[30], gen_helper_xpaci);
     }
     return true;
 }
@@ -2218,7 +2334,7 @@ static bool trans_XPACLRI(DisasContext *s, arg_XPACLRI *a)
 static bool trans_PACIA1716(DisasContext *s, arg_PACIA1716 *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacia(cpu_X[17], tcg_env, cpu_X[17], cpu_X[16]);
+        gen_pauth2(s, cpu_X[17], cpu_X[17], cpu_X[16], gen_helper_pacia);
     }
     return true;
 }
@@ -2226,7 +2342,7 @@ static bool trans_PACIA1716(DisasContext *s, arg_PACIA1716 *a)
 static bool trans_PACIB1716(DisasContext *s, arg_PACIB1716 *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacib(cpu_X[17], tcg_env, cpu_X[17], cpu_X[16]);
+        gen_pauth2(s, cpu_X[17], cpu_X[17], cpu_X[16], gen_helper_pacib);
     }
     return true;
 }
@@ -2234,7 +2350,7 @@ static bool trans_PACIB1716(DisasContext *s, arg_PACIB1716 *a)
 static bool trans_AUTIA1716(DisasContext *s, arg_AUTIA1716 *a)
 {
     if (s->pauth_active) {
-        gen_helper_autia(cpu_X[17], tcg_env, cpu_X[17], cpu_X[16]);
+        gen_pauth2(s, cpu_X[17], cpu_X[17], cpu_X[16], gen_helper_autia);
     }
     return true;
 }
@@ -2242,7 +2358,7 @@ static bool trans_AUTIA1716(DisasContext *s, arg_AUTIA1716 *a)
 static bool trans_AUTIB1716(DisasContext *s, arg_AUTIB1716 *a)
 {
     if (s->pauth_active) {
-        gen_helper_autib(cpu_X[17], tcg_env, cpu_X[17], cpu_X[16]);
+        gen_pauth2(s, cpu_X[17], cpu_X[17], cpu_X[16], gen_helper_autib);
     }
     return true;
 }
@@ -2278,7 +2394,7 @@ static bool trans_GCSB(DisasContext *s, arg_GCSB *a)
 static bool trans_PACIAZ(DisasContext *s, arg_PACIAZ *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacia(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
+        gen_pauth2(s, cpu_X[30], cpu_X[30], tcg_constant_i64(0), gen_helper_pacia);
     }
     return true;
 }
@@ -2286,7 +2402,7 @@ static bool trans_PACIAZ(DisasContext *s, arg_PACIAZ *a)
 static bool trans_PACIASP(DisasContext *s, arg_PACIASP *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacia(cpu_X[30], tcg_env, cpu_X[30], cpu_X[31]);
+        gen_pauth2(s, cpu_X[30], cpu_X[30], cpu_X[31], gen_helper_pacia);
     }
     return true;
 }
@@ -2294,7 +2410,7 @@ static bool trans_PACIASP(DisasContext *s, arg_PACIASP *a)
 static bool trans_PACIBZ(DisasContext *s, arg_PACIBZ *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacib(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
+        gen_pauth2(s, cpu_X[30], cpu_X[30], tcg_constant_i64(0), gen_helper_pacib);
     }
     return true;
 }
@@ -2302,7 +2418,7 @@ static bool trans_PACIBZ(DisasContext *s, arg_PACIBZ *a)
 static bool trans_PACIBSP(DisasContext *s, arg_PACIBSP *a)
 {
     if (s->pauth_active) {
-        gen_helper_pacib(cpu_X[30], tcg_env, cpu_X[30], cpu_X[31]);
+        gen_pauth2(s, cpu_X[30], cpu_X[30], cpu_X[31], gen_helper_pacib);
     }
     return true;
 }
@@ -2310,7 +2426,7 @@ static bool trans_PACIBSP(DisasContext *s, arg_PACIBSP *a)
 static bool trans_AUTIAZ(DisasContext *s, arg_AUTIAZ *a)
 {
     if (s->pauth_active) {
-        gen_helper_autia(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
+        gen_pauth2(s, cpu_X[30], cpu_X[30], tcg_constant_i64(0), gen_helper_autia);
     }
     return true;
 }
@@ -2318,7 +2434,7 @@ static bool trans_AUTIAZ(DisasContext *s, arg_AUTIAZ *a)
 static bool trans_AUTIASP(DisasContext *s, arg_AUTIASP *a)
 {
     if (s->pauth_active) {
-        gen_helper_autia(cpu_X[30], tcg_env, cpu_X[30], cpu_X[31]);
+        gen_pauth2(s, cpu_X[30], cpu_X[30], cpu_X[31], gen_helper_autia);
     }
     return true;
 }
@@ -2326,7 +2442,7 @@ static bool trans_AUTIASP(DisasContext *s, arg_AUTIASP *a)
 static bool trans_AUTIBZ(DisasContext *s, arg_AUTIBZ *a)
 {
     if (s->pauth_active) {
-        gen_helper_autib(cpu_X[30], tcg_env, cpu_X[30], tcg_constant_i64(0));
+        gen_pauth2(s, cpu_X[30], cpu_X[30], tcg_constant_i64(0), gen_helper_autib);
     }
     return true;
 }
@@ -2334,7 +2450,7 @@ static bool trans_AUTIBZ(DisasContext *s, arg_AUTIBZ *a)
 static bool trans_AUTIBSP(DisasContext *s, arg_AUTIBSP *a)
 {
     if (s->pauth_active) {
-        gen_helper_autib(cpu_X[30], tcg_env, cpu_X[30], cpu_X[31]);
+        gen_pauth2(s, cpu_X[30], cpu_X[30], cpu_X[31], gen_helper_autib);
     }
     return true;
 }
@@ -4334,11 +4450,9 @@ static bool trans_LDRA(DisasContext *s, arg_LDRA *a)
 
     if (s->pauth_active) {
         if (!a->m) {
-            gen_helper_autda_combined(dirty_addr, tcg_env, dirty_addr,
-                                      tcg_constant_i64(0));
+            gen_pauth2(s, dirty_addr, dirty_addr, tcg_constant_i64(0), gen_helper_autda_combined);
         } else {
-            gen_helper_autdb_combined(dirty_addr, tcg_env, dirty_addr,
-                                      tcg_constant_i64(0));
+            gen_pauth2(s, dirty_addr, dirty_addr, tcg_constant_i64(0), gen_helper_autdb_combined);
         }
     }
 
@@ -9069,7 +9183,7 @@ static bool gen_pacaut(DisasContext *s, arg_pacaut *a, NeonGenTwo64OpEnvFn fn)
     }
     if (s->pauth_active) {
         tcg_rd = cpu_reg(s, a->rd);
-        fn(tcg_rd, tcg_env, tcg_rd, tcg_rn);
+        gen_pauth2(s, tcg_rd, tcg_rd, tcg_rn, fn);
     }
     return true;
 }
@@ -9088,7 +9202,7 @@ static bool do_xpac(DisasContext *s, int rd, NeonGenOne64OpEnvFn *fn)
 {
     if (s->pauth_active) {
         TCGv_i64 tcg_rd = cpu_reg(s, rd);
-        fn(tcg_rd, tcg_env, tcg_rd);
+        gen_pauth1(s, tcg_rd, tcg_rd, fn);
     }
     return true;
 }
@@ -11024,6 +11138,29 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->max_svl = arm_cpu->sme_max_vq * 16;
     dc->max_any_vl = MAX(dc->max_svl, arm_cpu->sve_max_vq * 16);
     dc->pauth_active = EX_TBFLAG_A64(tb_flags, PAUTH_ACTIVE);
+    /*
+     * darwin-vm: the fast path is only legal where pauth_check_trap() can
+     * never fire: EL2+ (no EL3 on this machine) or EL0 under HCR.E2H+TGE,
+     * which is exactly the E20_0 regime.  EL1&0 regimes keep the helpers.
+     */
+    dc->amx_enabled = env->amx.version != 0;
+    dc->pauth_inline = false;
+    if (dc->pauth_active && arm_pauth_inline_enabled() &&
+        !arm_dc_feature(dc, ARM_FEATURE_EL3) &&
+        (dc->current_el >= 2 || dc->mmu_idx == ARMMMUIdx_E20_0)) {
+        int el = regime_el(dc->mmu_idx);
+        dc->pauth_inline = true;
+        dc->pauth_tcr_off = offsetof(CPUARMState, cp15.tcr_el[el]);
+        dc->pauth_sctlr_off = offsetof(CPUARMState, cp15.sctlr_el[el]);
+        dc->pauth_tcr = regime_tcr(env, dc->mmu_idx);
+        for (int d = 0; d < 2; d++) {
+            for (int upper = 0; upper < 2; upper++) {
+                dc->pauth_mask[d][upper] = pauth_ptr_mask(
+                    aa64_va_parameters(env, (uint64_t)upper << 55,
+                                       dc->mmu_idx, d, false));
+            }
+        }
+    }
     dc->bt = EX_TBFLAG_A64(tb_flags, BT);
     dc->btype = EX_TBFLAG_A64(tb_flags, BTYPE);
     dc->unpriv = EX_TBFLAG_A64(tb_flags, UNPRIV);
@@ -11199,7 +11336,8 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (!disas_a64(s, insn) &&
         !disas_sme(s, insn) &&
         !disas_sve(s, insn) &&
-        !disas_gxf(s, insn)) {
+        !disas_gxf(s, insn) &&
+        !disas_amx(s, insn)) {
         unallocated_encoding(s);
     }
 

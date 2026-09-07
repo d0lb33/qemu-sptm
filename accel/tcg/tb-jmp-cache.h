@@ -12,7 +12,16 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
+/*
+ * darwin-vm: overridable from the build (configure --extra-cflags=
+ * -DTB_JMP_CACHE_BITS=N).  An idle iOS 27 guest has ~1.45M live TBs and
+ * helper_lookup_tb_ptr was 13% of busy-vCPU host samples with the upstream
+ * 4096-entry cache (docs/re/tcg-idle-profile.md); the size is a measured
+ * trade-off, not a semantic change.
+ */
+#ifndef TB_JMP_CACHE_BITS
 #define TB_JMP_CACHE_BITS 12
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*

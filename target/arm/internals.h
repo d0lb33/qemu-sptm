@@ -1861,6 +1861,12 @@ int exception_target_el(CPUARMState *env);
 bool arm_singlestep_active(CPUARMState *env);
 bool arm_generate_debug_exceptions(CPUARMState *env);
 
+/*
+ * darwin-vm: true when the translator may emit the disabled-PAC fast path
+ * (DARWIN_PAUTH_INLINE=1).  Defined in tcg/pauth_helper.c.
+ */
+bool arm_pauth_inline_enabled(void);
+
 /**
  * pauth_ptr_mask:
  * @param: parameters defining the MMU setup
