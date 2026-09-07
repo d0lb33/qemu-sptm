@@ -237,6 +237,17 @@ static void start_write(void *opaque, hwaddr offset, uint64_t val, unsigned size
         if (((mpidr >> 8) & 0xff) == cluster &&
             (mpidr & 0xff) < 32 && (val & (1u << (mpidr & 0xff)))) {
             uint64_t entry = c->rvbar & MAKE_64BIT_MASK(12, 36);
+            /*
+             * Native path (2026-09-06): with -enable pmgr the stock kernel's
+             * ApplePMGR writes this bitmap itself, so the firmware handoff
+             * the PV bridge did in pv_cpu_start() must happen here as well;
+             * without it SPTM's secondary entry never reaches XNU and
+             * processor.c:1163 panics "cpu 1 failed to boot for the first
+             * time" (probe PMGR7SMP). The source is the CPU doing the write.
+             */
+            if (current_cpu && c->cpu->power_state == PSCI_OFF) {
+                apple_regs_pv_cpu_handoff(&c->cpu->env, &ARM_CPU(current_cpu)->env);
+            }
             int result = arm_set_cpu_on(mpidr, entry, smp.boot_x0, 2, true);
             if (result == QEMU_ARM_POWERCTL_RET_SUCCESS) {
                 arm_set_cpu_power_state(c->cpu, PSCI_ON_PENDING);
