@@ -35,6 +35,17 @@ bool darwin_iomfb_swap_id(const uint8_t *input, size_t size,
     return true;
 }
 
+bool darwin_iomfb_swap_empty(const uint8_t *input, size_t size)
+{
+    /* a0c9088..a0c9128 packs optional surfaces, with null flags feb..fee.
+     * CA_BINDING_GUEST1 RPC 15892 has all four absent (descriptor bytes aa).
+     * It still carries the pending main record: retire it without pixel DMA
+     * or claiming a new scanout. Power state is handled by the power RPCs. */
+    return input && size == DARWIN_IOMFB_SWAP_INPUT_SIZE &&
+           input[0xfea] == 0 && input[0xfeb] == 1 &&
+           input[0xfec] == 1 && input[0xfed] == 1 && input[0xfee] == 1;
+}
+
 void darwin_iomfb_swap_completion(uint8_t output[DARWIN_IOMFB_SWAP_COMPLETION_SIZE],
                                  uint32_t id)
 {

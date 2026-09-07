@@ -6,6 +6,7 @@
 #define DARWIN_IOMFB_SWAP_COMPLETION_SIZE 0x730
 bool darwin_iomfb_swap_id(const uint8_t *input, size_t size,
                          size_t output_size, uint32_t *id);
+bool darwin_iomfb_swap_empty(const uint8_t *input, size_t size);
 void darwin_iomfb_swap_completion(uint8_t output[DARWIN_IOMFB_SWAP_COMPLETION_SIZE],
                                  uint32_t id);
 typedef struct DarwinIOMFBSurface {

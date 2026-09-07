@@ -1557,8 +1557,12 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
 
     /* Copy before any completion can release the native surface mapping. */
     if (m->scanout_enabled && h.name == 0x41343038) {
-        bool displayed = iomfb_scanout(buf + sizeof(h), h.in_len);
-        if (m->display_state_enabled) {
+        bool empty = darwin_iomfb_swap_empty(buf + sizeof(h), h.in_len);
+        bool displayed = !empty && iomfb_scanout(buf + sizeof(h), h.in_len);
+        if (empty) {
+            fprintf(stderr, "iomfb: A408 empty surface update; no pixel DMA\n");
+        }
+        if (m->display_state_enabled && !empty) {
             uint32_t id;
             if (!displayed || !darwin_iomfb_swap_id(buf + sizeof(h), h.in_len,
                                                    h.out_len, &id) ||

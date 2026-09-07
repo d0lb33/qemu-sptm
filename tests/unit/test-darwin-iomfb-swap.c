@@ -92,11 +92,38 @@ static void scanout_contract(void)
     g_assert_false(darwin_iomfb_swap_surface(input, sizeof(input), &v));
 }
 
+static void empty_contract(void)
+{
+    uint8_t input[DARWIN_IOMFB_SWAP_INPUT_SIZE];
+    DarwinIOMFBSurface surface;
+    uint32_t id;
+    /* Captured absent descriptors contain poison, not a BGRA surface. */
+    memset(input, 0xaa, sizeof(input));
+    input[0xfea] = 0;
+    memset(input + 0xfeb, 1, 4);
+    stl_le_p(input + 0x98, 0);
+    g_assert_true(darwin_iomfb_swap_empty(input, sizeof(input)));
+    g_assert_true(darwin_iomfb_swap_id(input, sizeof(input), 12, &id));
+    g_assert_cmpuint(id, ==, 0);
+    g_assert_false(darwin_iomfb_swap_surface(input, sizeof(input), &surface));
+    g_assert_false(darwin_iomfb_swap_empty(NULL, sizeof(input)));
+    g_assert_false(darwin_iomfb_swap_empty(input, sizeof(input) - 1));
+    for (size_t i = 0xfea; i <= 0xfee; i++) {
+        uint8_t saved = input[i];
+        input[i] = saved ^ 1;
+        g_assert_false(darwin_iomfb_swap_empty(input, sizeof(input)));
+        input[i] = 2;
+        g_assert_false(darwin_iomfb_swap_empty(input, sizeof(input)));
+        input[i] = saved;
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/darwin-iomfb/swap/native-contract", native_contract);
     g_test_add_func("/darwin-iomfb/swap/reject-unsupported", reject_unsupported);
     g_test_add_func("/darwin-iomfb/swap/scanout-contract", scanout_contract);
+    g_test_add_func("/darwin-iomfb/swap/empty-contract", empty_contract);
     return g_test_run();
 }
