@@ -181,11 +181,18 @@
  *   0x1704129c  the lockdown query wants u16 0x5c02 at page+0x400 and reads
  *               the flag byte at page+0x448.
  *
- * So the model writes { +0x200: 0x00005c01, +0x400: 0x5c02, +0x448: 0 }
- * through the DART as soon as the AP has mapped the page. Zero xART and zero
- * lockdown are the permissive answers, chosen so nothing downstream changes
- * policy on their account; they are constants standing in for SEP state,
- * not modelled behaviour.
+ * By default the model writes { +0x200: 0x00005c01, +0x400: 0x5c02,
+ * +0x448: 0 } through the DART once mapped. xART absent is NOT universally
+ * permissive: exact TXM 0x17033fe8 returns true for it and 0x1704792c rejects
+ * signature classes 1..5 with 0x130a8 (observed OOP-JIT, 24A5430a).
+ * DARWIN_SEP_TXM_XART_TEST=1 opts into an immutable normal-state record:
+ * page+0x290 is a 60-byte sequence/payload snapshot read at 0x170413a0;
+ * sequence 2; payload+12 is 1, preserving this test guest's Developer Mode.
+ * Consumers 0x17033b18 / 0x17033c04 / 0x17033c24 read payload+12/+16/+8
+ * as Developer Mode / Lockdown / Demo settings (exact adjacent log strings).
+ * Lockdown and Demo are zero; other payload fields remain reserved zero.
+ * Publish the complete record before setting SCRD bit 16. This models only
+ * the boot-time status snapshot, not mutable or checkpointed xART policy.
  *
  * ---------------------------------------------------------------------------
  * Sources. Every number above was re-derived from this kernelcache (iOS 27,
@@ -864,11 +871,23 @@ static bool sep_dma(DarwinSEPState *s, uint64_t dva, void *buf, uint32_t len, bo
 // Write the SCRD state TXM validates. Retried from every later AP message
 // until the DART mapping for the page exists; returns true once written.
 static bool sep_txm_publish(DarwinSEPState *s) {
-    uint32_t scrd = TXM_SCRD_MAGIC;      // xART bit clear: see the header
+    const char *test = getenv("DARWIN_SEP_TXM_XART_TEST");
+    bool xart_test = test && !strcmp(test, "1");
+    uint32_t scrd = cpu_to_le32(TXM_SCRD_MAGIC |
+                              (xart_test ? (1u << 16) : 0));
     uint16_t lock = TXM_LOCK_MAGIC;
     uint8_t flag = 0;
 
     if (s->txm_published || !s->txm_dva) return s->txm_published;
+    if (xart_test) {
+        uint8_t snapshot[60] = {0};
+        stl_le_p(snapshot, 2);
+        stl_le_p(snapshot + 4 + 12, 1);
+        if (!sep_dma(s, s->txm_dva + 0x290, snapshot, sizeof(snapshot), true)) {
+            s->dma_warned = false;
+            return false;
+        }
+    }
     if (!sep_dma(s, s->txm_dva + TXM_SCRD_MAGIC_OFF, &scrd, sizeof(scrd), true)) {
         s->dma_warned = false;   // the mapping may simply not exist yet
         return false;
@@ -877,7 +896,9 @@ static bool sep_txm_publish(DarwinSEPState *s) {
     sep_dma(s, s->txm_dva + TXM_LOCK_FLAG_OFF, &flag, sizeof(flag), true);
     s->txm_published = true;
     fprintf(stderr, "sep(%s): TXM secure channel page at dva 0x%" PRIx64 " published "
-            "(SCRD magic 0x%04x, xART 0, lockdown 0)\n", s->role, s->txm_dva, TXM_SCRD_MAGIC);
+            "(SCRD magic 0x%04x, xART %u, lockdown 0)%s\n", s->role,
+            s->txm_dva, TXM_SCRD_MAGIC, xart_test,
+            xart_test ? " test-only immutable sequence=2 developer=1 demo=0" : "");
     return true;
 }
 
