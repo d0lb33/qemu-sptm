@@ -11,6 +11,7 @@
 #include "cpregs.h"
 #include "system/system.h"
 #include "xnu/apple_regs.h"
+#include "target/arm/amx.h"
 #include "hw/arm/apple_amcc.h"
 
 typedef uint64_t usize;
@@ -314,6 +315,21 @@ void apple_regs_init(ARMCPU *cpu, AMCCState *amcc, struct dtree_node *dt_root, s
 
     define_arm_cp_regs(cpu, apple_sysregs);
     define_arm_cp_regs(cpu, apple_pmcregs);
+    /*
+     * Apple AMX (target/arm/amx.h). Default: version 3, the generation the
+     * A17 Pro / M3 family reports (corsix AMX_VER_M3 semantics).
+     * DARWIN_AMX=0 leaves the space unallocated; DARWIN_AMX=N advertises N.
+     */
+    {
+        const char *amx = getenv("DARWIN_AMX");
+        uint32_t version = 3;
+        if (amx && (!strcmp(amx, "0") || !strcmp(amx, "off"))) {
+            version = 0;
+        } else if (amx && amx[0] >= '1' && amx[0] <= '6' && !amx[1]) {
+            version = amx[0] - '0';
+        }
+        arm_amx_init(cpu, version);
+    }
     if (rtc_pv && !strcmp(rtc_pv, "1")) {
         define_arm_cp_regs(cpu, pv_rtc_regs);
     }

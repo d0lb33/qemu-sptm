@@ -145,6 +145,8 @@ typedef struct DisasContext {
      * TCR with pauth_tcr.
      */
     bool pauth_inline;
+    /* darwin-vm: Apple AMX present (apple-amx.decode claims 0x00201000). */
+    bool amx_enabled;
     int pauth_tcr_off;
     int pauth_sctlr_off;
     uint64_t pauth_tcr;

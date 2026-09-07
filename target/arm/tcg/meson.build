@@ -3,7 +3,8 @@ gen_a64 = [
   decodetree.process('sve.decode', extra_args: '--decode=disas_sve'),
   decodetree.process('sme.decode', extra_args: '--decode=disas_sme'),
   decodetree.process('sme-fa64.decode', extra_args: '--static-decode=disas_sme_fa64'),
-  decodetree.process('apple-gxf.decode', extra_args: '--decode=disas_gxf')
+  decodetree.process('apple-gxf.decode', extra_args: '--decode=disas_gxf'),
+  decodetree.process('apple-amx.decode', extra_args: '--decode=disas_amx'),
 ]
 
 vfp_d = [
@@ -41,6 +42,17 @@ arm_ss.add(when: 'TARGET_AARCH64', if_true: files(
   'translate-sve.c',
   'translate-sme.c',
   'translate-gxf.c',
+  'translate-amx.c',
+  'amx_helper.c',
+  'amx/extr.c',
+  'amx/fma.c',
+  'amx/fms.c',
+  'amx/genlut.c',
+  'amx/mac16.c',
+  'amx/matfp.c',
+  'amx/matint.c',
+  'amx/vecfp.c',
+  'amx/vecint.c',
   'helper-a64.c',
   'mte_helper.c',
   'pauth_helper.c',

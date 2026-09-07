@@ -11143,6 +11143,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
      * never fire: EL2+ (no EL3 on this machine) or EL0 under HCR.E2H+TGE,
      * which is exactly the E20_0 regime.  EL1&0 regimes keep the helpers.
      */
+    dc->amx_enabled = env->amx.version != 0;
     dc->pauth_inline = false;
     if (dc->pauth_active && arm_pauth_inline_enabled() &&
         !arm_dc_feature(dc, ARM_FEATURE_EL3) &&
@@ -11335,7 +11336,8 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (!disas_a64(s, insn) &&
         !disas_sme(s, insn) &&
         !disas_sve(s, insn) &&
-        !disas_gxf(s, insn)) {
+        !disas_gxf(s, insn) &&
+        !disas_amx(s, insn)) {
         unallocated_encoding(s);
     }
 
