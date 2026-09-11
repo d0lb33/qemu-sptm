@@ -254,6 +254,8 @@ struct DarwinIOMFB {
     unsigned level;
     bool debug;
     bool rpc_trace;
+    bool quiet;
+    bool timing_trace;
 
     /* The AP's shared heap, from the class-0/subkind-1 announce. */
     bool heap_known;
@@ -648,7 +650,7 @@ static void iomfb_blank(void)
     }
 }
 
-static bool iomfb_scanout(const uint8_t *input, uint32_t len)
+static bool iomfb_scanout(DarwinIOMFB *m, const uint8_t *input, uint32_t len)
 {
     int64_t started = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     DarwinIOMFBSurface surface;
@@ -691,14 +693,24 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
         return false;
     }
     int64_t presented = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64
-            " source_format=0x%08x transfer=%u colorspace=%u source_stride=%u swap=%u scanout_us=%" PRId64
-            " monotonic_ns=%" PRId64 "\n",
-            surface.width, surface.height, display_stride, surface.dva,
-            surface.format, surface.transfer, surface.colorspace, surface.stride,
-            (uint32_t)ldl_le_p(input + 0x98),
-            (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
-            presented);
+    if (m->timing_trace) {
+        fprintf(stderr, "iomfb-timing: present swap=%u scanout_us=%" PRId64
+                " monotonic_ns=%" PRId64 "\n",
+                (uint32_t)ldl_le_p(input + 0x98),
+                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
+                presented);
+    }
+    if (!m->quiet) {
+        fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%"
+                PRIx64 " source_format=0x%08x transfer=%u colorspace=%u "
+                "source_stride=%u swap=%u scanout_us=%" PRId64
+                " monotonic_ns=%" PRId64 "\n", surface.width, surface.height,
+                display_stride, surface.dva, surface.format, surface.transfer,
+                surface.colorspace, surface.stride,
+                (uint32_t)ldl_le_p(input + 0x98),
+                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
+                presented);
+    }
     transition_capture(display_pixels, surface.width, surface.height,
                        display_stride, presented);
     scanout_last_w = surface.width;
@@ -1015,7 +1027,10 @@ static void iomfb_parse_overrides(DarwinIOMFB *m, const char *spec) {
 /* -------------------------------------------------------------- sending -- */
 
 static void iomfb_send(DarwinIOMFB *m, uint8_t ep, uint64_t msg, const char *what) {
-    fprintf(stderr, "iomfb: IOP -> AP ep 0x%02x 0x%016" PRIx64 "  (%s)\n", ep, msg, what);
+    if (!m->quiet) {
+        fprintf(stderr, "iomfb: IOP -> AP ep 0x%02x 0x%016" PRIx64
+                "  (%s)\n", ep, msg, what);
+    }
     darwin_asc_send(m->asc, ep, msg);
 }
 
@@ -1078,10 +1093,12 @@ static bool iomfb_callback_send_slot(DarwinIOMFB *m, uint8_t ep,
     }
 
     m->cb_sent++;
-    fprintf(stderr, "iomfb: ep 0x%02x callback #%" PRIu64 " '%s' (0x%08x) in %u "
-            "out %u -> heap+0x%x (tag %u) size 0x%x\n",
-            ep, m->cb_sent, cb->name, cb->name_be, in_len, cb->out_len,
-            base + tag * IOMFB_WINDOW, tag, size);
+    if (!m->quiet) {
+        fprintf(stderr, "iomfb: ep 0x%02x callback #%" PRIu64
+                " '%s' (0x%08x) in %u out %u -> heap+0x%x (tag %u) size 0x%x\n",
+                ep, m->cb_sent, cb->name, cb->name_be, in_len, cb->out_len,
+                base + tag * IOMFB_WINDOW, tag, size);
+    }
     if (m->debug && in_len) {
         iomfb_hexdump("cb in", buf + sizeof(h), in_len);
     }
@@ -1145,8 +1162,10 @@ static bool iomfb_swap_send_nested(DarwinIOMFB *m, uint8_t ep, unsigned tag,
     if (sent) {
         m->swap_nested[tag] = true;
         m->swap_nested_ids[tag] = id;
-        fprintf(stderr, "iomfb: swap id %u D594 nested on tag %u; A408 pending\n",
-                id, tag);
+        if (!m->quiet) {
+            fprintf(stderr, "iomfb: swap id %u D594 nested on tag %u; "
+                    "A408 pending\n", id, tag);
+        }
     }
     return sent;
 }
@@ -1167,9 +1186,11 @@ static void iomfb_swap_pump(DarwinIOMFB *m, uint8_t ep)
         /* Retain the ID for inspection rather than silently losing a frame. */
         m->swap_failed = true;
     }
-    fprintf(stderr, "iomfb: swap id %u D594 %s, queued %u\n",
-            m->swap_ids[m->swap_head], m->swap_active ? "sent" : "send failed",
-            m->swap_count);
+    if (!m->quiet || !m->swap_active) {
+        fprintf(stderr, "iomfb: swap id %u D594 %s, queued %u\n",
+                m->swap_ids[m->swap_head],
+                m->swap_active ? "sent" : "send failed", m->swap_count);
+    }
 }
 
 static void iomfb_swap_enqueue(DarwinIOMFB *m, const uint8_t *input,
@@ -1267,9 +1288,17 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
     uint32_t status = (uint32_t)(msg >> 16);
 
     if (m->swap_active) {
-        fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x monotonic_ns=%" PRId64 "\n",
-                m->swap_ids[m->swap_head], status,
-                qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        int64_t completed = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (m->timing_trace) {
+            fprintf(stderr, "iomfb-timing: complete swap=%u status=%u "
+                    "monotonic_ns=%" PRId64 "\n",
+                    m->swap_ids[m->swap_head], status, completed);
+        }
+        if (!m->quiet || status) {
+            fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x "
+                    "monotonic_ns=%" PRId64 "\n", m->swap_ids[m->swap_head],
+                    status, completed);
+        }
         m->cb_busy = m->swap_active = false;
         if (status) {
             m->swap_failed = true;
@@ -1451,11 +1480,19 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
         unsigned tag = IOMFB_TAG(msg);
         if (IOMFB_ACK(msg) == 0 && tag < IOMFB_TAGS && m->swap_nested[tag]) {
             uint32_t status = (uint32_t)(msg >> 16);
+            int64_t completed = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            if (m->timing_trace) {
+                fprintf(stderr, "iomfb-timing: complete swap=%u status=%u "
+                        "monotonic_ns=%" PRId64 "\n",
+                        m->swap_nested_ids[tag], status, completed);
+            }
             m->swap_nested[tag] = false;
-            fprintf(stderr, "iomfb: swap id %u D594 nested completed, status "
-                    "0x%x; releasing A408 tag %u monotonic_ns=%" PRId64 "\n",
-                    m->swap_nested_ids[tag], status, tag,
-                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+            if (!m->quiet || status) {
+                fprintf(stderr, "iomfb: swap id %u D594 nested completed, "
+                    "status 0x%x; releasing A408 tag %u monotonic_ns=%"
+                    PRId64 "\n", m->swap_nested_ids[tag], status, tag,
+                    completed);
+            }
             iomfb_send(m, ep, 0x42ULL | ((uint64_t)tag << 10) |
                        ((uint64_t)status << 16), "A408 after nested D594");
             iomfb_after_rpc(m, ep, "A408");
@@ -1467,9 +1504,12 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
          * thing that identifies it is that we have one outstanding.
          */
         if (m->cb_busy && IOMFB_ACK(msg) == 1 && IOMFB_TAG(msg) == 0) {
-            fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 (callback "
-                    "completion) tag %u ack %u status 0x%x\n",
-                    ep, IOMFB_TAG(msg), IOMFB_ACK(msg), (uint32_t)(msg >> 16));
+            if (!m->quiet) {
+                fprintf(stderr, "iomfb: ep 0x%02x class 2 subkind 1 "
+                        "(callback completion) tag %u ack %u status 0x%x\n",
+                        ep, IOMFB_TAG(msg), IOMFB_ACK(msg),
+                        (uint32_t)(msg >> 16));
+            }
             iomfb_callback_done(m, ep, msg);
         } else {
             fprintf(stderr, "iomfb: ep 0x%02x unexpected class 2 subkind 1 "
@@ -1570,12 +1610,14 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             *q++ = ']'; *q++ = ' '; *q = 0;
         }
     }
-    fprintf(stderr, "iomfb: ep 0x%02x %sRPC #%" PRIu64
-            " '%s' (0x%08x) in %u %sout %u "
-            "at heap+0x%x size 0x%x tag %u ack %u flag9 %u\n",
-            ep, nested ? "nested callback-context AP " : "", m->rpcs,
-            name, h.name, h.in_len, inhex, h.out_len, off, size,
-            IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
+    if (!m->quiet) {
+        fprintf(stderr, "iomfb: ep 0x%02x %sRPC #%" PRIu64
+                " '%s' (0x%08x) in %u %sout %u "
+                "at heap+0x%x size 0x%x tag %u ack %u flag9 %u\n",
+                ep, nested ? "nested callback-context AP " : "", m->rpcs,
+                name, h.name, h.in_len, inhex, h.out_len, off, size,
+                IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
+    }
 
     if (m->rpc_trace) {
         /*
@@ -1672,8 +1714,8 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     /* Copy before any completion can release the native surface mapping. */
     if (m->scanout_enabled && h.name == 0x41343038) {
         bool empty = darwin_iomfb_swap_empty(buf + sizeof(h), h.in_len);
-        bool displayed = !empty && iomfb_scanout(buf + sizeof(h), h.in_len);
-        if (empty) {
+        bool displayed = !empty && iomfb_scanout(m, buf + sizeof(h), h.in_len);
+        if (empty && !m->quiet) {
             fprintf(stderr, "iomfb: A408 empty surface update; no pixel DMA\n");
         }
         if (m->display_state_enabled && !empty) {
@@ -1727,10 +1769,12 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
 bool darwin_iomfb_handle(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
     unsigned cls = IOMFB_CLASS(msg);
 
-    fprintf(stderr, "iomfb: AP -> IOP ep 0x%02x 0x%016" PRIx64
-            " | class %u subkind %u ack %u flag9 %u tag %u payload 0x%" PRIx64 "\n",
-            ep, msg, cls, IOMFB_SUBKIND(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg),
-            IOMFB_TAG(msg), msg >> 16);
+    if (!m->quiet) {
+        fprintf(stderr, "iomfb: AP -> IOP ep 0x%02x 0x%016" PRIx64
+                " | class %u subkind %u ack %u flag9 %u tag %u payload 0x%"
+                PRIx64 "\n", ep, msg, cls, IOMFB_SUBKIND(msg), IOMFB_ACK(msg),
+                IOMFB_FLAG9(msg), IOMFB_TAG(msg), msg >> 16);
+    }
 
     if (m->level < 2) {
         return true;    /* decode-only mode: never answer */
@@ -1770,6 +1814,8 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     DarwinIOMFB *m = g_new0(DarwinIOMFB, 1);
     const char *dbg = getenv("DARWIN_DCP_IOMFB_DEBUG");
     const char *trace = getenv("DARWIN_DCP_IOMFB_RPC_TRACE");
+    const char *quiet = getenv("DARWIN_DCP_IOMFB_QUIET");
+    const char *timing_trace = getenv("DARWIN_DCP_IOMFB_TIMING_TRACE");
 
     m->asc = asc;
     m->dart = dart;
@@ -1803,6 +1849,9 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     }
     m->debug = dbg && dbg[0] && dbg[0] != '0';
     m->rpc_trace = trace && trace[0] && trace[0] != '0';
+    m->quiet = quiet && quiet[0] && quiet[0] != '0';
+    m->timing_trace = timing_trace && timing_trace[0] &&
+                      timing_trace[0] != '0';
     if (m->rpc_trace) {
         m->rpc_trace_seen = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
                                                   (GDestroyNotify)g_bytes_unref,
