@@ -582,6 +582,9 @@ static bool iomfb_export(const char *name, const void *bytes, size_t size)
     return g_file_set_contents(path, bytes, size, NULL);
 }
 
+/* Witness applicability follows A484; blanking is not a new GPU frame. */
+static bool witness_display_on = true;
+
 static void gpu_present_stopped(void *opaque, bool running, RunState state)
 {
     (void)opaque; (void)state;
@@ -594,8 +597,9 @@ static void gpu_present_stopped(void *opaque, bool running, RunState state)
                            sizeof(rgha_witness.request)) && ok;
         uint64_t snapshot = ++rgha_witness.snapshot;
         g_autofree char *manifest = g_strdup_printf(
-            "{\"version\":1,\"snapshot\":%" PRIu64 ",\"frames\":%u,\"ok\":%s}\n",
-            snapshot, rgha_witness.count, ok ? "true" : "false");
+            "{\"version\":1,\"snapshot\":%" PRIu64 ",\"frames\":%u,\"ok\":%s,\"display_on\":%s}\n",
+            snapshot, rgha_witness.count, ok ? "true" : "false",
+            witness_display_on ? "true" : "false");
         ok = iomfb_export("last-scanout.json", manifest, strlen(manifest)) && ok;
         fprintf(stderr, "iomfb: RGhA final export swap=%u frames=%u source_bytes=%u ok=%u\n",
                 (uint32_t)ldl_le_p(rgha_witness.request + 0x98),
@@ -795,6 +799,7 @@ static bool iomfb_power_rpc(DarwinIOMFB *m, uint32_t name, const char *ascii,
         {
             uint32_t was = m->display_power;
             m->display_power = ldl_le_p(in);
+            witness_display_on = m->display_power != 0;
             stl_le_p(out, m->display_power);
             stl_le_p(out + 4, 0);
             fprintf(stderr, "iomfb: %s display power %u -> %u (flags %02x %02x %02x %02x)\n",

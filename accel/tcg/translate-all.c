@@ -632,7 +632,19 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
-    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+    /*
+     * darwin-vm: one store instead of TB_JMP_CACHE_SIZE stores.  Entries
+     * carrying an older epoch are misses (tb-jmp-cache.h).  On wraparound
+     * clear the array for real so that entries stamped with the reused
+     * epoch values cannot match again, and skip epoch 0, the value of a
+     * zero-initialised entry.
+     */
+    uint32_t next = qatomic_read(&jc->epoch) + 1;
+    if (unlikely(next == 0)) {
+        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+            qatomic_set(&jc->array[i].tb, NULL);
+        }
+        next = 1;
     }
+    qatomic_set(&jc->epoch, next);
 }
