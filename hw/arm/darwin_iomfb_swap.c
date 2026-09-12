@@ -2,6 +2,11 @@
 #include "qemu/bswap.h"
 #include "hw/arm/darwin_iomfb_swap.h"
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define DARWIN_IOMFB_NEON_RGBA16 1
+#endif
+
 bool darwin_iomfb_marked_frame(const DarwinIOMFBSurface *surface,
                              const uint8_t *pixels, uint32_t *frame)
 {
@@ -130,6 +135,31 @@ static uint8_t half_unorm8(uint16_t value)
     return (((value & 1023) + 1024) * 255 + (1U << (shift - 1))) >> shift;
 }
 
+#ifdef DARWIN_IOMFB_NEON_RGBA16
+static inline uint8x8_t half8_unorm8(uint16x8_t bits)
+{
+    float16x8_t half = vreinterpretq_f16_u16(bits);
+    float32x4_t low = vcvt_f32_f16(vget_low_f16(half));
+    float32x4_t high = vcvt_f32_f16(vget_high_f16(half));
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t scale = vdupq_n_f32(255.0f);
+
+    low = vmulq_f32(vminq_f32(vmaxq_f32(low, zero), one), scale);
+    high = vmulq_f32(vminq_f32(vmaxq_f32(high, zero), one), scale);
+
+    return vmovn_u16(vcombine_u16(vmovn_u32(vcvtaq_u32_f32(low)),
+                                  vmovn_u32(vcvtaq_u32_f32(high))));
+}
+
+static inline bool half8_has_nonfinite(uint16x8_t value)
+{
+    uint16x8_t exponent = vandq_u16(value, vdupq_n_u16(0x7c00));
+
+    return vmaxvq_u16(vceqq_u16(exponent, vdupq_n_u16(0x7c00))) != 0;
+}
+#endif
+
 bool darwin_iomfb_rgha_to_bgra(const DarwinIOMFBSurface *s,
                               const uint8_t *source, size_t source_size,
                               uint8_t *output, size_t output_size)
@@ -145,7 +175,28 @@ bool darwin_iomfb_rgha_to_bgra(const DarwinIOMFBSurface *s,
     for (uint32_t y = 0; y < s->height; y++) {
         const uint8_t *src = source + (size_t)y * s->stride;
         uint8_t *dst = output + (size_t)y * s->width * 4;
-        for (uint32_t x = 0; x < s->width; x++, src += 8, dst += 4) {
+        uint32_t x = 0;
+#ifdef DARWIN_IOMFB_NEON_RGBA16
+        for (; x + 8 <= s->width; x += 8, src += 64, dst += 32) {
+            uint16x8x4_t rgba = vld4q_u16((const uint16_t *)src);
+            if (half8_has_nonfinite(rgba.val[0]) ||
+                half8_has_nonfinite(rgba.val[1]) ||
+                half8_has_nonfinite(rgba.val[2]) ||
+                half8_has_nonfinite(rgba.val[3])) {
+                return false;
+            }
+            uint8x8x4_t bgra = {
+                .val = {
+                    half8_unorm8(rgba.val[2]),
+                    half8_unorm8(rgba.val[1]),
+                    half8_unorm8(rgba.val[0]),
+                    half8_unorm8(rgba.val[3]),
+                },
+            };
+            vst4_u8(dst, bgra);
+        }
+#endif
+        for (; x < s->width; x++, src += 8, dst += 4) {
             uint16_t r = lduw_le_p(src), g = lduw_le_p(src + 2);
             uint16_t b = lduw_le_p(src + 4), a = lduw_le_p(src + 6);
             if ((r & 0x7c00) == 0x7c00 || (g & 0x7c00) == 0x7c00 ||

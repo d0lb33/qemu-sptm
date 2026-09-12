@@ -674,6 +674,7 @@ static bool iomfb_scanout(DarwinIOMFB *m, const uint8_t *input, uint32_t len)
         }
         off += chunk;
     }
+    int64_t dma_done = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     const uint8_t *display_pixels = pixels;
     uint32_t display_stride = surface.stride;
     if (surface.format == 0x52476841) {
@@ -687,6 +688,7 @@ static bool iomfb_scanout(DarwinIOMFB *m, const uint8_t *input, uint32_t len)
         }
         display_pixels = converted;
     }
+    int64_t converted_done = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     if (!darwin_fb_present_bgra(display_pixels, surface.width, surface.height,
                                 display_stride)) {
         fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
@@ -695,20 +697,29 @@ static bool iomfb_scanout(DarwinIOMFB *m, const uint8_t *input, uint32_t len)
     int64_t presented = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     if (m->timing_trace) {
         fprintf(stderr, "iomfb-timing: present swap=%u scanout_us=%" PRId64
-                " monotonic_ns=%" PRId64 "\n",
+                " dma_us=%" PRId64 " convert_us=%" PRId64
+                " console_us=%" PRId64 " monotonic_ns=%" PRId64 "\n",
                 (uint32_t)ldl_le_p(input + 0x98),
-                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
+                (presented - started) / 1000,
+                (dma_done - started) / 1000,
+                (converted_done - dma_done) / 1000,
+                (presented - converted_done) / 1000,
                 presented);
     }
     if (!m->quiet) {
         fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%"
                 PRIx64 " source_format=0x%08x transfer=%u colorspace=%u "
                 "source_stride=%u swap=%u scanout_us=%" PRId64
+                " dma_us=%" PRId64 " convert_us=%" PRId64
+                " console_us=%" PRId64
                 " monotonic_ns=%" PRId64 "\n", surface.width, surface.height,
                 display_stride, surface.dva, surface.format, surface.transfer,
                 surface.colorspace, surface.stride,
                 (uint32_t)ldl_le_p(input + 0x98),
-                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - started) / 1000,
+                (presented - started) / 1000,
+                (dma_done - started) / 1000,
+                (converted_done - dma_done) / 1000,
+                (presented - converted_done) / 1000,
                 presented);
     }
     transition_capture(display_pixels, surface.width, surface.height,

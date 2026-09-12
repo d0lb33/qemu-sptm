@@ -24,6 +24,7 @@
 #include "cpu-features.h"
 #include "fpu/softfloat.h"
 #include "qemu/log.h"
+#include "darwin-f16-fast.h"
 
 /*
  * Set the float_status behaviour to match the Arm defaults:
@@ -497,6 +498,12 @@ uint32_t HELPER(set_rmode)(uint32_t rmode, float_status *fp_status)
 float32 HELPER(vfp_fcvt_f16_to_f32)(uint32_t a, float_status *fpst,
                                     uint32_t ahp_mode)
 {
+    uint32_t exact;
+
+    /* Normal values and signed zero widen exactly and cannot change FPSR. */
+    if (likely(dvm_f16_to_f32_exact(a, &exact))) {
+        return exact;
+    }
     /* Squash FZ16 to 0 for the duration of conversion.  In this case,
      * it would affect flushing input denormals.
      */
@@ -510,6 +517,12 @@ float32 HELPER(vfp_fcvt_f16_to_f32)(uint32_t a, float_status *fpst,
 uint32_t HELPER(vfp_fcvt_f32_to_f16)(float32 a, float_status *fpst,
                                      uint32_t ahp_mode)
 {
+    uint32_t exact;
+
+    /* Use this only when no discarded bit, rounding or exception exists. */
+    if (likely(dvm_f32_to_f16_exact(a, &exact))) {
+        return exact;
+    }
     /* Squash FZ16 to 0 for the duration of conversion.  In this case,
      * it would affect flushing output denormals.
      */

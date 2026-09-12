@@ -156,8 +156,13 @@
  * arrive the same way: {ep 10, tag, length of the body in the OOL in-buffer,
  * 0}; observed 36 bytes for cmd 10 and 40 for cmd 25.  The bounded v1/SCRD
  * positive-control replies below are derived from the ACM receiver checks in
- * docs/re/acm-scrd-response-contract.md.  All other shapes stay unanswered:
- * a status-only acknowledgement would hide an unmodelled protocol decision.
+ * docs/re/acm-scrd-response-contract.md.  All other shapes stay unanswered by
+ * default: a status-only acknowledgement would hide an unmodelled protocol
+ * decision.  DARWIN_SEP_SCRD_FAIL_FAST=1 is a development-only exception for
+ * the observed command-36/40-byte and command-51/72-or-208-byte requests.  It
+ * returns the same status-only failure shape validated in the exact guest in
+ * docs/re/sep-protocol.md, avoiding a five-second timeout without claiming
+ * success or inventing response data.
  *
  * ---------------------------------------------------------------------------
  * The TXM secure channel
@@ -348,6 +353,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinSEPState, DARWIN_SEP)
 #define SCRD_REQUEST_CMD25_LEN      40
 #define SCRD_COMMAND_GET_STATE      10
 #define SCRD_COMMAND_GET_ENV        25
+#define SCRD_COMMAND_LOCAL_AUTH     36
+#define SCRD_COMMAND_SEP_CONTROL    51
+#define SCRD_REQUEST_CMD36_LEN      40
+#define SCRD_REQUEST_CMD51_SHORT_LEN 72
+#define SCRD_REQUEST_CMD51_LONG_LEN 208
+#define SCRD_STATUS_UNMODELLED      1
 #define SCRD_RESPONSE_VERSION       1
 #define SCRD_RESPONSE_HEADER_LEN    12
 #define SCRD_RESPONSE_CMD10_LEN     12
@@ -718,6 +729,7 @@ struct DarwinSEPState {
     const SEPEndpointDef *adv[ARRAY_SIZE(sep_all_eps)];
     int n_adv;
     bool debug;
+    bool scrd_fail_fast;
     bool sks_request_debug;
     bool sks_request_debug_code_set;
     uint8_t sks_request_debug_code;
@@ -1853,9 +1865,28 @@ static void sep_handle_scrd(DarwinSEPState *s, uint64_t m)
     }
 
     fprintf(stderr, "sep(%s): scrd tag %u cmd 0x%02x body %u is unmodelled; "
-            "no reply\n", s->role, frame_tag(m), command, request_size);
+            "%s\n", s->role, frame_tag(m), command, request_size,
+            s->scrd_fail_fast ? "checking bounded fail-fast" : "no reply");
     if (s->debug) {
         sep_dump_ool_in_len(s, SEP_EP_CREDENTIALS, request_size);
+    }
+    if (s->scrd_fail_fast &&
+        ((command == SCRD_COMMAND_LOCAL_AUTH &&
+          request_size == SCRD_REQUEST_CMD36_LEN) ||
+         (command == SCRD_COMMAND_SEP_CONTROL &&
+          (request_size == SCRD_REQUEST_CMD51_SHORT_LEN ||
+           request_size == SCRD_REQUEST_CMD51_LONG_LEN)))) {
+        /*
+         * ACM stores the upper word as the SEP status and wakes the sender.
+         * A nonzero status takes its failure path before OOL decoding, so the
+         * length stays zero and the output buffer is deliberately untouched.
+         */
+        sep_send_raw(s, frame(SEP_EP_CREDENTIALS, frame_tag(m), 0, 0,
+                              SCRD_STATUS_UNMODELLED));
+        fprintf(stderr, "sep(%s): scrd tag %u cmd 0x%02x body %u failed "
+                "fast with status %u (DARWIN_SEP_SCRD_FAIL_FAST)\n",
+                s->role, frame_tag(m), command, request_size,
+                SCRD_STATUS_UNMODELLED);
     }
     return;
 
@@ -2131,6 +2162,7 @@ static void darwin_sep_realize(DeviceState *dev, Error **errp) {
     s->cpu_status = ASC_CPU_STATUS_STOPPED;
     s->status = SEP_STATUS_ROM;
     s->debug = getenv("DARWIN_SEP_DEBUG") != NULL;
+    s->scrd_fail_fast = getenv("DARWIN_SEP_SCRD_FAIL_FAST") != NULL;
     const char *sks_request_debug = getenv("DARWIN_SKS_REQUEST_DEBUG");
     s->sks_request_debug = sks_request_debug && sks_request_debug[0] &&
                            sks_request_debug[0] != '0';

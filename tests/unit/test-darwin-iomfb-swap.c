@@ -166,6 +166,61 @@ static void rgha_contract(void)
     g_assert_false(darwin_iomfb_rgha_to_bgra(&s, source, 64, output, 24));
 }
 
+static uint8_t reference_half_unorm8(uint16_t value)
+{
+    unsigned exponent = (value >> 10) & 31;
+
+    if (value & 0x8000 || !exponent) {
+        return 0;
+    }
+    if (exponent >= 15) {
+        return 255;
+    }
+    unsigned shift = 25 - exponent;
+    return (((value & 1023) + 1024) * 255 + (1U << (shift - 1))) >> shift;
+}
+
+static void rgha_exhaustive_finite(void)
+{
+    const uint32_t width = 7936;
+    const uint32_t height = 4;
+    const size_t pixels = (size_t)width * height;
+    g_autofree uint8_t *source = g_malloc(pixels * 8);
+    g_autofree uint8_t *output = g_malloc(pixels * 4);
+    DarwinIOMFBSurface s = {
+        .width = width, .height = height, .stride = width * 8,
+        .format = 0x52476841, .transfer = 13, .colorspace = 1,
+    };
+
+    /* Test every finite binary16 bit pattern. The two nonfinite ranges are
+     * separately covered by the rejection checks below. Replicating each
+     * value across RGBA verifies every vector lane and output permutation. */
+    for (unsigned sign = 0; sign < 2; sign++) {
+        uint16_t base = sign ? 0x8000 : 0;
+        for (size_t i = 0; i < pixels; i++) {
+            uint16_t value = base + i;
+            for (unsigned channel = 0; channel < 4; channel++) {
+                stw_le_p(source + i * 8 + channel * 2, value);
+            }
+        }
+        g_assert_true(darwin_iomfb_rgha_to_bgra(&s, source, pixels * 8,
+                                                output, pixels * 4));
+        for (size_t i = 0; i < pixels; i++) {
+            uint8_t expected = reference_half_unorm8(base + i);
+            for (unsigned channel = 0; channel < 4; channel++) {
+                g_assert_cmpuint(output[i * 4 + channel], ==, expected);
+            }
+        }
+    }
+
+    memset(source, 0, 8 * 8);
+    for (unsigned bits = 0x7c00; bits <= 0x7fff; bits += 0x0100) {
+        stw_le_p(source + (bits >> 8 & 7) * 8, bits);
+    }
+    s.width = 8; s.height = 1; s.stride = 64;
+    g_assert_false(darwin_iomfb_rgha_to_bgra(&s, source, 64, output, 32));
+}
+
 static void rgha_native_oracle(void)
 {
     const char *directory = getenv("DVM_RGBA_ORACLE");
@@ -199,6 +254,7 @@ int main(int argc, char **argv)
     g_test_add_func("/darwin-iomfb/swap/scanout-contract", scanout_contract);
     g_test_add_func("/darwin-iomfb/swap/empty-contract", empty_contract);
     g_test_add_func("/darwin-iomfb/swap/rgha-contract", rgha_contract);
+    g_test_add_func("/darwin-iomfb/swap/rgha-exhaustive-finite", rgha_exhaustive_finite);
     g_test_add_func("/darwin-iomfb/swap/rgha-native-oracle", rgha_native_oracle);
     return g_test_run();
 }
